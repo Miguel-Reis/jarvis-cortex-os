@@ -33,7 +33,7 @@ C:\Users\guels\Desktop\jarvis-cortex-os\
 ├── AGENTS.md                       # Regras automáticas para o Antigravity IDE neste workspace
 ├── jarvis_os/
 │   ├── __init__.py
-│   ├── cli.py                      # CLI (`python -m jarvis_os.cli status | plan | briefing | memory | routine`)
+│   ├── cli.py                      # CLI (`status | plan | briefing | memory | routine | serve | sidecar | workflow`)
 │   ├── core/
 │   │   └── telemetry.py            # Windows Kernel32 GlobalMemoryStatusEx + NVMe Disk + Port Radar
 │   ├── memory/
@@ -47,10 +47,18 @@ C:\Users\guels\Desktop\jarvis-cortex-os\
 │   │   └── routine_discovery.py    # Evidence-Backed Routine Discovery (routine-cues-v2)
 │   ├── security/
 │   │   └── trust_boundary.py       # Authority-Aware Tool Relevance & Prompt-Injection Canary
-│   └── voice/
-│       └── mark_vii_tts.py         # Skywalker Sound Mark-VII Helmet DSP + Neural/SAPI Streamer
+│   ├── voice/
+│   │   └── mark_vii_tts.py         # Skywalker Sound Mark-VII Helmet DSP + Neural/SAPI Streamer
+│   ├── server/
+│   │   └── http_sse.py             # Servidor HTTP/SSE Real-Time + Pipeline Cognitivo Unificado
+│   ├── ui/
+│   │   └── dashboard.html          # Dashboard HUD Mark-VII 60 FPS + Orbe FFT + WebAudio DSP + Wake-Word
+│   ├── sidecar/
+│   │   └── desktop_agent.py        # Sidecar Desktop (EnumWindows/POSIX, Hotkeys, Clipboard Guard, WakeWord)
+│   └── workflows/
+│       └── engine.py               # AST Static Analyzer + Git Workspace Inspector + Live Test Gate
 └── tests/
-    └── test_jarvis_os.py           # Suite de testes unitários (10/10 PASS em <0.1s)
+    └── test_jarvis_os.py           # Suite de testes unitários (13/13 PASS em <0.1s)
 ```
 
 ---
@@ -60,7 +68,7 @@ C:\Users\guels\Desktop\jarvis-cortex-os\
 ```powershell
 cd C:\Users\guels\Desktop\jarvis-cortex-os
 
-# 1. Correr a suite completa de testes unitários
+# 1. Correr a suite completa de testes unitários (13/13 PASS)
 python -m unittest discover -s tests -v
 
 # 2. Executar o Briefing Executivo Matinal na CLI
@@ -71,20 +79,27 @@ python -m jarvis_os.cli status
 
 # 4. Calcular a Próxima Ação Determinística (Q-18)
 python -m jarvis_os.cli plan
+
+# 5. Inspecionar Sidecar Desktop, Janelas e Hotkeys
+python -m jarvis_os.cli sidecar
+
+# 6. Executar Workflow Autónomo & Gate de Testes
+python -m jarvis_os.cli workflow
+
+# 7. Iniciar o Servidor HTTP/SSE + Dashboard Dedicado Mark-VII HUD
+python -m jarvis_os.cli serve --port 8765
 ```
 
 ---
 
 ## 4. Roadmap de Evolução ("Próximos Passos A Sério" no Novo Workspace)
 
-Quando abrires a pasta `C:\Users\guels\Desktop\jarvis-cortex-os` como Workspace no **Antigravity IDE**, podes evoluir o projeto nas seguintes fases:
-
-- **Fase 1 — Servidor HTTP/SSE + Dashboard Dedicado (`jarvis_os/server/` & `jarvis_os/ui/`)**:
-  - Criar um servidor ASGI/HTTP ultra-rápido dedicado apenas ao **J.A.R.V.I.S. Cortex OS** com WebSockets/SSE em tempo real, Orbe 3D WebGL/Canvas 60 FPS com FFT real e consola de voz contínua (Wake-Word `"Hey Jarvis"`).
-- **Fase 2 — Sidecar de Automação Desktop Windows (`jarvis_os/sidecar/`)**:
-  - Inspirado no `@usejarvis/sidecar`: controlo seguro de janelas Windows, leitura de clipboard autorizado, atalhos globais (`Alt + Space` / Pebble Hotkeys) e execução de workflows locais com confirmação `TrustBoundaryGate`.
-- **Fase 3 — Conetores de Workflow & Git/CI (`jarvis_os/workflows/`)**:
-  - Execução automática de pipelines de código (Git branch, AST Impact Gate, Test Runner, PR Review) acionados por voz ou pelo `RoutineDiscoveryEngine`.
+- ✅ **Fase 1 (Concluída) — Servidor HTTP/SSE + Dashboard Dedicado (`jarvis_os/server/` & `jarvis_os/ui/`)**:
+  - Servidor HTTP/SSE multithreaded zero-dependências dedicado ao **J.A.R.V.I.S. Cortex OS** com stream SSE em tempo real (`/api/events`), Orbe 60 FPS com FFT WebAudio real e consola de voz contínua (Wake-Word `"Hey Jarvis"`).
+- ✅ **Fase 2 (Concluída) — Sidecar de Automação Desktop (`jarvis_os/sidecar/`)**:
+  - Inspirado no `@usejarvis/sidecar`: enumeração de janelas (`EnumWindows` / `/proc`), inspeção de clipboard com `TrustBoundaryGate`, atalhos globais (`Alt+Space`, `Ctrl+Shift+J`, `Ctrl+Shift+P`, `Ctrl+Shift+G`) e `WakeWordDetector`.
+- ✅ **Fase 3 (Concluída) — Conetores de Workflow & Git/CI (`jarvis_os/workflows/`)**:
+  - Execução automática de pipelines de código (`analyze_python_ast`, `inspect_git_workspace`, `run_unit_test_gate`) interligados diretamente com o `TodayContractGate`.
 
 ---
 

@@ -148,6 +148,18 @@ sequenceDiagram
   - **Acoustic Comb Resonance**: 18.5ms reflection delay with feedback decay simulating the titanium-gold helmet interior.
   - **Harmonic Soft Saturation**: Analog RF transceiver soft-clipping.
 
+### 10. `server.http_sse` & `ui.dashboard` (Real-Time HTTP/SSE & Mark-VII HUD 60 FPS)
+- Multithreaded zero-dependency HTTP & Server-Sent Events (`/api/events`) server.
+- Dedicated **Mark-VII HUD Dashboard** with a 60 FPS Canvas Acoustic & Synaptic Orb, live WebAudio Skywalker Sound DSP filter chain, HippoRAG 2 associative graph visualizer, and continuous Wake-Word (`"Hey Jarvis"`) console.
+
+### 11. `sidecar.desktop_agent` (Desktop Sidecar & Wake-Word Radar)
+- Cross-platform active window enumeration (`EnumWindows` on Win32 / `/proc` on POSIX).
+- Authority-aware global hotkeys (`Alt+Space`, `Ctrl+Shift+J`, `Ctrl+Shift+P`, `Ctrl+Shift+G`) and clipboard prompt-injection scanner backed by `TrustBoundaryGate`.
+
+### 12. `workflows.engine` (Autonomous AST & Test Verification Workflows)
+- Static Python AST structural & cyclomatic complexity analyzer with SHA-256 provenance.
+- Timeout-bounded Git workspace inspector and in-memory `unittest` runner wired directly into `TodayContractGate`.
+
 ---
 
 ## 🚀 Quickstart / Início Rápido
@@ -169,8 +181,8 @@ python -m jarvis_os.cli status
 # 2. Deterministic Next-Action Plan (Q-18) & Today Contracts
 python -m jarvis_os.cli plan
 
-# 3. Executive Bilingual Briefing (PT-BR & EN-US)
-python -m jarvis_os.cli briefing
+# 3. Executive Briefing (PT-PT / EN-US)
+python -m jarvis_os.cli briefing --lang pt
 
 # 4. Executive Briefing with Mark-VII Audio DSP Synthesis
 python -m jarvis_os.cli briefing --voice --preset MARK_VII_HELMET
@@ -183,6 +195,15 @@ python -m jarvis_os.cli memory search "Mark VII thrusters"
 
 # 7. Discover Autonomous Workflow Routines
 python -m jarvis_os.cli routine discover
+
+# 8. Inspect Desktop Sidecar, Active Windows & Hotkeys
+python -m jarvis_os.cli sidecar
+
+# 9. Run Autonomous AST & Unit Test Verification Workflow
+python -m jarvis_os.cli workflow
+
+# 10. Launch Real-Time HTTP/SSE Server & Mark-VII HUD Dashboard
+python -m jarvis_os.cli serve --port 8765
 ```
 
 ---
@@ -207,9 +228,12 @@ test_07_vault_extractor ... ok
 test_08_routine_discovery ... ok
 test_09_trust_boundary_and_canary ... ok
 test_10_mark_vii_audio_dsp ... ok
+test_11_desktop_sidecar_and_wake_word ... ok
+test_12_workflow_engine_and_ast_gate ... ok
+test_13_http_sse_server_endpoints ... ok
 
 ----------------------------------------------------------------------
-Ran 10 tests in 0.081s
+Ran 13 tests in 0.095s
 
 OK
 ```

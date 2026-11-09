@@ -14,8 +14,13 @@
 - `jarvis_os/intelligence/routine_discovery.py`: Evidence-Backed Routine Discovery (`routine-cues-v2`).
 - `jarvis_os/security/trust_boundary.py`: Authority-Aware Tool Relevance & Prompt-Injection Canary (`TrustBoundaryGate`).
 - `jarvis_os/voice/mark_vii_tts.py`: Skywalker Sound Mark-VII Helmet HUD Acoustic Synthesizer (`MarkVIISpeechSynthesizer`).
-- `jarvis_os/cli.py`: Unified CLI entrypoint.
+- `jarvis_os/server/http_sse.py`: Real-Time HTTP & Server-Sent Events (SSE) Server (`JarvisHTTPServer`, `JarvisCortexState`).
+- `jarvis_os/ui/dashboard.html`: Dedicated Mark-VII HUD 60 FPS WebGL/Canvas Orb, WebAudio DSP & Wake-Word Console.
+- `jarvis_os/sidecar/desktop_agent.py`: Desktop Sidecar Agent, Wake-Word Detector, Window Enumerator & Clipboard Guard (`DesktopSidecar`, `WakeWordDetector`).
+- `jarvis_os/workflows/engine.py`: Autonomous Python AST Impact Analyzer, Git Inspector & Live Unit Test Verification Gate (`WorkflowEngine`).
+- `jarvis_os/cli.py`: Unified CLI entrypoint (`status`, `plan`, `briefing`, `memory`, `routine`, `serve`, `sidecar`, `workflow`).
 
 ## 3. Verification Before Completion
 - Always run `python -m unittest discover -s tests -v` before committing or pushing to `origin/main`.
 - Always respond to the user in **European Portuguese (PT-PT)**.
+
