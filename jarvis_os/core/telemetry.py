@@ -82,6 +82,7 @@ class TelemetryRadar:
         6379: "Redis",
         8000: "FastAPI/Django",
         8080: "HTTP-Alt/Proxy",
+        8765: "Jarvis-Cortex-HUD",
         11434: "Ollama/LocalLLM",
         27017: "MongoDB",
     }
