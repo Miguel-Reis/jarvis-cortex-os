@@ -417,9 +417,81 @@ class TestJarvisCortexOS(unittest.TestCase):
                 sse_raw = resp.read().decode("utf-8")
                 self.assertIn("event: telemetry", sse_raw)
                 self.assertIn("data: {", sse_raw)
+
+            # 5. GET /api/brain/status
+            with urllib.request.urlopen(f"{base_url}/api/brain/status", timeout=3) as resp:
+                brain_st = json.loads(resp.read().decode("utf-8"))
+                self.assertIn("brain_url", brain_st)
+                self.assertNotEqual(brain_st["brain_port"], brain_st["jarvis_port"])
         finally:
             srv.shutdown()
             srv.server_close()
+
+    # ---------------------------------------------------------
+    # 13. Bi-Directional BrainBridge (Jarvis :8766 <-> Brain :8765)
+    # ---------------------------------------------------------
+    def test_14_brain_bridge_cross_port_sync(self) -> None:
+        import json
+        import threading
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+        from jarvis_os.core.brain_bridge import BrainBridge
+
+        class MockBrainHandler(BaseHTTPRequestHandler):
+            def log_message(self, format: str, *args: object) -> None:
+                pass
+
+            def do_GET(self) -> None:
+                if self.path.startswith("/api/memories"):
+                    payload = json.dumps([
+                        {"category": "BrainVault", "content": "Antigravity Brain port 8765 linked to Jarvis 8766."}
+                    ]).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(payload)))
+                    self.end_headers()
+                    self.wfile.write(payload)
+                else:
+                    payload = json.dumps({"ok": True, "engine": "antigravity-brain"}).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(payload)))
+                    self.end_headers()
+                    self.wfile.write(payload)
+
+            def do_POST(self) -> None:
+                payload = json.dumps({"ok": True, "reply": "Command acknowledged by Antigravity Brain"}).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+        mock_brain = HTTPServer(("127.0.0.1", 0), MockBrainHandler)
+        brain_port = mock_brain.server_address[1]
+        t = threading.Thread(target=mock_brain.serve_forever, kwargs={"poll_interval": 0.02}, daemon=True)
+        t.start()
+
+        try:
+            bridge = BrainBridge(brain_url=f"http://127.0.0.1:{brain_port}", jarvis_port=8766)
+            st = bridge.probe(auto_discover=False)
+            self.assertTrue(st.connected)
+            self.assertTrue(st.http_online)
+            self.assertEqual(st.brain_port, brain_port)
+            self.assertEqual(st.jarvis_port, 8766)
+
+            # Sync memories from Mock Brain into Jarvis SynapticDB
+            db = SynapticDB(":memory:")
+            sync_res = bridge.sync_with_brain(db)
+            self.assertEqual(sync_res["imported_memories"], 1)
+            self.assertEqual(db.count_memories(), 1)
+
+            # Forward directive from Jarvis (8766) to Brain
+            disp = bridge.dispatch_to_brain("Status check", {"mode": "STARK_EXECUTIVE"})
+            self.assertTrue(disp["forwarded"])
+            self.assertTrue(disp["brain_connected"])
+        finally:
+            mock_brain.shutdown()
+            mock_brain.server_close()
 
 
 if __name__ == "__main__":

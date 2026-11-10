@@ -17,6 +17,7 @@ import os
 import sys
 import time
 
+from jarvis_os.core.brain_bridge import BrainBridge
 from jarvis_os.core.telemetry import TelemetryRadar
 from jarvis_os.memory.synaptic_db import SynapticDB
 from jarvis_os.planning.next_action import ActionCandidate, NextActionPlanner
@@ -33,10 +34,12 @@ def cmd_status(args: argparse.Namespace) -> None:
     pers = PersonalityEngine()
     profile = pers.get_profile(PersonalityMode.STARK_EXECUTIVE)
     sec = TrustBoundaryGate()
+    bridge = BrainBridge(jarvis_port=8766)
+    brain_st = bridge.probe(auto_discover=True)
 
-    print("\n" + "=" * 64)
+    print("\n" + "=" * 68)
     print("  J.A.R.V.I.S. CORTEX OS — SYSTEM TELEMETRY & COGNITIVE RADAR")
-    print("=" * 64)
+    print("=" * 68)
     print(f" Host:             {report.hostname} ({report.os_name} {report.os_version})")
     print(f" CPU Cores:        {report.cpu_count}")
     print(f" Uptime:           {report.uptime_seconds:.1f} s ({report.uptime_seconds / 3600.0:.2f} hrs)")
@@ -47,15 +50,19 @@ def cmd_status(args: argparse.Namespace) -> None:
     print("\n [PORT RADAR]")
     if report.open_ports:
         for p in report.open_ports:
-            print(f"   -> Port {p.port:<5} | {p.service:<15} | OPEN ({p.latency_ms:.1f} ms)")
+            print(f"   -> Port {p.port:<5} | {p.service:<18} | OPEN ({p.latency_ms:.1f} ms)")
     else:
         print("   -> No monitored local ports open.")
+
+    print("\n [BRAIN BRIDGE (Jarvis :8766 ⇄ Brain :8765)]")
+    print(f"   Status:           {brain_st.status_label}")
+    print(f"   Target Brain URL: {brain_st.brain_url}")
 
     print(f"\n [COGNITIVE STATE]")
     print(f"   Personality Mode: {profile.mode.value}")
     print(f"   Cadence:          Conciseness={profile.conciseness:.2f}, Technicality={profile.technicality:.2f}")
     print(f"   Security Gate:    Canaries Active={len(sec.active_canaries)}, Boundary=NOMINAL")
-    print("=" * 64 + "\n")
+    print("=" * 68 + "\n")
 
 
 def cmd_plan(args: argparse.Namespace) -> None:
@@ -198,7 +205,24 @@ def cmd_routine(args: argparse.Namespace) -> None:
 
 def cmd_serve(args: argparse.Namespace) -> None:
     from jarvis_os.server.http_sse import run_server
-    run_server(host=args.host, port=args.port, db_path=args.db_path)
+    run_server(host=args.host, port=args.port, db_path=args.db_path, brain_url=args.brain_url)
+
+
+def cmd_brain(args: argparse.Namespace) -> None:
+    bridge = BrainBridge(brain_url=args.url, jarvis_port=8766)
+    st = bridge.probe(auto_discover=True)
+    print("\n" + "=" * 68)
+    print("  J.A.R.V.I.S. CORTEX OS (:8766) ⇄ ANTIGRAVITY BRAIN (:8765) BRIDGE")
+    print("=" * 68)
+    print(f" Status:           {st.status_label}")
+    print(f" Brain URL:        {st.brain_url}")
+    print(f" HTTP Online:      {st.http_online}")
+    print(f" SQLite Linked:    {st.sqlite_linked} ({st.sqlite_db_path or 'N/A'})")
+    if args.sync:
+        db = SynapticDB(args.db_path)
+        sync_res = bridge.sync_with_brain(db)
+        print(f" Synced Memories:  {sync_res['imported_memories']} imported into SynapticDB")
+    print("=" * 68 + "\n")
 
 
 def cmd_sidecar(args: argparse.Namespace) -> None:
@@ -276,11 +300,19 @@ def main() -> None:
     p_disc.set_defaults(func=cmd_routine)
 
     # serve
-    p_serve = subparsers.add_parser("serve", help="Start HTTP/SSE Server & Mark-VII HUD Dashboard")
+    p_serve = subparsers.add_parser("serve", help="Start HTTP/SSE Server (Port 8766) & Link to Brain (Port 8765)")
     p_serve.add_argument("--host", default="127.0.0.1", help="Bind host")
-    p_serve.add_argument("--port", type=int, default=8765, help="Bind port")
+    p_serve.add_argument("--port", type=int, default=8766, help="Dedicated Jarvis port (default: 8766)")
+    p_serve.add_argument("--brain-url", default="http://127.0.0.1:8765", help="Antigravity Brain URL (default: http://127.0.0.1:8765)")
     p_serve.add_argument("--db-path", default=":memory:", help="SQLite DB path")
     p_serve.set_defaults(func=cmd_serve)
+
+    # brain
+    p_brain = subparsers.add_parser("brain", help="Inspect & sync BrainBridge (Jarvis :8766 <-> Brain :8765)")
+    p_brain.add_argument("--url", default="http://127.0.0.1:8765", help="Antigravity Brain URL")
+    p_brain.add_argument("--sync", action="store_true", help="Sync memories from Brain into SynapticDB")
+    p_brain.add_argument("--db-path", default="jarvis_synaptic.db", help="SQLite DB path")
+    p_brain.set_defaults(func=cmd_brain)
 
     # sidecar
     p_sidecar = subparsers.add_parser("sidecar", help="Inspect Desktop Sidecar, Windows & Hotkeys")

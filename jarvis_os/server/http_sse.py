@@ -17,6 +17,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, List, Optional
 from urllib.parse import parse_qs, urlparse
 
+from jarvis_os.core.brain_bridge import BrainBridge
 from jarvis_os.core.telemetry import TelemetryRadar
 from jarvis_os.intelligence.personality import PersonalityEngine, PersonalityMode
 from jarvis_os.intelligence.routine_discovery import RoutineDiscoveryEngine
@@ -31,10 +32,17 @@ from jarvis_os.voice.mark_vii_tts import AudioDSPPreset, MarkVIISpeechSynthesize
 class JarvisCortexState:
     """Thread-safe unified cognitive state orchestrating all J.A.R.V.I.S. Cortex OS subsystems."""
 
-    def __init__(self, db_path: str = ":memory:") -> None:
+    def __init__(
+        self,
+        db_path: str = ":memory:",
+        jarvis_port: int = 8766,
+        brain_url: str = "http://127.0.0.1:8765",
+    ) -> None:
         self.lock = threading.RLock()
         self.started_at = time.time()
+        self.jarvis_port = jarvis_port
         self.radar = TelemetryRadar()
+        self.brain_bridge = BrainBridge(brain_url=brain_url, jarvis_port=jarvis_port)
         self.db_path = db_path
         self.memory = SynapticDB(db_path)
         self.planner = NextActionPlanner()
@@ -51,6 +59,11 @@ class JarvisCortexState:
 
         self.event_log: List[Dict[str, Any]] = []
         self._seed_initial_state()
+        # Attempt initial automatic memory sync from Antigravity Brain (8765 / brain.db)
+        try:
+            self.brain_bridge.sync_with_brain(self.memory)
+        except Exception:
+            pass
 
     @property
     def sidecar(self) -> Any:
@@ -553,6 +566,11 @@ class JarvisHTTPRequestHandler(BaseHTTPRequestHandler):
                 self._send_json({"available": False})
             return
 
+        if path == "/api/brain/status":
+            auto_disc = qs.get("discover", ["1"])[0] == "1"
+            self._send_json(self.cortex.brain_bridge.probe(auto_discover=auto_disc).to_dict())
+            return
+
         if path == "/api/events":
             # Server-Sent Events (SSE) stream
             once = qs.get("once", ["0"])[0] == "1"
@@ -571,6 +589,7 @@ class JarvisHTTPRequestHandler(BaseHTTPRequestHandler):
                         "memory": self.cortex.radar.get_memory_stats().__dict__,
                         "uptime": self.cortex.radar.get_uptime_seconds(),
                         "contracts": self.cortex.contract_gate.get_summary(),
+                        "brain_bridge": self.cortex.brain_bridge.probe(auto_discover=False).to_dict(),
                         "recent_events": self.cortex.event_log[-5:],
                     }
                     msg = f"event: telemetry\ndata: {json.dumps(snapshot)}\n\n"
@@ -598,6 +617,24 @@ class JarvisHTTPRequestHandler(BaseHTTPRequestHandler):
                 return
             result = self.cortex.process_directive(text, lang=lang)
             self._send_json(result)
+            return
+
+        if path == "/api/brain/sync":
+            with self.cortex.lock:
+                sync_res = self.cortex.brain_bridge.sync_with_brain(self.cortex.memory)
+                self.cortex._record_event(
+                    "BRAIN_BRIDGE_SYNC",
+                    f"Imported={sync_res['imported_memories']} from {sync_res['brain_status']['brain_url']}",
+                )
+            self._send_json(sync_res)
+            return
+
+        if path == "/api/brain/config":
+            new_url = str(body.get("brain_url", "http://127.0.0.1:8765")).strip()
+            with self.cortex.lock:
+                status = self.cortex.brain_bridge.set_brain_url(new_url)
+                self.cortex._record_event("BRAIN_BRIDGE_CONFIG", f"Target Brain set to {status.brain_url}")
+            self._send_json(status.to_dict())
             return
 
         if path == "/api/memory/ingest":
@@ -751,32 +788,38 @@ class JarvisHTTPServer(ThreadingHTTPServer):
         server_address: tuple[str, int],
         cortex_state: Optional[JarvisCortexState] = None,
     ) -> None:
-        self.cortex_state = cortex_state or JarvisCortexState()
+        self.cortex_state = cortex_state or JarvisCortexState(jarvis_port=server_address[1])
         super().__init__(server_address, JarvisHTTPRequestHandler)
+        self.cortex_state.jarvis_port = self.server_address[1]
+        self.cortex_state.brain_bridge.jarvis_port = self.server_address[1]
 
 
 def create_server(
     host: str = "127.0.0.1",
-    port: int = 8765,
+    port: int = 8766,
     db_path: str = ":memory:",
+    brain_url: str = "http://127.0.0.1:8765",
 ) -> JarvisHTTPServer:
-    state = JarvisCortexState(db_path=db_path)
+    state = JarvisCortexState(db_path=db_path, jarvis_port=port, brain_url=brain_url)
     return JarvisHTTPServer((host, port), cortex_state=state)
 
 
 def run_server(
     host: str = "127.0.0.1",
-    port: int = 8765,
+    port: int = 8766,
     db_path: str = ":memory:",
+    brain_url: str = "http://127.0.0.1:8765",
 ) -> None:
-    srv = create_server(host=host, port=port, db_path=db_path)
-    print("\n" + "=" * 68)
+    srv = create_server(host=host, port=port, db_path=db_path, brain_url=brain_url)
+    brain_st = srv.cortex_state.brain_bridge.probe(auto_discover=True)
+    print("\n" + "=" * 72)
     print("  J.A.R.V.I.S. CORTEX OS — MARK-VII HTTP/SSE SERVER ONLINE")
-    print("=" * 68)
-    print(f"  HUD Dashboard:   http://{host}:{port}/")
+    print("=" * 72)
+    print(f"  Jarvis HUD:      http://{host}:{port}/   (Porta dedicada Jarvis: {port})")
     print(f"  SSE Stream:      http://{host}:{port}/api/events")
+    print(f"  Brain Bridge:    {brain_st.status_label}")
     print(f"  Engine Mode:     ANTIGRAVITY_NATIVE_ZERO_OLLAMA (0 GB VRAM)")
-    print("=" * 68 + "\n")
+    print("=" * 72 + "\n")
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
