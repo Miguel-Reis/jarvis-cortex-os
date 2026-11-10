@@ -493,7 +493,34 @@ class TestJarvisCortexOS(unittest.TestCase):
             mock_brain.shutdown()
             mock_brain.server_close()
 
+    # ---------------------------------------------------------
+    # 14. Google AI Studio Build Mode Compatibility
+    # ---------------------------------------------------------
+    def test_15_google_aistudio_compatibility(self) -> None:
+        import json
+        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        meta_path = os.path.join(repo_root, "metadata.json")
+        pkg_path = os.path.join(repo_root, "package.json")
+        app_path = os.path.join(repo_root, "app.py")
+        idx_path = os.path.join(repo_root, "index.html")
+
+        self.assertTrue(os.path.exists(meta_path))
+        self.assertTrue(os.path.exists(pkg_path))
+        self.assertTrue(os.path.exists(app_path))
+        self.assertTrue(os.path.exists(idx_path))
+
+        with open(meta_path, "r", encoding="utf-8") as f:
+            meta = json.load(f)
+        self.assertIn("name", meta)
+        self.assertIn("majorCapabilities", meta)
+
+        with open(pkg_path, "r", encoding="utf-8") as f:
+            pkg = json.load(f)
+        self.assertEqual(pkg.get("scripts", {}).get("dev"), "python3 app.py")
+        self.assertEqual(pkg.get("scripts", {}).get("start"), "python3 app.py")
+
 
 if __name__ == "__main__":
     unittest.main()
+
 

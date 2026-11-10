@@ -242,6 +242,7 @@ class JarvisCortexState:
                 "memory_Stats": {
                     "total_memories": self.memory.count_memories(),
                 },
+                "brain_bridge": self.brain_bridge.probe(auto_discover=False).to_dict(),
                 "sidecar": sidecar_info,
                 "recent_events": self.event_log[-10:],
             }
@@ -476,10 +477,20 @@ class JarvisHTTPRequestHandler(BaseHTTPRequestHandler):
                 self.send_response(HTTPStatus.OK)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.send_header("Content-Length", str(len(content)))
+                self.send_header("Access-Control-Allow-Origin", "*")
                 self.end_headers()
                 self.wfile.write(content)
             else:
                 self._send_json({"status": "UI initializing", "engine": "J.A.R.V.I.S. Cortex OS"})
+            return
+
+        if path in ("/metadata.json", "/manifest.json"):
+            self._send_json({
+                "name": "J.A.R.V.I.S. Cortex OS — Mark-VII Tactical HUD & Zero-Ollama Cognitive Brain",
+                "description": "Autonomous Zero-Ollama Cognitive & Workflow Operating Brain: SQLite WAL + FTS5 BM25 + 128-D LSH SimHash + HippoRAG 2 PPR, Q-18 Deterministic Planner, Today Outcome Verification Gate, Adaptive Personality Engine, Skywalker Sound Mark-VII WebAudio DSP, Desktop Sidecar, and Cross-Port Bridge (:8766 ⇄ :8765 Antigravity Brain).",
+                "requestFramePermissions": ["microphone"],
+                "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"],
+            })
             return
 
         if path == "/api/status":
@@ -610,12 +621,13 @@ class JarvisHTTPRequestHandler(BaseHTTPRequestHandler):
         body = self._read_json_body()
 
         if path == "/api/directive":
-            text = str(body.get("text", "")).strip()
+            text = str(body.get("text") or body.get("directive") or "").strip()
             lang = str(body.get("lang", "pt")).strip()
             if not text:
-                self._send_json({"error": "Missing 'text' field"}, status=HTTPStatus.BAD_REQUEST)
+                self._send_json({"error": "Missing 'text' or 'directive' field"}, status=HTTPStatus.BAD_REQUEST)
                 return
             result = self.cortex.process_directive(text, lang=lang)
+            result["response"] = result.get("response_text", "")
             self._send_json(result)
             return
 

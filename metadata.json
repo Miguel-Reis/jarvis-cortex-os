@@ -1,0 +1,10 @@
+{
+  "name": "J.A.R.V.I.S. Cortex OS — Mark-VII Tactical HUD & Zero-Ollama Cognitive Brain",
+  "description": "Autonomous Zero-Ollama Cognitive & Workflow Operating Brain: SQLite WAL + FTS5 BM25 + 128-D LSH SimHash + HippoRAG 2 PPR, Q-18 Deterministic Planner, Today Outcome Verification Gate, Adaptive Personality Engine, Skywalker Sound Mark-VII WebAudio DSP, Desktop Sidecar, and Cross-Port Bridge (:8766 ⇄ :8765 Antigravity Brain).",
+  "requestFramePermissions": [
+    "microphone"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
