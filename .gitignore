@@ -42,10 +42,17 @@ ENV/
 .DS_Store
 Thumbs.db
 
-# Google AI Studio artifacts & legacy build config (avoid PEP-668 pip failure)
+# Google AI Studio artifacts & Node/legacy build artifacts
 .aistudio/
 public/assets/aistudio/
+node_modules/
+package-lock.json
+bun.lock
+bun.lockb
+yarn.lock
+pnpm-lock.yaml
 pyproject.toml
 requirements.txt
+
 
 

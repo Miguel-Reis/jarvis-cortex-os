@@ -59,11 +59,14 @@ class JarvisCortexState:
 
         self.event_log: List[Dict[str, Any]] = []
         self._seed_initial_state()
-        # Attempt initial automatic memory sync from Antigravity Brain (8765 / brain.db)
-        try:
-            self.brain_bridge.sync_with_brain(self.memory)
-        except Exception:
-            pass
+        # Non-blocking background memory sync from Antigravity Brain (8765 / brain.db)
+        def _bg_brain_sync() -> None:
+            try:
+                self.brain_bridge.sync_with_brain(self.memory)
+            except Exception:
+                pass
+
+        threading.Thread(target=_bg_brain_sync, name="JarvisBrainBootSync", daemon=True).start()
 
     @property
     def sidecar(self) -> Any:
@@ -444,6 +447,7 @@ class JarvisHTTPRequestHandler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Access-Control-Allow-Private-Network", "true")
         self.end_headers()
         self.wfile.write(raw)
 
@@ -462,6 +466,7 @@ class JarvisHTTPRequestHandler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Access-Control-Allow-Private-Network", "true")
         self.end_headers()
 
     def do_GET(self) -> None:
@@ -482,6 +487,23 @@ class JarvisHTTPRequestHandler(BaseHTTPRequestHandler):
                 self.wfile.write(content)
             else:
                 self._send_json({"status": "UI initializing", "engine": "J.A.R.V.I.S. Cortex OS"})
+            return
+
+        if path == "/favicon.ico":
+            svg = (
+                '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">'
+                '<circle cx="32" cy="32" r="28" fill="#06101a" stroke="#0ec4e8" stroke-width="4"/>'
+                '<circle cx="32" cy="32" r="12" fill="#0ec4e8"/></svg>'
+            ).encode("utf-8")
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "image/svg+xml")
+            self.send_header("Content-Length", str(len(svg)))
+            self.end_headers()
+            self.wfile.write(svg)
+            return
+
+        if path == "/api/health":
+            self._send_json({"status": "ok", "engine": "J.A.R.V.I.S. Cortex OS", "port": self.cortex.jarvis_port})
             return
 
         if path in ("/metadata.json", "/manifest.json"):
@@ -822,19 +844,36 @@ def run_server(
     db_path: str = ":memory:",
     brain_url: str = "http://127.0.0.1:8765",
 ) -> None:
+    import sys
+
+    if getattr(sys, "stdout", None) is not None and hasattr(sys.stdout, "reconfigure"):
+        try:
+            sys.stdout.reconfigure(encoding="utf-8")
+        except Exception:
+            pass
+
     srv = create_server(host=host, port=port, db_path=db_path, brain_url=brain_url)
-    brain_st = srv.cortex_state.brain_bridge.probe(auto_discover=True)
-    print("\n" + "=" * 72)
-    print("  J.A.R.V.I.S. CORTEX OS — MARK-VII HTTP/SSE SERVER ONLINE")
-    print("=" * 72)
-    print(f"  Jarvis HUD:      http://{host}:{port}/   (Porta dedicada Jarvis: {port})")
-    print(f"  SSE Stream:      http://{host}:{port}/api/events")
-    print(f"  Brain Bridge:    {brain_st.status_label}")
-    print(f"  Engine Mode:     ANTIGRAVITY_NATIVE_ZERO_OLLAMA (0 GB VRAM)")
-    print("=" * 72 + "\n")
+
+    def _bg_probe() -> None:
+        try:
+            srv.cortex_state.brain_bridge.probe(auto_discover=True)
+        except Exception:
+            pass
+
+    threading.Thread(target=_bg_probe, name="JarvisBrainProbe", daemon=True).start()
+
+    print("\n" + "=" * 72, flush=True)
+    print("  J.A.R.V.I.S. CORTEX OS - MARK-VII HTTP/SSE SERVER ONLINE", flush=True)
+    print("=" * 72, flush=True)
+    print(f"  Jarvis HUD:      http://{host}:{port}/   (Porta dedicada Jarvis: {port})", flush=True)
+    print(f"  SSE Stream:      http://{host}:{port}/api/events", flush=True)
+    print(f"  Brain Bridge:    {brain_url}", flush=True)
+    print("  Engine Mode:     ANTIGRAVITY_NATIVE_ZERO_OLLAMA (0 GB VRAM)", flush=True)
+    print("=" * 72 + "\n", flush=True)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
         srv.server_close()
+

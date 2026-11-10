@@ -3,6 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Ccircle cx='32' cy='32' r='28' fill='%2306101a' stroke='%230ec4e8' stroke-width='4'/%3E%3Ccircle cx='32' cy='32' r='12' fill='%230ec4e8'/%3E%3C/svg%3E" />
   <title>J.A.R.V.I.S. Cortex OS — Mark-VII Tactical HUD</title>
   <style>
     :root {
@@ -2494,8 +2495,11 @@
         let jarvisOnline = false;
         let brainOnline = false;
 
+        const isHttpsOrigin = window.location.protocol === 'https:';
+        const candidateBases = isHttpsOrigin ? [''] : ['', 'http://127.0.0.1:8766'];
+
         // 1. Probe Jarvis Cortex OS (:8766 or current origin)
-        for (const base of ['', 'http://127.0.0.1:8766']) {
+        for (const base of candidateBases) {
           try {
             const statusRes = await fetch(`${base}/api/status`, { cache: 'no-store' });
             if (statusRes.ok) {
@@ -2515,31 +2519,33 @@
           } catch (_) {}
         }
 
-        // 2. Also probe Antigravity Brain directly on Port 8765 (http://127.0.0.1:8765)
-        try {
-          const brainRes = await fetch('http://127.0.0.1:8765/api/memories', { cache: 'no-store' });
-          if (brainRes.ok) {
-            brainOnline = true;
-            const memData = await brainRes.json();
-            const items = Array.isArray(memData) ? memData : (memData.memories || memData.items || []);
-            if (Array.isArray(items) && items.length > 0) {
-              items.slice(0, 6).forEach((m, idx) => {
-                const topic = m.category || m.workspace || 'Brain:8765';
-                const content = m.content || m.fact || '';
-                if (content && !STATE.memories.some((x) => x.content === content)) {
-                  STATE.memories.unshift({
-                    id: `brain-${m.id || idx}`,
-                    topic,
-                    content,
-                    confidence: 0.98,
-                    lsh: '8765b4a19c0e7712'
-                  });
-                }
-              });
-              renderMemoryResults();
+        // 2. Probe Antigravity Brain directly on Port 8765 when running locally (non-HTTPS)
+        if (!isHttpsOrigin) {
+          try {
+            const brainRes = await fetch('http://127.0.0.1:8765/api/memories', { cache: 'no-store' });
+            if (brainRes.ok) {
+              brainOnline = true;
+              const memData = await brainRes.json();
+              const items = Array.isArray(memData) ? memData : (memData.memories || memData.items || []);
+              if (Array.isArray(items) && items.length > 0) {
+                items.slice(0, 6).forEach((m, idx) => {
+                  const topic = m.category || m.workspace || 'Brain:8765';
+                  const content = m.content || m.fact || '';
+                  if (content && !STATE.memories.some((x) => x.content === content)) {
+                    STATE.memories.unshift({
+                      id: `brain-${m.id || idx}`,
+                      topic,
+                      content,
+                      confidence: 0.98,
+                      lsh: '8765b4a19c0e7712'
+                    });
+                  }
+                });
+                renderMemoryResults();
+              }
             }
-          }
-        } catch (_) {}
+          } catch (_) {}
+        }
 
         if (jarvisOnline && brainOnline) {
           sseDot.className = 'status-dot';

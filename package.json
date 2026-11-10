@@ -4,11 +4,15 @@
   "version": "1.0.0",
   "type": "module",
   "scripts": {
-    "dev": "python3 app.py",
-    "start": "python3 app.py",
-    "build": "echo 'Python project - no build step required'",
-    "preview": "python3 app.py"
+    "dev": "node server.mjs",
+    "build": "node server.mjs --build",
+    "start": "node server.mjs",
+    "preview": "node server.mjs"
   },
-  "dependencies": {},
-  "devDependencies": {}
+  "dependencies": {
+    "@google/genai": "^1.29.0"
+  },
+  "devDependencies": {
+    "vite": "^6.2.0"
+  }
 }
