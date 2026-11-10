@@ -1131,7 +1131,10 @@ function ensureV3Migration(state: JarvisStoreData, seed: JarvisStoreData): Jarvi
       state.mcpRegistryResources && state.mcpRegistryResources.length > 0
         ? state.mcpRegistryResources
         : seed.mcpRegistryResources,
-    mcpServers: state.mcpServers ?? seed.mcpServers,
+    mcpServers: (state.mcpServers ?? seed.mcpServers ?? []).map((s) => ({
+      ...s,
+      jevEligible: s.jevEligible ?? true,
+    })),
   };
 }
 

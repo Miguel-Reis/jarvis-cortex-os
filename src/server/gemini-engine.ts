@@ -632,8 +632,14 @@ export async function runAgentChatTurn(params: {
   // PreInvocation JEV-S1 Reflex Router (<1ms) + SCOUT-01 Lookahead + 5-Stage Token Diet
   const scoutIdx = await buildScoutWorkspaceIndex();
   const prevHash = roomDeltaHashes.get(room.id);
-  const activeMcpCatalog = state.mcpRegistryTools
+  const nativeEligible = state.mcpRegistryTools
     ? state.mcpRegistryTools.filter((t) => t.enabled && t.jevEligible).map((t) => t.name)
+    : undefined;
+  const externalEligible = (state.mcpServers || [])
+    .filter((s) => s.enabled && s.authStatus === 'AUTHORIZED' && s.jevEligible !== false)
+    .flatMap((s) => s.discoveredTools || []);
+  const activeMcpCatalog = nativeEligible
+    ? Array.from(new Set([...nativeEligible, ...externalEligible]))
     : undefined;
   const { decision: jevDecision, nextDeltaHash, compressedContextBlock } = routeJevS1({
     prompt: userText,

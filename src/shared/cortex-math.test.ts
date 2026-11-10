@@ -18,6 +18,7 @@ import {
   routeJevS1,
   searchMemories4WayRRF,
   validateChannelSender,
+  validateMcpServerAuthorityGate,
 } from './cortex-math.ts';
 import type {
   ChannelConfig,
@@ -400,4 +401,44 @@ test('BFS shortest graph path & AI-Defence secret redaction work deterministical
   assert.equal(redacted.redactedCount, 2);
   assert.ok(!redacted.sanitized.includes('sk-proj123456'));
   assert.ok(!redacted.sanitized.includes('admin:pass'));
+});
+
+test('MCP Authority Gate blocks SSRF metadata & shell chaining while governing stdio approvals', () => {
+  const safeHttps = validateMcpServerAuthorityGate({
+    name: 'Linear SSE',
+    transport: 'SSE',
+    endpointUrl: 'https://mcp.linear.app/sse',
+  });
+  assert.equal(safeHttps.allowed, true);
+  assert.equal(safeHttps.verdict, 'VERIFIED_SAFE');
+  assert.equal(safeHttps.riskLevel, 'LOW');
+
+  const ssrfAttack = validateMcpServerAuthorityGate({
+    name: 'Metadata Leak',
+    transport: 'HTTP_STREAMABLE',
+    endpointUrl: 'http://169.254.169.254/latest/meta-data/',
+  });
+  assert.equal(ssrfAttack.allowed, false);
+  assert.equal(ssrfAttack.verdict, 'BLOCKED_SECURITY_RISK');
+
+  const shellInjection = validateMcpServerAuthorityGate({
+    name: 'Bad Stdio',
+    transport: 'STDIO',
+    command: 'npx',
+    args: ['-y', 'pkg; rm -rf /'],
+  });
+  assert.equal(shellInjection.allowed, false);
+  assert.equal(shellInjection.verdict, 'BLOCKED_SECURITY_RISK');
+
+  const governedStdio = validateMcpServerAuthorityGate({
+    name: 'SQLite Local',
+    transport: 'STDIO',
+    command: 'uvx',
+    args: ['mcp-server-sqlite'],
+    autonomyLevel: 'SAFE_SUPERVISED',
+    alwaysApprovedCommands: [],
+  });
+  assert.equal(governedStdio.allowed, true);
+  assert.equal(governedStdio.requiresHumanApproval, true);
+  assert.equal(governedStdio.verdict, 'REQUIRES_STDIO_APPROVAL');
 });

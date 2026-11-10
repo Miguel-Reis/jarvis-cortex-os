@@ -14,6 +14,7 @@ import {
   redactAiDefenceSecrets,
   searchMemories4WayRRF,
   validateChannelSender,
+  validateMcpServerAuthorityGate,
 } from './src/shared/cortex-math.ts';
 import {
   buildDefaultMcpRegistryResources,
@@ -1198,6 +1199,62 @@ async function startServer() {
     res.json({ ok: true, overview: getMcpGatewayOverview() });
   });
 
+  app.post('/api/mcp/gateway/validate-server', (req, res) => {
+    const body = req.body || {};
+    const libItem = body.libraryId
+      ? MCP_STANDARD_LIBRARY.find((item) => item.id === String(body.libraryId))
+      : undefined;
+
+    const name = String(body.name || libItem?.name || 'Servidor MCP').trim();
+    const transport = (
+      ['HTTP_STREAMABLE', 'SSE', 'STDIO'].includes(body.transport)
+        ? body.transport
+        : libItem?.transport || 'HTTP_STREAMABLE'
+    ) as McpTransportType;
+
+    const endpointUrl =
+      transport !== 'STDIO'
+        ? String(body.endpointUrl || libItem?.defaultEndpointOrCommand || '').trim()
+        : undefined;
+
+    const command =
+      transport === 'STDIO'
+        ? String(body.command || libItem?.defaultEndpointOrCommand || '').trim()
+        : undefined;
+
+    const args: string[] =
+      transport === 'STDIO'
+        ? Array.isArray(body.args)
+          ? body.args.map(String).filter(Boolean)
+          : typeof body.args === 'string' && body.args.trim()
+            ? body.args.trim().split(/\s+/)
+            : libItem?.defaultArgs || []
+        : [];
+
+    const state = db.getState();
+    const gate = validateMcpServerAuthorityGate({
+      name,
+      transport,
+      endpointUrl,
+      command,
+      args,
+      autonomyLevel: state.settings.autonomyLevel,
+      alwaysApprovedCommands: state.settings.alwaysApprovedCommands,
+    });
+
+    if (!gate.allowed) {
+      db.appendAudit(
+        'AUTHORITY_GATE',
+        'SECURITY',
+        'MCP_VALIDATION_BLOCKED',
+        redactAiDefenceSecrets(`${name} [${transport}] Risco ${gate.riskScore}/100`).sanitized,
+        'BLOCKED'
+      );
+    }
+
+    res.json({ gate });
+  });
+
   app.post('/api/mcp/gateway/servers', async (req, res) => {
     const body = req.body || {};
     const libItem = body.libraryId
@@ -1239,13 +1296,32 @@ async function startServer() {
             : libItem?.defaultArgs || []
         : [];
 
-    if (transport !== 'STDIO' && !endpointUrl) {
-      res.status(400).json({ error: 'Endpoint URL é obrigatório para servidores HTTP Streamable ou SSE.' });
-      return;
-    }
+    const state = db.getState();
+    const gate = validateMcpServerAuthorityGate({
+      name,
+      transport,
+      endpointUrl,
+      command,
+      args,
+      autonomyLevel: state.settings.autonomyLevel,
+      alwaysApprovedCommands: state.settings.alwaysApprovedCommands,
+    });
 
-    if (transport === 'STDIO' && !command) {
-      res.status(400).json({ error: 'Comando executável é obrigatório para servidores stdio.' });
+    if (!gate.allowed) {
+      const failDetail =
+        gate.checks.find((c) => c.status === 'FAIL')?.detail ||
+        'Configuração bloqueada pelo Authority Gate.';
+      db.appendAudit(
+        'AUTHORITY_GATE',
+        'SECURITY',
+        'MCP_SERVER_BLOCKED',
+        redactAiDefenceSecrets(`${name} [${transport}]: ${failDetail}`).sanitized,
+        'BLOCKED'
+      );
+      res.status(403).json({
+        error: `Bloqueado pelo Authority Gate (Risco ${gate.riskScore}/100): ${failDetail}`,
+        gate,
+      });
       return;
     }
 
@@ -1270,11 +1346,8 @@ async function startServer() {
       .replace(/(^-|-$)/g, '');
 
     const fullStdioCmd = transport === 'STDIO' ? [command, ...args].join(' ').trim() : '';
-    const state = db.getState();
-    const stdioPreApproved =
-      transport !== 'STDIO' ||
-      state.settings.autonomyLevel === 'FULL_EXECUTIVE' ||
-      state.settings.alwaysApprovedCommands.includes(fullStdioCmd);
+    const stdioPreApproved = !gate.requiresHumanApproval;
+    const jevEligible = body.jevEligible !== false;
 
     const newServer: McpCustomServer = {
       id: serverId,
@@ -1290,6 +1363,7 @@ async function startServer() {
       args: transport === 'STDIO' ? args : undefined,
       envKeys: maskedEnvKeys,
       enabled: true,
+      jevEligible,
       authStatus: stdioPreApproved ? 'AUTHORIZED' : 'PENDING_APPROVAL',
       healthStatus: stdioPreApproved ? 'ONLINE' : 'PENDING_AUTH',
       lastLatencyMs: 0,
@@ -1297,8 +1371,9 @@ async function startServer() {
       lastCheckedAt: nowIso,
       lastError: stdioPreApproved
         ? undefined
-        : 'Aguarda autorização do comando stdio pelo Operador (Fronteira de Confiança).',
+        : 'Aguarda autorização do comando stdio pelo Operador (Authority Gate).',
       fromLibraryId: libItem?.id,
+      authorityGate: gate,
     };
 
     db.update((draft) => {
@@ -1311,7 +1386,7 @@ async function startServer() {
           title: `Autorizar Servidor MCP stdio (${name})`,
           commandOrAction: fullStdioCmd,
           source: 'MCP_GATEWAY',
-          riskLevel: 'MEDIUM',
+          riskLevel: gate.riskLevel === 'LOW' ? 'MEDIUM' : gate.riskLevel,
           requestedAt: nowIso,
           status: 'PENDING',
           mcpServerId: serverId,
@@ -1320,7 +1395,7 @@ async function startServer() {
     });
 
     const auditSummary = redactAiDefenceSecrets(
-      `${name} [${transport}] ${endpointUrl || fullStdioCmd}`
+      `${name} [${transport}] JEV-S1=${jevEligible ? 'ON' : 'OFF'} · Risco=${gate.riskScore}/100`
     ).sanitized;
     db.appendAudit(
       'OPERATOR',
@@ -1337,6 +1412,7 @@ async function startServer() {
     broadcastSse('state_updated', { section: 'mcp' });
     res.json({
       server: (db.getState().mcpServers || []).find((s) => s.id === serverId),
+      gate,
       overview: getMcpGatewayOverview(),
       approvals: db.getState().approvals,
     });
@@ -1392,30 +1468,38 @@ async function startServer() {
 
   app.patch('/api/mcp/gateway/servers/:id', async (req, res) => {
     const body = req.body || {};
-    let exists = false;
+    let updatedRef: McpCustomServer | null = null;
+    let shouldReprobe = false;
 
     db.update((draft) => {
       const target = (draft.mcpServers || []).find((s) => s.id === req.params.id);
       if (!target) return;
-      exists = true;
       if (typeof body.enabled === 'boolean') {
         target.enabled = body.enabled;
         if (!body.enabled) target.healthStatus = 'OFFLINE';
+        else shouldReprobe = true;
+      }
+      if (typeof body.jevEligible === 'boolean') {
+        target.jevEligible = body.jevEligible;
       }
       if (typeof body.endpointUrl === 'string' && body.endpointUrl.trim()) {
         target.endpointUrl = body.endpointUrl.trim();
+        shouldReprobe = true;
       }
       if (typeof body.description === 'string') {
         target.description = body.description.trim();
       }
+      updatedRef = { ...target };
     });
 
-    if (!exists) {
+    if (!updatedRef) {
       res.status(404).json({ error: 'Servidor MCP não encontrado.' });
       return;
     }
 
-    const updated = await probeExternalMcpServer(req.params.id, PORT);
+    const updated = shouldReprobe
+      ? await probeExternalMcpServer(req.params.id, PORT)
+      : updatedRef;
     broadcastSse('state_updated', { section: 'mcp' });
     res.json({ server: updated, overview: getMcpGatewayOverview() });
   });

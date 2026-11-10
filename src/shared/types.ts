@@ -630,6 +630,24 @@ export interface McpRegistryResourceItem {
   staticPayload?: string;
 }
 
+export interface McpAuthorityCheckItem {
+  id: string;
+  label: string;
+  status: 'PASS' | 'WARN' | 'FAIL';
+  detail: string;
+}
+
+export interface McpAuthorityGateResult {
+  allowed: boolean;
+  requiresHumanApproval: boolean;
+  riskScore: number;
+  riskLevel: 'LOW' | 'MEDIUM' | 'HIGH' | 'CRITICAL';
+  verdict: 'VERIFIED_SAFE' | 'REQUIRES_STDIO_APPROVAL' | 'BLOCKED_SECURITY_RISK';
+  checks: McpAuthorityCheckItem[];
+  redactedSecretsCount: number;
+  checkedAt: string;
+}
+
 export interface McpCustomServer {
   id: string;
   name: string;
@@ -642,6 +660,7 @@ export interface McpCustomServer {
   args?: string[];
   envKeys: Record<string, string>;
   enabled: boolean;
+  jevEligible: boolean;
   authStatus: 'AUTHORIZED' | 'PENDING_APPROVAL';
   healthStatus: 'ONLINE' | 'DEGRADED' | 'OFFLINE' | 'PENDING_AUTH';
   lastLatencyMs: number;
@@ -649,6 +668,7 @@ export interface McpCustomServer {
   lastCheckedAt: string;
   lastError?: string;
   fromLibraryId?: string;
+  authorityGate?: McpAuthorityGateResult;
 }
 
 export interface McpStandardLibraryItem {

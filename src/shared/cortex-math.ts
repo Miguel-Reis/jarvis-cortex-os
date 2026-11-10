@@ -1,4 +1,5 @@
 import type {
+  AutonomyLevel,
   ChannelConfig,
   GraphEdge,
   GraphNodeComputed,
@@ -6,6 +7,9 @@ import type {
   JevRouteDecision,
   LanguageCode,
   LookaheadAlert,
+  McpAuthorityCheckItem,
+  McpAuthorityGateResult,
+  McpTransportType,
   MemoryCategory,
   MemoryItem,
   MemoryRankedHit,
@@ -1173,4 +1177,234 @@ export function getVisibleSidebarIds(
     if (id === 'authority' && pendingApprovalsCount > 0) return true;
     return false;
   });
+}
+
+const TRUSTED_MCP_STDIO_RUNNERS = new Set([
+  'npx',
+  'uvx',
+  'node',
+  'python3',
+  'python',
+  'deno',
+  'bun',
+  'docker',
+]);
+
+/**
+ * Authority Gate Security Validator for MCP Server Connections (HTTP Streamable, SSE, stdio)
+ */
+export function validateMcpServerAuthorityGate(params: {
+  name: string;
+  transport: McpTransportType;
+  endpointUrl?: string;
+  command?: string;
+  args?: string[];
+  autonomyLevel?: AutonomyLevel;
+  alwaysApprovedCommands?: string[];
+}): McpAuthorityGateResult {
+  const {
+    name,
+    transport,
+    endpointUrl = '',
+    command = '',
+    args = [],
+    autonomyLevel = 'BALANCED_PROACTIVE',
+    alwaysApprovedCommands = [],
+  } = params;
+
+  const checks: McpAuthorityCheckItem[] = [];
+  let riskScore = 0;
+  let hardBlocked = false;
+  let requiresHumanApproval = false;
+
+  const combinedInput = `${name} ${endpointUrl} ${command} ${args.join(' ')}`.trim();
+
+  // 1. Canary & Prompt Injection Inspection
+  const canary = detectPromptInjection(combinedInput);
+  if (canary.blocked) {
+    hardBlocked = true;
+    riskScore = Math.min(100, riskScore + Math.max(85, canary.riskScore));
+    checks.push({
+      id: 'CANARY_INJECTION',
+      label: 'Filtro Canary Anti-Injeção',
+      status: 'FAIL',
+      detail: `Padrão de injeção intercetado (${canary.matchedRules.join(', ')}).`,
+    });
+  } else {
+    checks.push({
+      id: 'CANARY_INJECTION',
+      label: 'Filtro Canary Anti-Injeção',
+      status: 'PASS',
+      detail: 'Nenhum vetor de injeção ou exfiltração detetado nos parâmetros.',
+    });
+  }
+
+  // 2. Transport-Specific Security Inspection
+  if (transport === 'HTTP_STREAMABLE' || transport === 'SSE') {
+    const cleanUrl = endpointUrl.trim();
+    try {
+      const parsed = new URL(cleanUrl);
+      const host = parsed.hostname.toLowerCase();
+      const isLoopback = host === '127.0.0.1' || host === 'localhost' || host === '::1';
+      const isMetadataSsrf =
+        host === '169.254.169.254' ||
+        host === 'metadata.google.internal' ||
+        host.startsWith('169.254.') ||
+        host === '0.0.0.0';
+
+      if (!['http:', 'https:'].includes(parsed.protocol)) {
+        hardBlocked = true;
+        riskScore = Math.min(100, riskScore + 90);
+        checks.push({
+          id: 'TRANSPORT_PROTOCOL',
+          label: 'Protocolo de Transporte HTTP/SSE',
+          status: 'FAIL',
+          detail: `Protocolo '${parsed.protocol}' proibido. Usa apenas http:// (loopback) ou https://.`,
+        });
+      } else if (isMetadataSsrf) {
+        hardBlocked = true;
+        riskScore = Math.min(100, riskScore + 95);
+        checks.push({
+          id: 'SSRF_BOUNDARY',
+          label: 'Proteção Anti-SSRF Cloud Metadata',
+          status: 'FAIL',
+          detail: `Destino '${host}' bloqueado pela Fronteira de Confiança (proteção SSRF).`,
+        });
+      } else if (parsed.protocol === 'http:' && !isLoopback) {
+        riskScore = Math.min(100, riskScore + 25);
+        checks.push({
+          id: 'TLS_POSTURE',
+          label: 'Encriptação de Transporte TLS',
+          status: 'WARN',
+          detail: `Endpoint remoto sem TLS (${host}). Recomenda-se HTTPS para tráfego externo.`,
+        });
+      } else {
+        checks.push({
+          id: 'SSRF_BOUNDARY',
+          label: 'Proteção Anti-SSRF & Transporte',
+          status: 'PASS',
+          detail: isLoopback
+            ? `Loopback local seguro confirmado (${host}).`
+            : `Ligação encriptada HTTPS validada (${host}).`,
+        });
+      }
+    } catch {
+      hardBlocked = true;
+      riskScore = Math.min(100, riskScore + 85);
+      checks.push({
+        id: 'URL_SYNTAX',
+        label: 'Validação Sintática de Endpoint',
+        status: 'FAIL',
+        detail: 'URL de endpoint inválido ou em falta.',
+      });
+    }
+  } else {
+    // STDIO Transport Validation
+    const cleanCmd = command.trim();
+    const fullStdioLine = [cleanCmd, ...args].filter(Boolean).join(' ').trim();
+    const hasShellMetachars = /[;&|`$><\n\r]|\$\(/.test(fullStdioLine);
+
+    if (!cleanCmd) {
+      hardBlocked = true;
+      riskScore = Math.min(100, riskScore + 85);
+      checks.push({
+        id: 'STDIO_BINARY',
+        label: 'Executável stdio',
+        status: 'FAIL',
+        detail: 'Comando executável stdio obrigatório.',
+      });
+    } else if (hasShellMetachars) {
+      hardBlocked = true;
+      riskScore = Math.min(100, riskScore + 95);
+      checks.push({
+        id: 'SHELL_METACHAR_GUARD',
+        label: 'Isolamento contra Shell Chaining',
+        status: 'FAIL',
+        detail: 'Metacaracteres de encadeamento shell (;, &, |, $, `, >) são bloqueados em stdio.',
+      });
+    } else {
+      const binBase = cleanCmd.split(/[\\/]/).pop()?.toLowerCase() || cleanCmd.toLowerCase();
+      if (TRUSTED_MCP_STDIO_RUNNERS.has(binBase)) {
+        checks.push({
+          id: 'STDIO_RUNNER_TRUST',
+          label: 'Runtime Executável Reconhecido',
+          status: 'PASS',
+          detail: `Runner standard '${binBase}' validado para execução isolada execFile.`,
+        });
+      } else {
+        riskScore = Math.min(100, riskScore + 30);
+        checks.push({
+          id: 'STDIO_RUNNER_TRUST',
+          label: 'Runtime Executável Personalizado',
+          status: 'WARN',
+          detail: `Binário '${binBase}' fora da lista standard (npx/uvx/node/python3/docker).`,
+        });
+      }
+
+      const isPreApproved =
+        autonomyLevel === 'FULL_EXECUTIVE' || alwaysApprovedCommands.includes(fullStdioLine);
+      if (isPreApproved) {
+        checks.push({
+          id: 'AUTHORITY_POLICY',
+          label: 'Política de Autoridade stdio',
+          status: 'PASS',
+          detail: 'Comando pré-autorizado pela política ativa do Operador.',
+        });
+      } else {
+        requiresHumanApproval = true;
+        riskScore = Math.min(100, riskScore + 20);
+        checks.push({
+          id: 'AUTHORITY_POLICY',
+          label: 'Governação Inbox de Autoridade',
+          status: 'WARN',
+          detail: 'Requer aprovação explícita do Operador antes de invocar o processo local.',
+        });
+      }
+    }
+  }
+
+  // 3. AI-Defence Inline Secret Leak Check (URL query / CLI args)
+  const leakCheck = redactAiDefenceSecrets(`${endpointUrl} ${args.join(' ')}`);
+  if (leakCheck.redactedCount > 0) {
+    riskScore = Math.min(100, riskScore + 25);
+    checks.push({
+      id: 'AI_DEFENCE_SECRETS',
+      label: 'Higiene de Segredos AI-Defence',
+      status: 'WARN',
+      detail: `Detetados ${leakCheck.redactedCount} segredo(s) expostos em URL/argumentos. Move-os para Variáveis de Ambiente mascaradas.`,
+    });
+  } else {
+    checks.push({
+      id: 'AI_DEFENCE_SECRETS',
+      label: 'Higiene de Segredos AI-Defence',
+      status: 'PASS',
+      detail: 'Zero chaves em texto limpo expostas no URL ou argumentos CLI.',
+    });
+  }
+
+  const riskLevel: McpAuthorityGateResult['riskLevel'] =
+    riskScore >= 80
+      ? 'CRITICAL'
+      : riskScore >= 50
+        ? 'HIGH'
+        : riskScore >= 20
+          ? 'MEDIUM'
+          : 'LOW';
+
+  const verdict: McpAuthorityGateResult['verdict'] = hardBlocked
+    ? 'BLOCKED_SECURITY_RISK'
+    : requiresHumanApproval
+      ? 'REQUIRES_STDIO_APPROVAL'
+      : 'VERIFIED_SAFE';
+
+  return {
+    allowed: !hardBlocked,
+    requiresHumanApproval,
+    riskScore,
+    riskLevel,
+    verdict,
+    checks,
+    redactedSecretsCount: leakCheck.redactedCount,
+    checkedAt: new Date().toISOString(),
+  };
 }

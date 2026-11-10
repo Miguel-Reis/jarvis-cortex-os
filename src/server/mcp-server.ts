@@ -113,6 +113,7 @@ export function getMcpGatewayOverview() {
   const jevEligibleTools = activeTools.filter((t) => t.jevEligible);
   const activeResources = resources.filter((r) => r.enabled);
   const onlineServers = servers.filter((s) => s.enabled && s.healthStatus === 'ONLINE');
+  const jevEligibleServers = servers.filter((s) => s.enabled && s.jevEligible !== false);
 
   const latencySamples = [
     ...activeTools.map((t) => t.lastLatencyMs),
@@ -143,6 +144,7 @@ export function getMcpGatewayOverview() {
       healthyResources: activeResources.filter((r) => r.healthStatus === 'HEALTHY').length,
       totalServers: servers.length,
       onlineServers: onlineServers.length,
+      jevEligibleServers: jevEligibleServers.length,
       pendingAuthServers: servers.filter((s) => s.authStatus === 'PENDING_APPROVAL').length,
       avgLatencyMs,
     },
@@ -254,9 +256,13 @@ export async function executeMcpToolCall(
       }
       case 'brain_prune_tools': {
         const prompt = String(args.prompt || '');
-        const eligibleNames = getRegistryTools()
+        const nativeNames = getRegistryTools()
           .filter((t) => t.enabled && t.jevEligible)
           .map((t) => t.name);
+        const serverToolNames = (state.mcpServers || [])
+          .filter((s) => s.enabled && s.authStatus === 'AUTHORIZED' && s.jevEligible !== false)
+          .flatMap((s) => s.discoveredTools || []);
+        const eligibleNames = Array.from(new Set([...nativeNames, ...serverToolNames]));
         const pruned = pruneMcpToolsForIntent(prompt, eligibleNames);
         const denom = Math.max(1, eligibleNames.length);
         result = {
