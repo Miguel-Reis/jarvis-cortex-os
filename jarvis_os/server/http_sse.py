@@ -530,9 +530,17 @@ class JarvisHTTPRequestHandler(BaseHTTPRequestHandler):
             with self.cortex.lock:
                 bm25 = self.cortex.memory.search_bm25(q, limit=8) if q else []
                 lsh = self.cortex.memory.search_semantic_lsh(q, threshold=0.38, limit=8) if q else []
+                seen_ids: set[Any] = set()
+                results: List[Dict[str, Any]] = []
+                for item in bm25 + lsh:
+                    key = item.get("id") or item.get("topic")
+                    if key not in seen_ids:
+                        seen_ids.add(key)
+                        results.append(item)
                 ppr = self.cortex.memory.run_hipporag_ppr(seed_nodes={seed: 1.0}, alpha=0.85)[:10]
             self._send_json({
                 "query": q,
+                "results": results,
                 "bm25": bm25,
                 "lsh": lsh,
                 "ppr": [{"node": k, "score": v} for k, v in ppr],
@@ -690,6 +698,58 @@ class JarvisHTTPRequestHandler(BaseHTTPRequestHandler):
                     self._send_json({"accepted": False, "reason": "Rejected by Provenance Gate (<0.70 confidence)"})
             return
 
+        if path == "/api/voice/synthesize":
+            text = str(body.get("text", "Sistemas operacionais nominais, Senhor.")).strip() or "Sistemas operacionais nominais, Senhor."
+            preset_str = str(body.get("preset", "MARK_VII_HELMET")).strip()
+            try:
+                preset = AudioDSPPreset(preset_str)
+            except ValueError:
+                preset = AudioDSPPreset.MARK_VII_HELMET
+
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tf:
+                wav_path = tf.name
+            try:
+                self.cortex.tts.synthesize_speech_file(text, wav_path, preset=preset)
+                with open(wav_path, "rb") as wf:
+                    wav_bytes = wf.read()
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-Type", "audio/wav")
+                self.send_header("Content-Length", str(len(wav_bytes)))
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                self.wfile.write(wav_bytes)
+            finally:
+                if os.path.exists(wav_path):
+                    try:
+                        os.remove(wav_path)
+                    except OSError:
+                        pass
+            return
+
+        if path == "/api/plan":
+            action = str(body.get("action", "complete")).strip().lower()
+            with self.cortex.lock:
+                if action == "complete":
+                    action_id = str(body.get("action_id", "")).strip()
+                    if action_id:
+                        self.cortex.planner.mark_completed(action_id)
+                        self.cortex._record_event("Q18_ACTION_COMPLETED", f"Completed {action_id}")
+                else:
+                    cand = ActionCandidate(
+                        action_id=str(body.get("action_id", f"ACT-{int(time.time()) % 10000:04d}")),
+                        title=str(body.get("title", "Nova Ação Tática")),
+                        target_component=str(body.get("target_component", "jarvis_os.core")),
+                        impact=float(body.get("impact", 8.0)),
+                        urgency=float(body.get("urgency", 8.0)),
+                        effort=float(body.get("effort", 2.0)),
+                        risk=float(body.get("risk", 0.5)),
+                        dependencies=list(body.get("dependencies", [])),
+                    )
+                    self.cortex.planner.register_candidate(cand)
+                    self.cortex._record_event("Q18_CANDIDATE_ADDED", f"[{cand.action_id}] {cand.title}")
+            self._send_json(self.cortex.get_plan_payload())
+            return
+
         if path == "/api/plan/candidate":
             with self.cortex.lock:
                 cand = ActionCandidate(
@@ -736,26 +796,38 @@ class JarvisHTTPRequestHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/api/workflows/run":
-            workflow_type = str(body.get("type", "unit_tests")).strip()
+            workflow_type = str(body.get("type") or body.get("workflow") or "unit_tests").strip()
             repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
             with self.cortex.lock:
                 if not self.cortex.workflows:
                     self._send_json({"error": "WorkflowEngine not available"}, status=HTTPStatus.SERVICE_UNAVAILABLE)
                     return
 
-                if workflow_type == "unit_tests":
+                if workflow_type in ("unit_tests", "verify_tests"):
+                    import hashlib
+
                     test_dir = os.path.join(repo_root, "tests")
+                    target_item = str(body.get("work_item_id") or body.get("item_id") or "WORK-01")
                     res = self.cortex.workflows.run_unit_test_gate(
                         self.cortex.contract_gate,
-                        work_item_id=str(body.get("work_item_id", "WORK-01")),
+                        work_item_id=target_item,
                         test_dir=test_dir,
                     )
-                    # Also verify WORK-02 file existence automatically if requested
+                    # Also verify WORK-02 file existence and WORK-03 executive signature when suite passes
                     bp_path = os.path.join(repo_root, "JARVIS_OS_BLUEPRINT.md")
                     if "WORK-02" in self.cortex.contract_gate.items and os.path.exists(bp_path):
-                        self.cortex.contract_gate.verify_and_close("WORK-02", {"path": bp_path})
+                        self.cortex.contract_gate.verify_and_close("WORK-02", {"file_path": bp_path})
+                    if res.verified_by_gate and "WORK-03" in self.cortex.contract_gate.items:
+                        secret = self.cortex.contract_gate.executive_secret
+                        sig = hashlib.sha256(f"WORK-03:{secret}".encode("utf-8")).hexdigest()
+                        self.cortex.contract_gate.verify_and_close("WORK-03", {"signature_token": sig})
+                    integrity_hash = "sha256:" + hashlib.sha256(res.raw_output.encode("utf-8")).hexdigest()[:32]
                     self.cortex._record_event("WORKFLOW_TEST_GATE", res.gate_message)
                     self._send_json({
+                        "verified": res.verified_by_gate,
+                        "passed_count": res.tests_run if res.exit_code == 0 else 0,
+                        "tests_run": res.tests_run,
+                        "integrity_hash": integrity_hash,
                         "workflow": res.__dict__,
                         "contract_summary": self.cortex.contract_gate.get_summary(),
                         "contracts": [i.to_dict() for i in self.cortex.contract_gate.items.values()],

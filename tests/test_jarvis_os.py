@@ -504,13 +504,13 @@ class TestJarvisCortexOS(unittest.TestCase):
         app_path = os.path.join(repo_root, "app.py")
         idx_path = os.path.join(repo_root, "index.html")
 
-        srv_mjs_path = os.path.join(repo_root, "server.mjs")
+        srv_ts_path = os.path.join(repo_root, "server.ts")
 
         self.assertTrue(os.path.exists(meta_path))
         self.assertTrue(os.path.exists(pkg_path))
         self.assertTrue(os.path.exists(app_path))
         self.assertTrue(os.path.exists(idx_path))
-        self.assertTrue(os.path.exists(srv_mjs_path))
+        self.assertTrue(os.path.exists(srv_ts_path))
         self.assertFalse(os.path.exists(os.path.join(repo_root, "pyproject.toml")))
         self.assertFalse(os.path.exists(os.path.join(repo_root, "requirements.txt")))
 
@@ -521,8 +521,8 @@ class TestJarvisCortexOS(unittest.TestCase):
 
         with open(pkg_path, "r", encoding="utf-8") as f:
             pkg = json.load(f)
-        self.assertEqual(pkg.get("scripts", {}).get("dev"), "node server.mjs")
-        self.assertEqual(pkg.get("scripts", {}).get("start"), "node server.mjs")
+        self.assertEqual(pkg.get("scripts", {}).get("dev"), "tsx server.ts")
+        self.assertEqual(pkg.get("scripts", {}).get("start"), "node server.ts")
         self.assertGreaterEqual(len(pkg.get("dependencies", {})), 1)
 
 

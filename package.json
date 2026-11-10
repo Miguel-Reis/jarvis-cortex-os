@@ -4,13 +4,33 @@
   "version": "1.0.0",
   "type": "module",
   "scripts": {
-    "dev": "node server.mjs",
-    "build": "node server.mjs --build",
-    "start": "node server.mjs",
-    "preview": "node server.mjs"
+    "dev": "tsx server.ts",
+    "build": "vite build",
+    "start": "node server.ts",
+    "preview": "node server.ts",
+    "lint": "tsc --noEmit"
   },
   "dependencies": {
-    "@google/genai": "^1.29.0"
+    "@google/genai": "^3.0.0",
+    "@tailwindcss/vite": "^4.1.0",
+    "@types/d3": "^7.4.3",
+    "@types/express": "^4.17.21",
+    "@types/node": "^26.6.6",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@types/three": "^0.187.0",
+    "@vitejs/plugin-react": "^6.3.0",
+    "d3": "^7.9.2",
+    "express": "^4.21.2",
+    "framer-motion": "^14.12.0",
+    "lucide-react": "^1.71.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "recharts": "^3.10.1",
+    "tailwindcss": "^4.1.0",
+    "three": "^0.187.0",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2"
   },
   "devDependencies": {
     "vite": "^6.2.0"

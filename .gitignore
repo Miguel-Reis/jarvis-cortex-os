@@ -53,6 +53,8 @@ yarn.lock
 pnpm-lock.yaml
 pyproject.toml
 requirements.txt
+data/
+.playwright-cli/
 
 
 
