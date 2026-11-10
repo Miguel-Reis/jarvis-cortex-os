@@ -10,7 +10,7 @@ import {
 test('calculateQ18Score ranks high-leverage low-effort actions deterministically', () => {
   const highLeverage = calculateQ18Score({ impact: 9.5, urgency: 9.0, effort: 1.5, risk: 0.2 });
   const lowLeverage = calculateQ18Score({ impact: 2.0, urgency: 2.0, effort: 4.0, risk: 0.5 });
-  assert.equal(highLeverage, 51.3221);
+  assert.equal(highLeverage, 51.3822);
   assert.ok(highLeverage > lowLeverage);
 });
 

@@ -358,7 +358,11 @@ export async function executeGovernedCommand(
   try {
     const shellOpt =
       process.platform === 'win32' ? { shell: 'powershell.exe' } : { shell: '/bin/bash' };
-    const { stdout, stderr } = await execAsync(cleanCmd, {
+    const effectiveCmd =
+      process.platform === 'win32' && /^python3(\s|$)/.test(cleanCmd)
+        ? cleanCmd.replace(/^python3\b/, 'python')
+        : cleanCmd;
+    const { stdout, stderr } = await execAsync(effectiveCmd, {
       cwd: WORKSPACE_ROOT,
       timeout: 12_000,
       maxBuffer: 512 * 1024,
