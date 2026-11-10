@@ -31,11 +31,14 @@ C:\Users\guels\Desktop\jarvis-cortex-os\
 ├── README.md                       # Documentação executiva bilingue (PT/EN) + Diagramas Mermaid
 ├── JARVIS_OS_BLUEPRINT.md          # Este documento de arquitetura e roadmap
 ├── AGENTS.md                       # Regras automáticas para o Antigravity IDE neste workspace
+├── JarvisHUD.bat                   # Launcher Windows 1-Clique (Porta 8766 ligada ao Brain 8765)
+├── jarvis_app.py                   # Launcher Python Multiplataforma (--port 8766 --brain-url http://127.0.0.1:8765 --open)
 ├── jarvis_os/
 │   ├── __init__.py
-│   ├── cli.py                      # CLI (`status | plan | briefing | memory | routine | serve | sidecar | workflow`)
+│   ├── cli.py                      # CLI (`status | plan | briefing | memory | routine | brain | serve | sidecar | workflow`)
 │   ├── core/
-│   │   └── telemetry.py            # Windows Kernel32 GlobalMemoryStatusEx + NVMe Disk + Port Radar
+│   │   ├── telemetry.py            # Windows Kernel32 GlobalMemoryStatusEx + NVMe Disk + Port Radar
+│   │   └── brain_bridge.py         # Ponte Bidirecional Cross-Port (:8766 Jarvis ⇄ :8765 Antigravity Brain + brain.db)
 │   ├── memory/
 │   │   └── synaptic_db.py          # SQLite WAL + FTS5 BM25 + 128-D LSH + HippoRAG 2 PPR + Provenance Gate
 │   ├── planning/
@@ -50,7 +53,7 @@ C:\Users\guels\Desktop\jarvis-cortex-os\
 │   ├── voice/
 │   │   └── mark_vii_tts.py         # Skywalker Sound Mark-VII Helmet DSP + Neural/SAPI Streamer
 │   ├── server/
-│   │   └── http_sse.py             # Servidor HTTP/SSE Real-Time + Pipeline Cognitivo Unificado
+│   │   └── http_sse.py             # Servidor HTTP/SSE Real-Time (Porta 8766) + Pipeline Cognitivo Unificado
 │   ├── ui/
 │   │   └── dashboard.html          # Dashboard HUD Mark-VII 60 FPS + Orbe FFT + WebAudio DSP + Wake-Word
 │   ├── sidecar/
@@ -58,7 +61,7 @@ C:\Users\guels\Desktop\jarvis-cortex-os\
 │   └── workflows/
 │       └── engine.py               # AST Static Analyzer + Git Workspace Inspector + Live Test Gate
 └── tests/
-    └── test_jarvis_os.py           # Suite de testes unitários (13/13 PASS em <0.1s)
+    └── test_jarvis_os.py           # Suite de testes unitários (14/14 PASS em <0.2s)
 ```
 
 ---
@@ -68,7 +71,7 @@ C:\Users\guels\Desktop\jarvis-cortex-os\
 ```powershell
 cd C:\Users\guels\Desktop\jarvis-cortex-os
 
-# 1. Correr a suite completa de testes unitários (13/13 PASS)
+# 1. Correr a suite completa de testes unitários (14/14 PASS)
 python -m unittest discover -s tests -v
 
 # 2. Executar o Briefing Executivo Matinal na CLI
@@ -77,8 +80,8 @@ python -m jarvis_os.cli briefing --lang pt
 # 3. Ver Telemetria Windows Kernel32 + Port Radar
 python -m jarvis_os.cli status
 
-# 4. Calcular a Próxima Ação Determinística (Q-18)
-python -m jarvis_os.cli plan
+# 4. Verificar & Sincronizar a Ponte com o Antigravity Brain (:8766 ⇄ :8765)
+python -m jarvis_os.cli brain --sync
 
 # 5. Inspecionar Sidecar Desktop, Janelas e Hotkeys
 python -m jarvis_os.cli sidecar
@@ -86,8 +89,9 @@ python -m jarvis_os.cli sidecar
 # 6. Executar Workflow Autónomo & Gate de Testes
 python -m jarvis_os.cli workflow
 
-# 7. Iniciar o Servidor HTTP/SSE + Dashboard Dedicado Mark-VII HUD
-python -m jarvis_os.cli serve --port 8765
+# 7. Iniciar o Servidor HTTP/SSE (Porta 8766) + Abrir Dashboard Mark-VII no Browser
+python jarvis_app.py --port 8766 --brain-url http://127.0.0.1:8765 --open
+# (ou fazer duplo clique em JarvisHUD.bat no Windows)
 ```
 
 ---

@@ -907,8 +907,8 @@
         </div>
         <div id="sidecarWindowsList" class="mono" style="font-size:10px; color:var(--text-primary); background:var(--bg-obsidian-deep); padding:6px 8px; border-radius:4px; border:1px solid hsla(192,95%,52%,0.14);">
           • [PID 4812] jarvis-cortex-os — Antigravity IDE<br/>
-          • [PID 9024] Mark-VII Tactical HUD (localhost:8765)<br/>
-          • [PID 2140] PowerShell / Bash Telemetry Daemon
+          • [PID 9024] Mark-VII Tactical HUD (localhost:8766)<br/>
+          • [PID 8765] Antigravity Brain Bridge (localhost:8765)
         </div>
       </article>
 
@@ -1356,9 +1356,9 @@
           memory: { total_mb: 16384, used_mb: 7897.6, percent_used: 48.2 },
           disks: [{ drive: '/', total_gb: 478.0, used_gb: 198.4, percent_used: 41.5 }],
           open_ports: [
-            { port: 8765, service: 'Jarvis-Cortex-HUD', is_open: true, latency_ms: 0.42 },
+            { port: 8766, service: 'Jarvis-Cortex-HUD', is_open: true, latency_ms: 0.12 },
+            { port: 8765, service: 'Antigravity-Brain', is_open: true, latency_ms: 0.38 },
             { port: 8000, service: 'FastAPI/REST-Core', is_open: true, latency_ms: 0.85 },
-            { port: 5432, service: 'PostgreSQL-Index', is_open: true, latency_ms: 1.12 },
             { port: 11434, service: 'Ollama (ZERO-VRAM OFF)', is_open: false, latency_ms: null }
           ]
         },
@@ -1909,9 +1909,9 @@
         const tbody = document.getElementById('portRadarBody');
         tbody.innerHTML = '';
         const ports = t.open_ports && t.open_ports.length ? t.open_ports : [
-          { port: 8765, service: 'Jarvis-Cortex-HUD', is_open: true, latency_ms: 0.42 },
+          { port: 8766, service: 'Jarvis-Cortex-HUD', is_open: true, latency_ms: 0.12 },
+          { port: 8765, service: 'Antigravity-Brain', is_open: true, latency_ms: 0.38 },
           { port: 8000, service: 'FastAPI/REST-Core', is_open: true, latency_ms: 0.85 },
-          { port: 5432, service: 'PostgreSQL-Index', is_open: true, latency_ms: 1.12 },
           { port: 11434, service: 'Ollama (ZERO-VRAM OFF)', is_open: false, latency_ms: null }
         ];
 
@@ -2490,70 +2490,114 @@
       async function syncWithBackend() {
         const sseDot = document.getElementById('sseStatusDot');
         const sseText = document.getElementById('sseStatusText');
+        let jarvisBase = '';
+        let jarvisOnline = false;
+        let brainOnline = false;
 
-        try {
-          const statusRes = await fetch('/api/status', { cache: 'no-store' });
-          if (statusRes.ok) {
-            const data = await statusRes.json();
-            STATE.backendConnected = true;
-            if (data.telemetry) {
-              STATE.telemetry = data.telemetry;
-            } else if (data.memory) {
-              STATE.telemetry = data;
+        // 1. Probe Jarvis Cortex OS (:8766 or current origin)
+        for (const base of ['', 'http://127.0.0.1:8766']) {
+          try {
+            const statusRes = await fetch(`${base}/api/status`, { cache: 'no-store' });
+            if (statusRes.ok) {
+              const data = await statusRes.json();
+              if (data && (data.engine_mode === 'ANTIGRAVITY_NATIVE_ZERO_OLLAMA' || data.telemetry)) {
+                jarvisOnline = true;
+                jarvisBase = base;
+                STATE.backendConnected = true;
+                STATE.jarvisBaseUrl = base;
+                if (data.telemetry) STATE.telemetry = data.telemetry;
+                if (data.brain_bridge && data.brain_bridge.http_online) {
+                  brainOnline = true;
+                }
+                break;
+              }
             }
-            sseDot.className = 'status-dot';
-            sseText.textContent = 'SSE LIVE STREAM';
-            renderTelemetryAndPorts();
-          } else {
-            throw new Error('Non-200 status');
-          }
-        } catch (_) {
-          STATE.backendConnected = false;
-          sseDot.className = 'status-dot amber';
-          sseText.textContent = 'LOCAL CORTEX SIM';
-          renderTelemetryAndPorts();
+          } catch (_) {}
         }
 
-        if (STATE.backendConnected) {
+        // 2. Also probe Antigravity Brain directly on Port 8765 (http://127.0.0.1:8765)
+        try {
+          const brainRes = await fetch('http://127.0.0.1:8765/api/memories', { cache: 'no-store' });
+          if (brainRes.ok) {
+            brainOnline = true;
+            const memData = await brainRes.json();
+            const items = Array.isArray(memData) ? memData : (memData.memories || memData.items || []);
+            if (Array.isArray(items) && items.length > 0) {
+              items.slice(0, 6).forEach((m, idx) => {
+                const topic = m.category || m.workspace || 'Brain:8765';
+                const content = m.content || m.fact || '';
+                if (content && !STATE.memories.some((x) => x.content === content)) {
+                  STATE.memories.unshift({
+                    id: `brain-${m.id || idx}`,
+                    topic,
+                    content,
+                    confidence: 0.98,
+                    lsh: '8765b4a19c0e7712'
+                  });
+                }
+              });
+              renderMemoryResults();
+            }
+          }
+        } catch (_) {}
+
+        if (jarvisOnline && brainOnline) {
+          sseDot.className = 'status-dot';
+          sseText.textContent = 'JARVIS :8766 ⇄ BRAIN :8765';
+        } else if (brainOnline) {
+          sseDot.className = 'status-dot';
+          sseText.textContent = 'BRAIN :8765 LINKED';
+        } else if (jarvisOnline) {
+          sseDot.className = 'status-dot';
+          sseText.textContent = 'JARVIS :8766 ONLINE';
+        } else {
+          STATE.backendConnected = false;
+          sseDot.className = 'status-dot amber';
+          sseText.textContent = 'HUD READY (:8766 ⇄ :8765)';
+        }
+
+        renderTelemetryAndPorts();
+
+        if (jarvisOnline) {
           try {
-            const planRes = await fetch('/api/plan');
+            const planRes = await fetch(`${jarvisBase}/api/plan`);
             if (planRes.ok) {
               const planData = await planRes.json();
               if (Array.isArray(planData.candidates) && planData.candidates.length) {
                 STATE.q18Candidates = planData.candidates;
                 renderQ18Planner();
               }
-              if (Array.isArray(planData.work_items) && planData.work_items.length) {
-                STATE.workItems = planData.work_items;
+              if (Array.isArray(planData.contracts) && planData.contracts.length) {
+                STATE.workItems = planData.contracts;
                 renderTodayContracts();
               }
             }
           } catch (_) {}
 
           try {
-            const sidecarRes = await fetch('/api/sidecar/status');
+            const sidecarRes = await fetch(`${jarvisBase}/api/sidecar/status`);
             if (sidecarRes.ok) {
               const sc = await sidecarRes.json();
-              if (Array.isArray(sc.active_windows) && sc.active_windows.length) {
+              const wins = sc.windows || sc.active_windows || [];
+              if (Array.isArray(wins) && wins.length) {
                 document.getElementById('sidecarWindowsList').innerHTML =
-                  sc.active_windows.map((w) => `• ${w}`).join('<br/>');
+                  wins.slice(0, 5).map((w) => typeof w === 'string' ? `• ${w}` : `• [PID ${w.hwnd_or_pid}] ${w.title}`).join('<br/>');
               }
             }
           } catch (_) {}
 
-          // Connect EventSource SSE stream (/api/events)
           if (window.EventSource) {
             try {
-              const es = new EventSource('/api/events');
-              es.onmessage = (ev) => {
+              const es = new EventSource(`${jarvisBase}/api/events`);
+              es.addEventListener('telemetry', (ev) => {
                 try {
                   const payload = JSON.parse(ev.data);
-                  if (payload.telemetry) {
-                    STATE.telemetry = payload.telemetry;
+                  if (payload.memory) {
+                    STATE.telemetry.memory = payload.memory;
                     renderTelemetryAndPorts();
                   }
                 } catch (_) {}
-              };
+              });
               es.onerror = () => {
                 es.close();
               };

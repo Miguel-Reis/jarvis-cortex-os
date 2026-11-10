@@ -6,6 +6,7 @@
 
 ## 2. Core Modules Map
 - `jarvis_os/core/telemetry.py`: Windows Kernel32 `GlobalMemoryStatusEx`, Disk NVMe & TCP Port Radar.
+- `jarvis_os/core/brain_bridge.py`: Cross-Port Bi-Directional Bridge (`BrainBridge`) connecting Jarvis (`:8766`) to Antigravity Brain (`:8765` + `brain.db`).
 - `jarvis_os/memory/synaptic_db.py`: SQLite WAL + FTS5 BM25 + 128-D LSH SimHash + HippoRAG 2 Personalized PageRank (PPR) + SHA-256 Provenance Gate.
 - `jarvis_os/planning/next_action.py`: Deterministic Q-18 Next-Action Planner (`plan_next_action`).
 - `jarvis_os/planning/today_contract.py`: Today Work-Items with cryptographic/execution Outcome Verification Gate (`TodayContractGate`).
@@ -14,11 +15,11 @@
 - `jarvis_os/intelligence/routine_discovery.py`: Evidence-Backed Routine Discovery (`routine-cues-v2`).
 - `jarvis_os/security/trust_boundary.py`: Authority-Aware Tool Relevance & Prompt-Injection Canary (`TrustBoundaryGate`).
 - `jarvis_os/voice/mark_vii_tts.py`: Skywalker Sound Mark-VII Helmet HUD Acoustic Synthesizer (`MarkVIISpeechSynthesizer`).
-- `jarvis_os/server/http_sse.py`: Real-Time HTTP & Server-Sent Events (SSE) Server (`JarvisHTTPServer`, `JarvisCortexState`).
+- `jarvis_os/server/http_sse.py`: Real-Time HTTP & Server-Sent Events (SSE) Server on port `8766` (`JarvisHTTPServer`, `JarvisCortexState`).
 - `jarvis_os/ui/dashboard.html`: Dedicated Mark-VII HUD 60 FPS WebGL/Canvas Orb, WebAudio DSP & Wake-Word Console.
 - `jarvis_os/sidecar/desktop_agent.py`: Desktop Sidecar Agent, Wake-Word Detector, Window Enumerator & Clipboard Guard (`DesktopSidecar`, `WakeWordDetector`).
 - `jarvis_os/workflows/engine.py`: Autonomous Python AST Impact Analyzer, Git Inspector & Live Unit Test Verification Gate (`WorkflowEngine`).
-- `jarvis_os/cli.py`: Unified CLI entrypoint (`status`, `plan`, `briefing`, `memory`, `routine`, `serve`, `sidecar`, `workflow`).
+- `jarvis_os/cli.py` & `jarvis_app.py` / `JarvisHUD.bat`: Unified CLI entrypoint (`status`, `plan`, `briefing`, `memory`, `routine`, `brain`, `serve`, `sidecar`, `workflow`) and 1-click launcher.
 
 ## 3. Verification Before Completion
 - Always run `python -m unittest discover -s tests -v` before committing or pushing to `origin/main`.

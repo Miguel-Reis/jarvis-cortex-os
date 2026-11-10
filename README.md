@@ -148,8 +148,9 @@ sequenceDiagram
   - **Acoustic Comb Resonance**: 18.5ms reflection delay with feedback decay simulating the titanium-gold helmet interior.
   - **Harmonic Soft Saturation**: Analog RF transceiver soft-clipping.
 
-### 10. `server.http_sse` & `ui.dashboard` (Real-Time HTTP/SSE & Mark-VII HUD 60 FPS)
-- Multithreaded zero-dependency HTTP & Server-Sent Events (`/api/events`) server.
+### 10. `server.http_sse`, `core.brain_bridge` & `ui.dashboard` (Port `8766` HTTP/SSE + Brain Bridge `:8765` + Mark-VII HUD 60 FPS)
+- Multithreaded zero-dependency HTTP & Server-Sent Events (`/api/events`) server running on dedicated port **`8766`**.
+- **Bi-Directional Antigravity Brain Bridge (`BrainBridge`)**: Links Jarvis (`127.0.0.1:8766`) to Antigravity Brain (`127.0.0.1:8765` `/api/jarvis`, `/api/memories`, `/api/swarm` + SQLite `brain.db` fallback) with SHA-256 Provenance Gate.
 - Dedicated **Mark-VII HUD Dashboard** with a 60 FPS Canvas Acoustic & Synaptic Orb, live WebAudio Skywalker Sound DSP filter chain, HippoRAG 2 associative graph visualizer, and continuous Wake-Word (`"Hey Jarvis"`) console.
 
 ### 11. `sidecar.desktop_agent` (Desktop Sidecar & Wake-Word Radar)
@@ -196,14 +197,18 @@ python -m jarvis_os.cli memory search "Mark VII thrusters"
 # 7. Discover Autonomous Workflow Routines
 python -m jarvis_os.cli routine discover
 
-# 8. Inspect Desktop Sidecar, Active Windows & Hotkeys
+# 8. Check & Sync Cross-Port Bridge (:8766 Jarvis ⇄ :8765 Antigravity Brain)
+python -m jarvis_os.cli brain --sync
+
+# 9. Inspect Desktop Sidecar, Active Windows & Hotkeys
 python -m jarvis_os.cli sidecar
 
-# 9. Run Autonomous AST & Unit Test Verification Workflow
+# 10. Run Autonomous AST & Unit Test Verification Workflow
 python -m jarvis_os.cli workflow
 
-# 10. Launch Real-Time HTTP/SSE Server & Mark-VII HUD Dashboard
-python -m jarvis_os.cli serve --port 8765
+# 11. Launch Real-Time HTTP/SSE Server (Port 8766) & Auto-Open Mark-VII HUD
+python jarvis_app.py --port 8766 --brain-url http://127.0.0.1:8765 --open
+# (or double-click JarvisHUD.bat on Windows)
 ```
 
 ---
@@ -231,9 +236,10 @@ test_10_mark_vii_audio_dsp ... ok
 test_11_desktop_sidecar_and_wake_word ... ok
 test_12_workflow_engine_and_ast_gate ... ok
 test_13_http_sse_server_endpoints ... ok
+test_14_brain_bridge_cross_port_sync ... ok
 
 ----------------------------------------------------------------------
-Ran 13 tests in 0.095s
+Ran 14 tests in 0.186s
 
 OK
 ```
