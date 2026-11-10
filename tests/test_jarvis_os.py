@@ -509,6 +509,7 @@ class TestJarvisCortexOS(unittest.TestCase):
         self.assertTrue(os.path.exists(app_path))
         self.assertTrue(os.path.exists(idx_path))
         self.assertFalse(os.path.exists(os.path.join(repo_root, "pyproject.toml")))
+        self.assertFalse(os.path.exists(os.path.join(repo_root, "requirements.txt")))
 
         with open(meta_path, "r", encoding="utf-8") as f:
             meta = json.load(f)

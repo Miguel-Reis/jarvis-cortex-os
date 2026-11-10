@@ -42,8 +42,10 @@ ENV/
 .DS_Store
 Thumbs.db
 
-# Google AI Studio artifacts & legacy build config
+# Google AI Studio artifacts & legacy build config (avoid PEP-668 pip failure)
 .aistudio/
 public/assets/aistudio/
 pyproject.toml
+requirements.txt
+
 
