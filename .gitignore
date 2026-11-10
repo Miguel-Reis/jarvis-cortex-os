@@ -41,3 +41,9 @@ ENV/
 .idea/
 .DS_Store
 Thumbs.db
+
+# Google AI Studio artifacts & legacy build config
+.aistudio/
+public/assets/aistudio/
+pyproject.toml
+
