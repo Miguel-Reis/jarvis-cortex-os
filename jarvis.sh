@@ -14,6 +14,11 @@ echo "  Jarvis Gateway: http://127.0.0.1:${PORT}  |  Antigravity Brain: :8765"
 echo "  Debug Log File: logs/jarvis-debug.log"
 echo "============================================================================"
 
+if [ -d ".git" ] && command -v git >/dev/null 2>&1; then
+  echo "[0/2] A sincronizar automaticamente com GitHub (origin/main)..."
+  git pull --rebase --autostash origin main || true
+fi
+
 if [ ! -x "node_modules/.bin/tsx" ] || [ ! -f "node_modules/three/package.json" ]; then
   echo "[1/2] A instalar/atualizar dependências Node.js..."
   npm install

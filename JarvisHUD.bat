@@ -13,6 +13,14 @@ echo   Jarvis Gateway: http://localhost:8766  ^|  Antigravity Brain: :8765
 echo   Debug Mode:     FULL TRACE ENABLED     ^|  Log: logs\jarvis-debug.log
 echo ============================================================================
 
+if exist ".git" (
+  where git >nul 2>nul
+  if not errorlevel 1 (
+    echo [0/3] A sincronizar automaticamente com GitHub ^(origin/main^)...
+    git pull --rebase --autostash origin main
+  )
+)
+
 where node >nul 2>nul
 if errorlevel 1 (
   echo [AVISO] Node.js nao encontrado no PATH. A iniciar motor Python de reserva na porta 8766...
