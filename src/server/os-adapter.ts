@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import net from 'node:net';
 import crypto from 'node:crypto';
-import { exec } from 'node:child_process';
+import { exec, execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { detectPromptInjection } from '../shared/cortex-math.ts';
 import type {
@@ -19,6 +19,7 @@ import { db } from './db.ts';
 import { debugLog } from './debug-logger.ts';
 
 const execAsync = promisify(exec);
+const execFileAsync = promisify(execFile);
 const WORKSPACE_ROOT = process.cwd();
 
 const WATCHED_PORTS: { port: number; service: string }[] = [
@@ -594,7 +595,7 @@ async function queryPythonDesktopSidecar(): Promise<{
   const script =
     'import json; from jarvis_os.sidecar.desktop_agent import DesktopSidecar; s=DesktopSidecar(); print(json.dumps({"status": s.get_status(), "windows": s.list_active_windows(12)}))';
   try {
-    const { stdout } = await execAsync(`${pyBin} -c '${script}'`, {
+    const { stdout } = await execFileAsync(pyBin, ['-c', script], {
       cwd: WORKSPACE_ROOT,
       timeout: 2200,
     });
@@ -662,8 +663,12 @@ export async function triggerSidecarHotkey(
     const pyBin = process.platform === 'win32' ? 'python' : 'python3';
     const safeCombo = combo.replace(/[^A-Za-z0-9+_-]/g, '');
     try {
-      const { stdout } = await execAsync(
-        `${pyBin} -c "import json; from jarvis_os.sidecar.desktop_agent import DesktopSidecar; print(json.dumps(DesktopSidecar().trigger_hotkey('${safeCombo}')))"`,
+      const { stdout } = await execFileAsync(
+        pyBin,
+        [
+          '-c',
+          `import json; from jarvis_os.sidecar.desktop_agent import DesktopSidecar; print(json.dumps(DesktopSidecar().trigger_hotkey('${safeCombo}')))`,
+        ],
         { cwd: WORKSPACE_ROOT, timeout: 2000 }
       );
       const parsed = JSON.parse(stdout.trim()) as { triggered_action?: string; hotkey?: string };

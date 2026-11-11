@@ -14,8 +14,8 @@ echo "  Jarvis Gateway: http://127.0.0.1:${PORT}  |  Antigravity Brain: :8765"
 echo "  Debug Log File: logs/jarvis-debug.log"
 echo "============================================================================"
 
-if [ ! -d "node_modules" ]; then
-  echo "[1/2] A instalar dependências Node.js..."
+if [ ! -x "node_modules/.bin/tsx" ] || [ ! -f "node_modules/three/package.json" ]; then
+  echo "[1/2] A instalar/atualizar dependências Node.js..."
   npm install
 fi
 
