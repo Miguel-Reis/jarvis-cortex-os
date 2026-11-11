@@ -36,6 +36,7 @@ import {
   rollbackSubagentSandbox,
   storeBiTemporalMemory,
 } from './swarm-orbit-engine.ts';
+import { debugLog } from './debug-logger.ts';
 
 const execFileAsync = promisify(execFile);
 
@@ -562,6 +563,12 @@ export async function handleMcpJsonRpc(
   const rpcId = body?.id ?? 1;
   const method = String(body?.method || 'initialize');
   const params = body?.params || {};
+  const rpcStart = performance.now();
+
+  debugLog('DEBUG', 'MCP', `JSON-RPC 2.0 request id=${String(rpcId)} method="${method}"`, {
+    payload: Object.keys(params).length > 0 ? params : undefined,
+    maxPreviewLen: 180,
+  });
 
   try {
     if (method === 'ping') {
@@ -628,6 +635,12 @@ export async function handleMcpJsonRpc(
       const toolName = String(params.name || '');
       const toolArgs = (params.arguments as Record<string, unknown>) || {};
       const output = await executeMcpToolCall(toolName, toolArgs);
+      debugLog(
+        output.error ? 'WARN' : 'INFO',
+        'MCP',
+        `tools/call "${toolName}" -> ${output.error ? 'ERROR' : 'OK'}`,
+        { durationMs: performance.now() - rpcStart, payload: output, maxPreviewLen: 220 }
+      );
       db.appendAudit(
         'MCP_2026_CLIENT',
         'MCP',
@@ -940,6 +953,16 @@ export async function probeExternalMcpServer(
     }
   });
 
+  debugLog(
+    healthStatus === 'ONLINE' ? 'DEBUG' : 'WARN',
+    'MCP',
+    `External probe "${srv.name}" (${srv.transport}) -> ${healthStatus}`,
+    {
+      durationMs: latencyMs,
+      payload: lastError ? { error: lastError } : { tools: discoveredTools.length },
+    }
+  );
+
   return updatedSrv;
 }
 
@@ -954,10 +977,18 @@ export async function runMcpServersHeartbeat(activePort = 3000, serverId?: strin
     targets.map((srv) => probeExternalMcpServer(srv.id, activePort))
   );
   const overview = getMcpGatewayOverview();
+  const roundTripMs = Number((performance.now() - t0).toFixed(2));
+
+  debugLog(
+    'DEBUG',
+    'MCP',
+    `Gateway heartbeat sweep: ${probed.filter(Boolean).length} server(s) probed`,
+    { durationMs: roundTripMs }
+  );
 
   return {
     heartbeatAt: new Date().toISOString(),
-    roundTripMs: Number((performance.now() - t0).toFixed(2)),
+    roundTripMs,
     probedCount: probed.filter(Boolean).length,
     overview,
   };

@@ -1908,5 +1908,91 @@ export function computeProjectsPortfolioSummary(params: {
   };
 }
 
+// ============================================================================
+// 21. Debug Logging Helpers (Secret-Safe Preview & HTTP Level Classification)
+// ============================================================================
+
+export type DebugLogLevel = 'DEBUG' | 'INFO' | 'WARN' | 'ERROR';
+
+export function classifyHttpLogLevel(statusCode: number, durationMs = 0): DebugLogLevel {
+  if (statusCode >= 500) return 'ERROR';
+  if (statusCode >= 400 || durationMs >= 2500) return 'WARN';
+  return 'DEBUG';
+}
+
+const SENSITIVE_KEY_RE =
+  /(api[_-]?key|secret|password|passwd|authorization|cookie|credential|private[_-]?key|(?:^|[a-z0-9_-])token$)/i;
+const BASE64_KEY_RE = /(base64|zlib|pcm|wav|inlineData)/i;
+
+function sanitizeDebugValue(val: unknown, depth = 0): unknown {
+  if (val === null || val === undefined) return val;
+  if (typeof val === 'number' || typeof val === 'boolean') return val;
+
+  if (typeof val === 'string') {
+    if (val.length > 220 && /^[A-Za-z0-9+/=_-]+$/.test(val)) {
+      return `<base64:${val.length}chars>`;
+    }
+    const { sanitized } = redactAiDefenceSecrets(val);
+    return sanitized;
+  }
+
+  if (depth >= 3) {
+    if (Array.isArray(val)) return `[Array(${val.length})]`;
+    return '[Object]';
+  }
+
+  if (Array.isArray(val)) {
+    const slice = val.slice(0, 8).map((item) => sanitizeDebugValue(item, depth + 1));
+    if (val.length > 8) {
+      slice.push(`…(+${val.length - 8} items)`);
+    }
+    return slice;
+  }
+
+  if (typeof val === 'object') {
+    const out: Record<string, unknown> = {};
+    const entries = Object.entries(val as Record<string, unknown>);
+    for (const [k, v] of entries.slice(0, 16)) {
+      if (SENSITIVE_KEY_RE.test(k) && typeof v !== 'number' && typeof v !== 'boolean') {
+        out[k] = '<REDACTED>';
+      } else if (BASE64_KEY_RE.test(k) && typeof v === 'string') {
+        out[k] = `<base64:${v.length}chars>`;
+      } else {
+        out[k] = sanitizeDebugValue(v, depth + 1);
+      }
+    }
+    if (entries.length > 16) {
+      out.__moreKeys = entries.length - 16;
+    }
+    return out;
+  }
+
+  return String(val);
+}
+
+export function formatDebugPayloadPreview(payload: unknown, maxLen = 280): string {
+  if (payload === undefined) return '';
+  if (payload === null) return 'null';
+
+  let rawStr = '';
+  if (typeof payload === 'string') {
+    rawStr = redactAiDefenceSecrets(payload).sanitized.replace(/\s+/g, ' ').trim();
+  } else {
+    try {
+      rawStr = JSON.stringify(sanitizeDebugValue(payload));
+    } catch {
+      rawStr = String(payload);
+    }
+  }
+
+  const safeMax = Math.max(32, maxLen);
+  if (rawStr.length <= safeMax) {
+    return rawStr;
+  }
+  const extra = rawStr.length - safeMax;
+  return `${rawStr.slice(0, safeMax)}…(+${extra} chars)`;
+}
+
+
 
 

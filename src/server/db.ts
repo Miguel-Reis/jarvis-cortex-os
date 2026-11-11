@@ -21,6 +21,7 @@ import type {
   SwarmLane,
   SwarmTask,
 } from '../shared/types.ts';
+import { debugLog } from './debug-logger.ts';
 
 const require = createRequire(import.meta.url);
 
@@ -1327,14 +1328,17 @@ class JarvisDatabase {
         `);
         this.sqliteDb = dbConn;
         this.storageEngine = 'node:sqlite';
+        debugLog('INFO', 'DB', 'SQLite WAL storage initialized (node:sqlite)');
       }
-    } catch {
+    } catch (err) {
       this.sqliteDb = null;
       this.storageEngine = 'json-transactional';
+      debugLog('DEBUG', 'DB', `SQLite unavailable, using json-transactional mirror (${(err as Error).message})`);
     }
   }
 
   private loadOrSeed(): JarvisStoreData {
+    const t0 = performance.now();
     const seed = buildInitialSeed();
 
     if (this.sqliteDb) {
@@ -1346,10 +1350,16 @@ class JarvisDatabase {
           const parsed = JSON.parse(row.payload_json) as Partial<JarvisStoreData>;
           const migrated = ensureV3Migration(parsed as JarvisStoreData, seed);
           this.persist(migrated);
+          debugLog(
+            'INFO',
+            'DB',
+            `Loaded & migrated state from SQLite (${migrated.memories.length} memories, ${migrated.projects?.length ?? 0} projects)`,
+            { durationMs: performance.now() - t0 }
+          );
           return migrated;
         }
-      } catch {
-        // Fall through to JSON or fresh seed
+      } catch (err) {
+        debugLog('WARN', 'DB', `SQLite state read fallback: ${(err as Error).message}`);
       }
     }
 
@@ -1359,17 +1369,27 @@ class JarvisDatabase {
         const parsed = JSON.parse(raw) as Partial<JarvisStoreData>;
         const migrated = ensureV3Migration(parsed as JarvisStoreData, seed);
         this.persist(migrated);
+        debugLog(
+          'INFO',
+          'DB',
+          `Loaded & migrated state from JSON mirror (${migrated.memories.length} memories, ${migrated.projects?.length ?? 0} projects)`,
+          { durationMs: performance.now() - t0 }
+        );
         return migrated;
-      } catch {
-        // Corrupted fallback -> re-seed
+      } catch (err) {
+        debugLog('WARN', 'DB', `JSON mirror corrupted, re-seeding clean state: ${(err as Error).message}`);
       }
     }
 
     this.persist(seed);
+    debugLog('INFO', 'DB', `Initialized fresh v3.0 seed state (${seed.memories.length} memories)`, {
+      durationMs: performance.now() - t0,
+    });
     return seed;
   }
 
   private persist(data: JarvisStoreData): void {
+    const t0 = performance.now();
     const serialized = JSON.stringify(data, null, 2);
     const nowIso = new Date().toISOString();
 
@@ -1384,14 +1404,17 @@ class JarvisDatabase {
                updated_at = excluded.updated_at`
           )
           .run('root_state_v2', serialized, nowIso);
-      } catch {
-        // Ensure JSON mirror still writes cleanly
+      } catch (err) {
+        debugLog('WARN', 'DB', `SQLite persist warning: ${(err as Error).message}`);
       }
     }
 
     const tmpPath = `${JSON_FALLBACK_PATH}.tmp`;
     fs.writeFileSync(tmpPath, serialized, 'utf-8');
     fs.renameSync(tmpPath, JSON_FALLBACK_PATH);
+    debugLog('DEBUG', 'DB', `State persisted (${this.storageEngine} · ${serialized.length} bytes)`, {
+      durationMs: performance.now() - t0,
+    });
   }
 
   public getEngineName(): string {
@@ -1422,6 +1445,12 @@ class JarvisDatabase {
     detail: string,
     status: JarvisStoreData['auditLogs'][number]['status'] = 'ALLOWED'
   ): void {
+    debugLog(
+      status === 'BLOCKED' ? 'WARN' : 'INFO',
+      'AUDIT',
+      `${actor} · ${category} · ${action} -> ${status}`,
+      { payload: detail, maxPreviewLen: 220 }
+    );
     this.update((draft) => {
       draft.auditLogs.unshift({
         id: `aud-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,

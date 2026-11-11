@@ -166,9 +166,13 @@ const InnerApp: React.FC = () => {
   const refreshBootstrap = useCallback(async () => {
     try {
       const data = await apiJson<BootstrapPayload>('/api/bootstrap');
+      console.debug(
+        `[JARVIS:BOOT] State synchronized (engine=${data.storageEngine}, port=${data.activePort}, brain=${data.brain8765?.mode || 'STANDALONE'}, projects=${data.state.projects?.length ?? 0}, memories=${data.state.memories?.length ?? 0})`
+      );
       setBoot(data);
       setErrorMsg(null);
     } catch (err) {
+      console.debug(`[JARVIS:BOOT] Bootstrap sync warning: ${(err as Error).message}`);
       setErrorMsg((err as Error).message);
     } finally {
       setLoading(false);
@@ -182,26 +186,22 @@ const InnerApp: React.FC = () => {
   // Subscribe to Server-Sent Events (/api/events)
   useEffect(() => {
     const es = new EventSource('/api/events');
-    es.addEventListener('connected', () => setSseConnected(true));
-    es.addEventListener('state_updated', () => {
-      refreshBootstrap();
+    es.addEventListener('connected', (ev) => {
+      console.debug('[JARVIS:SSE] Stream connected (/api/events)', (ev as MessageEvent).data || '');
+      setSseConnected(true);
     });
-    es.addEventListener('workflow_run', () => {
+    const onSseRefresh = (eventName: string) => (ev: Event) => {
+      console.debug(`[JARVIS:SSE] Event "${eventName}"`, (ev as MessageEvent).data || '');
       refreshBootstrap();
-    });
-    es.addEventListener('swarm_progress', () => {
-      refreshBootstrap();
-    });
-    es.addEventListener('proactive_scan', () => {
-      refreshBootstrap();
-    });
-    es.addEventListener('sidecar_event', () => {
-      refreshBootstrap();
-    });
-    es.addEventListener('heartbeat', () => {
-      refreshBootstrap();
-    });
+    };
+    es.addEventListener('state_updated', onSseRefresh('state_updated'));
+    es.addEventListener('workflow_run', onSseRefresh('workflow_run'));
+    es.addEventListener('swarm_progress', onSseRefresh('swarm_progress'));
+    es.addEventListener('proactive_scan', onSseRefresh('proactive_scan'));
+    es.addEventListener('sidecar_event', onSseRefresh('sidecar_event'));
+    es.addEventListener('heartbeat', onSseRefresh('heartbeat'));
     es.onerror = () => {
+      console.debug('[JARVIS:SSE] Stream reconnecting...');
       setSseConnected(false);
     };
     return () => {
@@ -263,6 +263,7 @@ const InnerApp: React.FC = () => {
   }, [handleToggleFocusMode]);
 
   const handleNavigate = (section: NavSectionId, subId?: string) => {
+    console.debug(`[JARVIS:NAV] Navigating -> section="${section}"${subId ? ` subId="${subId}"` : ''}`);
     setActiveSection(section);
     setSubTargetId(subId);
     setMobileMenuOpen(false);

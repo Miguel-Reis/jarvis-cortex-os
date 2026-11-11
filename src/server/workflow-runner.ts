@@ -3,6 +3,7 @@ import { collectOSTelemetry, executeGovernedCommand } from './os-adapter.ts';
 import { synthesizeBriefText } from './gemini-engine.ts';
 import { runProjectProactiveScan } from './swarm-orbit-engine.ts';
 import type { Workflow, WorkflowRun, WorkflowStepLog } from '../shared/types.ts';
+import { debugLog } from './debug-logger.ts';
 
 type SseBroadcastFn = (event: string, data: unknown) => void;
 
@@ -31,6 +32,11 @@ export async function runWorkflowById(
   let aggregatedContext = '';
 
   const t0 = Date.now();
+  debugLog(
+    'INFO',
+    'WORKFLOW',
+    `Starting workflow "${wf.name}" (${wf.id}) via ${triggerSource} [${wf.nodes.length} nodes]`
+  );
 
   for (const node of wf.nodes) {
     const stepStart = Date.now();
@@ -200,6 +206,12 @@ export async function runWorkflowById(
     overallStatus === 'FAILED' ? 'BLOCKED' : 'VERIFIED'
   );
 
+  debugLog(
+    overallStatus === 'FAILED' ? 'WARN' : 'INFO',
+    'WORKFLOW',
+    `Workflow "${wf.name}" finished -> ${overallStatus} (${steps.length} steps)`,
+    { durationMs: runRecord.totalDurationMs }
+  );
   broadcastCallback('workflow_run', runRecord);
   return runRecord;
 }
@@ -252,13 +264,18 @@ export function startOrRefreshHeartbeatDaemon(activePort = 3000): void {
         await runProjectProactiveScan().catch(() => {});
       }
 
+      debugLog(
+        ramHigh ? 'WARN' : 'DEBUG',
+        'HEARTBEAT',
+        `Beat #${db.getState().heartbeat.totalBeats}: ${detail}`
+      );
       broadcastCallback('heartbeat', {
         timestamp: nowIso,
         telemetry,
         heartbeat: db.getState().heartbeat,
       });
-    } catch {
-      // Keep daemon resilient
+    } catch (err) {
+      debugLog('WARN', 'HEARTBEAT', `Daemon cycle warning: ${(err as Error).message}`);
     }
   }, intervalMs);
 

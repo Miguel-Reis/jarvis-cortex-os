@@ -9,7 +9,7 @@
     "start": "node server.ts",
     "preview": "node server.ts",
     "lint": "tsc --noEmit",
-    "test": "node --test src/shared/cortex-math.test.ts && node --test tests/cortex_math.test.mjs"
+    "test": "tsx --test src/shared/cortex-math.test.ts && node --test tests/cortex_math.test.mjs"
   },
   "dependencies": {
     "@google/genai": "^3.0.0",

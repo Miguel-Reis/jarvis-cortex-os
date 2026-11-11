@@ -89,6 +89,14 @@ import {
   probeAllMcpGatewayItems,
   probeExternalMcpServer,
 } from './src/server/mcp-server.ts';
+import {
+  createHttpDebugMiddleware,
+  debugLog,
+  getDebugLogFilePath,
+  getRecentDebugLogs,
+  isDebugLoggingEnabled,
+  printStartupDebugBanner,
+} from './src/server/debug-logger.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -105,13 +113,32 @@ function resolvePort(): number {
 const PORT = resolvePort();
 const HOST = process.env.HOST || '0.0.0.0';
 
+process.on('uncaughtException', (err) => {
+  debugLog('ERROR', 'FATAL', `Uncaught Exception: ${err.message}`, {
+    payload: err.stack || String(err),
+    maxPreviewLen: 500,
+  });
+});
+
+process.on('unhandledRejection', (reason) => {
+  debugLog('ERROR', 'FATAL', 'Unhandled Promise Rejection', {
+    payload: reason instanceof Error ? `${reason.message} | ${reason.stack || ''}` : reason,
+    maxPreviewLen: 500,
+  });
+});
+
 async function startServer() {
   const app = express();
   app.use(express.json({ limit: '15mb' }));
+  app.use(createHttpDebugMiddleware());
 
   // Real-time SSE Clients Registry
   const sseClients = new Set<express.Response>();
   const broadcastSse = (event: string, payload: unknown) => {
+    debugLog('DEBUG', 'SSE', `Broadcast event="${event}" to ${sseClients.size} client(s)`, {
+      payload,
+      maxPreviewLen: 180,
+    });
     const msg = `event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`;
     for (const client of sseClients) {
       try {
@@ -127,7 +154,9 @@ async function startServer() {
   startOrRefreshHeartbeatDaemon(PORT);
 
   // Pre-warm SCOUT-01 AST index asynchronously
-  buildScoutWorkspaceIndex().catch(() => {});
+  buildScoutWorkspaceIndex().catch((err) => {
+    debugLog('WARN', 'SCOUT-AST', `Initial AST pre-warm warning: ${(err as Error).message}`);
+  });
 
   // ==========================================================================
   // Health & Unified Bootstrap State
@@ -144,6 +173,17 @@ async function startServer() {
     });
   });
 
+  app.get('/api/debug/logs', (req, res) => {
+    const limit = Math.max(1, Math.min(300, Number(req.query.limit) || 150));
+    const logs = getRecentDebugLogs(limit);
+    res.json({
+      enabled: isDebugLoggingEnabled(),
+      logFilePath: getDebugLogFilePath(),
+      count: logs.length,
+      logs,
+    });
+  });
+
   app.get('/api/events', async (req, res) => {
     res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
     res.setHeader('Cache-Control', 'no-cache');
@@ -151,6 +191,7 @@ async function startServer() {
     res.flushHeaders?.();
 
     sseClients.add(res);
+    debugLog('DEBUG', 'SSE', `Client connected to /api/events (active=${sseClients.size})`);
     const initialSnap = {
       connectedAt: new Date().toISOString(),
       pendingApprovals: db.getState().approvals.filter((a) => a.status === 'PENDING').length,
@@ -160,6 +201,7 @@ async function startServer() {
 
     req.on('close', () => {
       sseClients.delete(res);
+      debugLog('DEBUG', 'SSE', `Client disconnected from /api/events (active=${sseClients.size})`);
     });
   });
 
@@ -2537,6 +2579,14 @@ async function startServer() {
   }
 
   app.listen(PORT, HOST, () => {
+    printStartupDebugBanner({
+      port: PORT,
+      host: HOST,
+      storageEngine: db.getEngineName(),
+      isProd,
+      geminiConfigured: Boolean(process.env.GEMINI_API_KEY?.trim()),
+      openRouterConfigured: Boolean(process.env.OPENROUTER_API_KEY?.trim()),
+    });
     console.log(
       `[J.A.R.V.I.S. Cortex OS v3.0] Listening on http://${HOST}:${PORT} (${db.getEngineName()} + MCP 2026)`
     );

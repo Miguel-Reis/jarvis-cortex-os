@@ -35,6 +35,7 @@ import type {
 } from '../shared/types.ts';
 import { db } from './db.ts';
 import { getGitOverview } from './os-adapter.ts';
+import { debugLog } from './debug-logger.ts';
 
 const execAsync = promisify(exec);
 const require = createRequire(import.meta.url);
@@ -263,6 +264,7 @@ export async function buildScoutWorkspaceIndex(forceRefresh = false): Promise<Sc
     return scoutCache;
   }
 
+  const t0 = performance.now();
   const files = walkCodeFiles(WORKSPACE_ROOT);
   const allSymbols: ScoutSymbolEntry[] = [];
   const fileImports = new Map<string, string[]>();
@@ -288,6 +290,12 @@ export async function buildScoutWorkspaceIndex(forceRefresh = false): Promise<Sc
     coChanges,
     fileImports,
   };
+  debugLog(
+    'INFO',
+    'SCOUT-AST',
+    `Workspace AST indexed: ${fileImports.size} files · ${allSymbols.length} symbols · ${coChanges.length} co-change edges`,
+    { durationMs: performance.now() - t0 }
+  );
   return scoutCache;
 }
 
@@ -842,6 +850,12 @@ export async function launchAsymmetricSwarm(params: {
     'VERIFIED'
   );
 
+  debugLog(
+    'INFO',
+    'SWARM',
+    `Swarm ${scale}x completed (${swarmRun.id}): ${verifyGatesPassed}/${verifyGatesTotal} Verify Gates · Ruflo EMA=${prevPheromone}`,
+    { payload: { objective, status: swarmRun.status, sandboxId: sandbox.id } }
+  );
   sseBroadcast('swarm_progress', {
     runId: swarmRun.id,
     scale,
@@ -992,6 +1006,13 @@ export async function probeAndSyncBrain8765(importMemories = false): Promise<{
     status.mode === 'HYBRID_LIVE_8765'
       ? `Ponte híbrida ${baseUrl} ativa (${importedCount} novos factos sincronizados · ${latencyMs}ms).`
       : `Motores v7.2 a operar nativamente no Jarvis (porta :8765 offline neste contentor · zero perda funcional).`;
+
+  debugLog(
+    'DEBUG',
+    'BRAIN:8765',
+    `Probe ${baseUrl} -> mode=${status.mode} (http=${httpOnline}, sqliteWal=${sqliteWalDetected}, imported=${importedCount})`,
+    { durationMs: latencyMs }
+  );
 
   return { status, importedCount, message };
 }
@@ -1302,6 +1323,13 @@ export async function runProjectProactiveScan(targetProjectId?: string): Promise
   });
 
   if (updatedProjects.length > 0) {
+    debugLog(
+      'INFO',
+      'PROACTIVE',
+      `Scanned ${updatedProjects.length} project(s) -> ${updatedProjects
+        .map((p) => `${p.name}:${p.healthScore}% (${p.proactiveInsights.length} insights)`)
+        .join(', ')}`
+    );
     sseBroadcast('proactive_scan', {
       scannedCount: updatedProjects.length,
       projects: updatedProjects,

@@ -209,6 +209,16 @@ class JarvisCortexState:
         self.event_log.append(ev)
         if len(self.event_log) > 50:
             self.event_log = self.event_log[-50:]
+        if os.environ.get("JARVIS_HTTP_VERBOSE") == "1":
+            iso_ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ev["timestamp"]))
+            line = f"[{iso_ts}] [DEBUG] [PY-CORTEX ] {event_type}: {detail}"
+            print(line, flush=True)
+            try:
+                os.makedirs("logs", exist_ok=True)
+                with open(os.path.join("logs", "jarvis-debug.log"), "a", encoding="utf-8") as lf:
+                    lf.write(line + "\n")
+            except OSError:
+                pass
         return ev
 
     def get_status_payload(self, run_port_scan: bool = False) -> Dict[str, Any]:
@@ -435,9 +445,18 @@ class JarvisHTTPRequestHandler(BaseHTTPRequestHandler):
         return self.server.cortex_state  # type: ignore[attr-defined]
 
     def log_message(self, format: str, *args: Any) -> None:
-        # Quiet logging to keep terminal clean during tests and daemon operation
+        # Quiet logging during unit tests; full timestamped debug trace when running server
         if os.environ.get("JARVIS_HTTP_VERBOSE") == "1":
-            super().log_message(format, *args)
+            iso_ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            msg = format % args if args else format
+            line = f"[{iso_ts}] [DEBUG] [PY-HTTP   ] {self.address_string()} {msg}"
+            print(line, flush=True)
+            try:
+                os.makedirs("logs", exist_ok=True)
+                with open(os.path.join("logs", "jarvis-debug.log"), "a", encoding="utf-8") as lf:
+                    lf.write(line + "\n")
+            except OSError:
+                pass
 
     def _send_json(self, payload: Dict[str, Any], status: int = HTTPStatus.OK) -> None:
         raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -918,6 +937,7 @@ def run_server(
 ) -> None:
     import sys
 
+    os.environ.setdefault("JARVIS_HTTP_VERBOSE", "1")
     if getattr(sys, "stdout", None) is not None and hasattr(sys.stdout, "reconfigure"):
         try:
             sys.stdout.reconfigure(encoding="utf-8")
@@ -928,18 +948,23 @@ def run_server(
 
     def _bg_probe() -> None:
         try:
-            srv.cortex_state.brain_bridge.probe(auto_discover=True)
+            st = srv.cortex_state.brain_bridge.probe(auto_discover=True)
+            srv.cortex_state._record_event(
+                "BRAIN_8765_PROBE",
+                f"url={st.brain_url} reachable={st.http_reachable} db={st.db_discovered}",
+            )
         except Exception:
             pass
 
     threading.Thread(target=_bg_probe, name="JarvisBrainProbe", daemon=True).start()
 
     print("\n" + "=" * 72, flush=True)
-    print("  J.A.R.V.I.S. CORTEX OS - MARK-VII HTTP/SSE SERVER ONLINE", flush=True)
+    print("  J.A.R.V.I.S. CORTEX OS - MARK-VII HTTP/SSE SERVER [FULL DEBUG]", flush=True)
     print("=" * 72, flush=True)
     print(f"  Jarvis HUD:      http://{host}:{port}/   (Porta dedicada Jarvis: {port})", flush=True)
     print(f"  SSE Stream:      http://{host}:{port}/api/events", flush=True)
     print(f"  Brain Bridge:    {brain_url}", flush=True)
+    print("  Debug Log File:  logs/jarvis-debug.log", flush=True)
     print("  Engine Mode:     ANTIGRAVITY_NATIVE_ZERO_OLLAMA (0 GB VRAM)", flush=True)
     print("=" * 72 + "\n", flush=True)
     try:

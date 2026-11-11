@@ -16,6 +16,7 @@ import type {
   TodayContractItem,
 } from '../shared/types.ts';
 import { db } from './db.ts';
+import { debugLog } from './debug-logger.ts';
 
 const execAsync = promisify(exec);
 const WORKSPACE_ROOT = process.cwd();
@@ -333,6 +334,9 @@ export async function executeGovernedCommand(
 
   const scan = detectPromptInjection(cleanCmd);
   if (scan.blocked) {
+    debugLog('WARN', 'OS-EXEC', `Blocked command from ${source} (risk=${scan.riskScore}/100)`, {
+      payload: { command: cleanCmd, rules: scan.matchedRules },
+    });
     db.appendAudit('TRUST_GATE', 'SECURITY', 'COMMAND_BLOCKED', `Comando bloqueado: ${cleanCmd}`, 'BLOCKED');
     return {
       status: 'BLOCKED',
@@ -351,6 +355,9 @@ export async function executeGovernedCommand(
 
   if (!isPreApproved) {
     const approvalId = `appr-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+    debugLog('INFO', 'OS-EXEC', `Queued command for human approval (${approvalId}) from ${source}`, {
+      payload: cleanCmd,
+    });
     db.update((draft) => {
       draft.approvals.unshift({
         id: approvalId,
@@ -380,28 +387,42 @@ export async function executeGovernedCommand(
       process.platform === 'win32' && /^python3(\s|$)/.test(cleanCmd)
         ? cleanCmd.replace(/^python3\b/, 'python')
         : cleanCmd;
+    debugLog('DEBUG', 'OS-EXEC', `Executing [${source}]: ${effectiveCmd}`);
     const { stdout, stderr } = await execAsync(effectiveCmd, {
       cwd: WORKSPACE_ROOT,
       timeout: 12_000,
       maxBuffer: 512 * 1024,
       ...shellOpt,
     });
+    const durationMs = Date.now() - start;
     const combined = [stdout?.trim(), stderr?.trim()].filter(Boolean).join('\n') || '(Comando concluído sem output)';
+    debugLog('INFO', 'OS-EXEC', `Exit 0 [${source}]: ${effectiveCmd}`, {
+      durationMs,
+      payload: combined,
+      maxPreviewLen: 200,
+    });
     db.appendAudit(source, 'TERMINAL', 'COMMAND_EXECUTED', cleanCmd, 'VERIFIED');
     return {
       status: 'EXECUTED',
       output: combined.slice(0, 6000),
       exitCode: 0,
-      durationMs: Date.now() - start,
+      durationMs,
     };
   } catch (err: unknown) {
+    const durationMs = Date.now() - start;
     const e = err as { stdout?: string; stderr?: string; message?: string; code?: number };
+    const exitCode = typeof e.code === 'number' ? e.code : 1;
     const out = [e.stdout?.trim(), e.stderr?.trim(), e.message].filter(Boolean).join('\n');
+    debugLog('WARN', 'OS-EXEC', `Exit ${exitCode} [${source}]: ${cleanCmd}`, {
+      durationMs,
+      payload: out,
+      maxPreviewLen: 260,
+    });
     return {
       status: 'EXECUTED',
       output: out.slice(0, 6000),
-      exitCode: typeof e.code === 'number' ? e.code : 1,
-      durationMs: Date.now() - start,
+      exitCode,
+      durationMs,
     };
   }
 }
@@ -410,7 +431,13 @@ export async function verifyTodayContractItem(
   contract: TodayContractItem,
   activeServerPort = 3000
 ): Promise<{ verified: boolean; evidenceHash: string; summary: string }> {
+  const t0 = performance.now();
   const nowIso = new Date().toISOString();
+  debugLog(
+    'DEBUG',
+    'CONTRACT',
+    `Verifying contract "${contract.title}" (${contract.verificationRule} -> ${contract.verificationTarget})`
+  );
 
   if (contract.verificationRule === 'FILE_EXISTS') {
     const abs = path.resolve(WORKSPACE_ROOT, contract.verificationTarget);
@@ -420,6 +447,9 @@ export async function verifyTodayContractItem(
       .update(`${contract.verificationTarget}:${exists}:${nowIso}`)
       .digest('hex')
       .slice(0, 16);
+    debugLog(exists ? 'INFO' : 'WARN', 'CONTRACT', `FILE_EXISTS=${exists} sha256=${hash}`, {
+      durationMs: performance.now() - t0,
+    });
     return {
       verified: exists,
       evidenceHash: hash,
@@ -441,12 +471,18 @@ export async function verifyTodayContractItem(
         .update(`${targetUrl}:${res.status}:${nowIso}`)
         .digest('hex')
         .slice(0, 16);
+      debugLog(ok ? 'INFO' : 'WARN', 'CONTRACT', `HTTP_CHECK ${res.status} on ${targetUrl} sha256=${hash}`, {
+        durationMs: performance.now() - t0,
+      });
       return {
         verified: ok,
         evidenceHash: hash,
         summary: `HTTP ${res.status} confirmado em ${contract.verificationTarget}.`,
       };
     } catch (err: unknown) {
+      debugLog('WARN', 'CONTRACT', `HTTP_CHECK failed on ${targetUrl}: ${(err as Error).message}`, {
+        durationMs: performance.now() - t0,
+      });
       return {
         verified: false,
         evidenceHash: '0000000000000000',
@@ -460,6 +496,10 @@ export async function verifyTodayContractItem(
     const ok = res.status === 'EXECUTED' && res.exitCode === 0;
     const hash = crypto.createHash('sha256').update(res.output).digest('hex').slice(0, 16);
     const tail = res.output.split('\n').slice(-3).join(' | ');
+    debugLog(ok ? 'INFO' : 'WARN', 'CONTRACT', `TEST_PASS=${ok} sha256=${hash}`, {
+      durationMs: performance.now() - t0,
+      payload: tail,
+    });
     return {
       verified: ok,
       evidenceHash: hash,
@@ -474,6 +514,9 @@ export async function verifyTodayContractItem(
     target: contract.verificationTarget,
   });
   const hash = crypto.createHash('sha256').update(stateSnap).digest('hex').slice(0, 16);
+  debugLog('INFO', 'CONTRACT', `EXEC_SIGN attested sha256=${hash} for ${contract.verificationTarget}`, {
+    durationMs: performance.now() - t0,
+  });
   return {
     verified: true,
     evidenceHash: hash,
@@ -653,6 +696,10 @@ export async function triggerSidecarHotkey(
   });
 
   db.appendAudit('SIDECAR_BRIDGE', 'SIDECAR', 'HOTKEY_TRIGGERED', `${combo} em ${record.deviceName}`, 'VERIFIED');
+  debugLog('INFO', 'SIDECAR', `Hotkey ${combo} -> ${status} on ${record.deviceName}`, {
+    durationMs: record.durationMs,
+    payload: output,
+  });
   return record;
 }
 

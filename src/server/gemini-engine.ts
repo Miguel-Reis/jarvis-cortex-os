@@ -34,6 +34,7 @@ import {
   lookupWorkspaceSymbols,
   storeBiTemporalMemory,
 } from './swarm-orbit-engine.ts';
+import { debugLog } from './debug-logger.ts';
 
 const roomDeltaHashes = new Map<string, string>();
 
@@ -692,9 +693,24 @@ export async function runAgentChatTurn(params: {
     attachments: attachments.length > 0 ? attachments : undefined,
   };
 
+  const turnStart = performance.now();
+  debugLog('INFO', 'AI-ENGINE', `Incoming chat turn in room "${room.name}" (${room.id})`, {
+    payload: { prompt: userText, attachments: attachments.length },
+    maxPreviewLen: 180,
+  });
+
   // Security Canary & Prompt Injection Gate
   const injection = detectPromptInjection(userText);
   if (injection.blocked) {
+    debugLog(
+      'WARN',
+      'AI-ENGINE',
+      `Canary Gate intercepted prompt injection (risk=${injection.riskScore}/100)`,
+      {
+        durationMs: performance.now() - turnStart,
+        payload: { rules: injection.matchedRules, prompt: userText },
+      }
+    );
     db.update((draft) => {
       draft.settings.personalityMode = 'GUARDIAN_DEFENSE';
     });
@@ -744,6 +760,20 @@ export async function runAgentChatTurn(params: {
     activeMcpCatalog,
   });
   roomDeltaHashes.set(room.id, nextDeltaHash);
+
+  debugLog(
+    'INFO',
+    'AI-ENGINE',
+    `JEV-S1 Route: tier=${jevDecision.tier} · intent=${jevDecision.intent} · TokenDiet=-${jevDecision.tokenDiet.savingsPercent}%`,
+    {
+      durationMs: jevDecision.latencyMs,
+      payload: {
+        microTick: jevDecision.microTick,
+        prunedTools: jevDecision.prunedTools,
+        savedTokens: jevDecision.tokenDiet.savedTokens,
+      },
+    }
+  );
 
   const activeProject =
     (state.projects || []).find((p) => p.id === (room.projectId || state.activeProjectId)) ||
@@ -986,6 +1016,16 @@ export async function runAgentChatTurn(params: {
   });
 
   harvestSelfLearnFromTurn(assistantMsg.id, userText, replyText);
+
+  debugLog(
+    'INFO',
+    'AI-ENGINE',
+    `Chat turn completed via ${engineUsed} (${toolCalls.length} tool call(s))`,
+    {
+      durationMs: performance.now() - turnStart,
+      payload: { replyChars: replyText.length, tools: toolCalls.map((tc) => tc.name) },
+    }
+  );
 
   return { userMessage: userMsg, assistantMessage: assistantMsg, blockedByCanary: false };
 }

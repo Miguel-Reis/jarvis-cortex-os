@@ -623,8 +623,24 @@ function handleNodeFallback(req, res) {
   sendJson(res, { error: `Not found: ${pathname}` }, 404);
 }
 
+const MJS_DEBUG_ENABLED = process.env.JARVIS_DEBUG !== '0' && process.env.JARVIS_DEBUG !== 'false';
+
 const server = http.createServer((req, res) => {
-  const pathname = (req.url || '/').split('?')[0];
+  const startNs = process.hrtime.bigint();
+  const method = req.method || 'GET';
+  const rawUrl = req.url || '/';
+  const pathname = rawUrl.split('?')[0];
+  const via = pyBackendOnline && pathname.startsWith('/api/') ? 'PY:8766' : 'NODE_NATIVE';
+
+  if (MJS_DEBUG_ENABLED) {
+    res.on('finish', () => {
+      const ms = (Number(process.hrtime.bigint() - startNs) / 1e6).toFixed(2);
+      console.log(
+        `[${new Date().toISOString()}] [DEBUG] [MJS:${via}] ${method} ${rawUrl} -> ${res.statusCode} (${ms}ms)`
+      );
+    });
+  }
+
   // Serve root HTML directly in <1ms; proxy API calls to Python JarvisCortexOS when active
   if (pyBackendOnline && pathname.startsWith('/api/')) {
     proxyToPython(req, res);
@@ -634,5 +650,7 @@ const server = http.createServer((req, res) => {
 });
 
 server.listen(PORT, HOST, () => {
-  console.log(`J.A.R.V.I.S. Cortex OS Mark-VII HUD listening on http://${HOST}:${PORT}`);
+  console.log(
+    `[J.A.R.V.I.S. Cortex OS Mark-VII] Listening on http://${HOST}:${PORT} (PID=${process.pid}, Debug=${MJS_DEBUG_ENABLED ? 'ON' : 'OFF'})`
+  );
 });

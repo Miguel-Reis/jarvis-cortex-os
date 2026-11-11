@@ -4,6 +4,7 @@ import {
   applyBulkProjectProactivity,
   buildDeterministicWorkflowFromPrompt,
   buildSparklineSvgPoints,
+  classifyHttpLogLevel,
   computeArchitecturalDrift,
   computeBinaryQuantization128,
   computeEbbinghausRetention,
@@ -18,6 +19,7 @@ import {
   detectPromptInjection,
   evaluateProjectProactivity,
   findShortestGraphPath,
+  formatDebugPayloadPreview,
   getVisibleSidebarIds,
   hammingSimilarity128,
   rankQ18Actions,
@@ -700,5 +702,30 @@ test('computeProjectsPortfolioSummary aggregates total projects, active hours, a
   assert.equal(summary.uniqueAssignedAgentsCount, 3);
 });
 
+test('formatDebugPayloadPreview redacts secrets, elides base64 blobs, and truncates safely', () => {
+  const preview = formatDebugPayloadPreview({
+    roomId: 'room-exec',
+    apiKey: 'sk-proj1234567890abcdefghijklmnop',
+    note: 'Token leaked ghp_1234567890abcdefghijklmnopqrstuvwx',
+    dataBase64: 'A'.repeat(512),
+    savedByDietTokens5h: 98460,
+  });
+  assert.ok(preview.includes('"roomId":"room-exec"'));
+  assert.ok(preview.includes('<REDACTED>'));
+  assert.ok(!preview.includes('sk-proj123456'));
+  assert.ok(!preview.includes('ghp_1234567890'));
+  assert.ok(preview.includes('<base64:512chars>'));
+  assert.ok(preview.includes('98460'));
 
+  const truncated = formatDebugPayloadPreview('X'.repeat(400), 80);
+  assert.ok(truncated.length < 110);
+  assert.ok(truncated.includes('chars)'));
+});
 
+test('classifyHttpLogLevel maps HTTP status codes and slow latencies to DEBUG/WARN/ERROR', () => {
+  assert.equal(classifyHttpLogLevel(200, 12), 'DEBUG');
+  assert.equal(classifyHttpLogLevel(304, 5), 'DEBUG');
+  assert.equal(classifyHttpLogLevel(404, 8), 'WARN');
+  assert.equal(classifyHttpLogLevel(200, 3500), 'WARN');
+  assert.equal(classifyHttpLogLevel(500, 20), 'ERROR');
+});

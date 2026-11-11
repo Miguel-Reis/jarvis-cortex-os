@@ -10,6 +10,8 @@ import os
 from jarvis_os.server.http_sse import run_server
 
 if __name__ == "__main__":
+    os.environ.setdefault("JARVIS_DEBUG", "1")
+    os.environ.setdefault("JARVIS_HTTP_VERBOSE", "1")
     port = int(os.environ.get("PORT", 3000))
     host = os.environ.get("HOST", "0.0.0.0")
     brain_url = os.environ.get("BRAIN_URL", "http://127.0.0.1:8765")
