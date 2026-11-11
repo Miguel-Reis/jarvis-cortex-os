@@ -880,32 +880,73 @@ export async function probeAndSyncBrain8765(importMemories = false): Promise<{
   const state = db.getState();
   const baseUrl = (state.settings.antigravityBrainUrl || 'http://127.0.0.1:8765').replace(/\/$/, '');
 
-  // Check if local brain.db exists on workstation disk
+  const expandHome = (p: string) =>
+    p.startsWith('~/') || p.startsWith('~\\')
+      ? path.join(os.homedir(), p.slice(2))
+      : path.resolve(WORKSPACE_ROOT, p);
+
+  const configuredDbRaw = (state.settings.antigravityBrainSqlitePath || '').trim();
   const candidateSqlitePaths = [
-    path.resolve(WORKSPACE_ROOT, 'brain.db'),
+    ...(configuredDbRaw ? [expandHome(configuredDbRaw)] : []),
     path.resolve(WORKSPACE_ROOT, '..', 'antigravity-brain', 'brain.db'),
+    path.resolve(WORKSPACE_ROOT, '..', 'antigravity-brain', 'data', 'brain.db'),
+    path.join(os.homedir(), 'Desktop', 'antigravity-brain', 'brain.db'),
+    path.join(os.homedir(), 'Desktop', 'antigravity-brain', 'data', 'brain.db'),
     path.join(os.homedir(), '.antigravity-brain', 'brain.db'),
+    path.join(os.homedir(), '.gemini', 'antigravity', 'brain.db'),
+    path.resolve(WORKSPACE_ROOT, 'brain.db'),
   ];
   const detectedSqlitePath = candidateSqlitePaths.find((p) => fs.existsSync(p));
   let sqliteWalDetected = false;
   let sqliteMemCount = 0;
+  const sqliteExtractedItems: { topic?: string; content?: string; tier?: MemoryTier }[] = [];
 
   if (detectedSqlitePath) {
     try {
       const sqliteMod = require('node:sqlite') as {
         DatabaseSync?: new (p: string, opts?: { readOnly?: boolean }) => {
-          prepare: (sql: string) => { get: () => Record<string, unknown> | undefined };
+          prepare: (sql: string) => {
+            get: () => Record<string, unknown> | undefined;
+            all: () => Record<string, unknown>[];
+          };
           close: () => void;
         };
       };
       if (sqliteMod?.DatabaseSync) {
         const extDb = new sqliteMod.DatabaseSync(detectedSqlitePath, { readOnly: true });
-        const row = extDb
-          .prepare("SELECT count(*) as c FROM sqlite_master WHERE type='table'")
-          .get();
-        sqliteWalDetected = Boolean(row);
-        sqliteMemCount = Number(row?.c ?? 0);
-        extDb.close();
+        try {
+          const tables = extDb
+            .prepare("SELECT name FROM sqlite_master WHERE type='table'")
+            .all()
+            .map((r) => String(r.name || ''));
+          sqliteWalDetected = tables.length > 0;
+
+          const memTable = ['memories', 'memory_nodes', 'facts', 'nodes', 'episodes', 'items'].find(
+            (t) => tables.includes(t)
+          );
+          if (memTable) {
+            const cntRow = extDb.prepare(`SELECT count(*) as c FROM "${memTable}"`).get();
+            sqliteMemCount = Number(cntRow?.c ?? 0);
+            if (importMemories && sqliteMemCount > 0) {
+              const rows = extDb.prepare(`SELECT * FROM "${memTable}" LIMIT 25`).all();
+              for (const r of rows) {
+                const topic = String(
+                  r.topic ?? r.title ?? r.name ?? r.key ?? r.entity ?? 'Antigravity Brain SQLite'
+                ).trim();
+                const content = String(
+                  r.content ?? r.value ?? r.summary ?? r.body ?? r.description ?? r.text ?? ''
+                ).trim();
+                if (content) {
+                  sqliteExtractedItems.push({ topic, content, tier: 'SEMANTIC' });
+                }
+              }
+            }
+          } else {
+            sqliteMemCount = tables.length;
+          }
+        } finally {
+          extDb.close();
+        }
       }
     } catch {
       sqliteWalDetected = true;
@@ -917,64 +958,117 @@ export async function probeAndSyncBrain8765(importMemories = false): Promise<{
   let remoteSwarmActive = false;
   let importedCount = 0;
 
-  try {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 1200);
-    const resp = await fetch(`${baseUrl}/api/memories`, { signal: controller.signal });
-    clearTimeout(timer);
+  const probePaths = [
+    '/api/memories',
+    '/api/jarvis?action=overview',
+    '/api/jarvis?action=memories',
+    '/api/bootstrap',
+    '/api/status',
+    '/api/health',
+    '/api/graph',
+    '/',
+  ];
+  let httpExtractedItems: { topic?: string; content?: string; tier?: MemoryTier }[] = [];
 
-    if (resp.ok) {
+  for (const probePath of probePaths) {
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 900);
+      const resp = await fetch(`${baseUrl}${probePath}`, {
+        headers: { Accept: 'application/json', 'X-Jarvis-Cortex-Port': '8766' },
+        signal: controller.signal,
+      });
+      clearTimeout(timer);
+
+      if (!resp.ok) continue;
       httpOnline = true;
-      const payload = (await resp.json()) as
-        | { memories?: { topic?: string; content?: string; tier?: MemoryTier }[] }
-        | { topic?: string; content?: string; tier?: MemoryTier }[];
-      const items = Array.isArray(payload) ? payload : payload.memories || [];
-      remoteMemoryCount = items.length;
 
-      if (importMemories && items.length > 0) {
-        const nowIso = new Date().toISOString();
-        db.update((draft) => {
-          for (const item of items.slice(0, 20)) {
-            const content = String(item.content || '').trim();
-            const topic = String(item.topic || 'Antigravity Brain Sync').trim();
-            if (!content || draft.memories.some((m) => m.content === content)) continue;
-            const id = `mem-8765-${Date.now()}-${importedCount}`;
-            draft.memories.unshift({
-              id,
-              topic,
-              content,
-              category: 'FACT',
-              provenance: 'CONFIRMED',
-              confidence: 0.98,
-              tags: ['brain-8765', 'hybrid-sync'],
-              pinned: false,
-              sourceUri: `${baseUrl}/api/memories`,
-              simHash: computeSimHash128(`${topic} ${content}`),
-              bq128Hex: computeBinaryQuantization128(`${topic} ${content}`),
-              tier: item.tier || 'SEMANTIC',
-              accessCount: 1,
-              lastAccessedAt: nowIso,
-              importance: 4,
-              validFrom: nowIso,
-              validUntil: null,
-              supersededBy: null,
-              createdAt: nowIso,
-              updatedAt: nowIso,
+      const ct = resp.headers.get('content-type') || '';
+      if (ct.includes('json') || probePath.startsWith('/api/')) {
+        const rawText = await resp.text();
+        try {
+          const payload = JSON.parse(rawText) as Record<string, unknown> | unknown[];
+          const candidateArr = Array.isArray(payload)
+            ? payload
+            : ((payload.memories ||
+                (payload.state as Record<string, unknown> | undefined)?.memories ||
+                payload.facts ||
+                payload.nodes ||
+                payload.items) as unknown[] | undefined);
+          if (Array.isArray(candidateArr) && candidateArr.length > 0) {
+            remoteMemoryCount = Math.max(remoteMemoryCount, candidateArr.length);
+            httpExtractedItems = candidateArr.map((raw) => {
+              const obj = (raw || {}) as Record<string, unknown>;
+              return {
+                topic: String(obj.topic ?? obj.title ?? obj.name ?? 'Antigravity Brain Sync'),
+                content: String(obj.content ?? obj.summary ?? obj.value ?? obj.text ?? ''),
+                tier: (obj.tier as MemoryTier) || 'SEMANTIC',
+              };
             });
-            draft.graphEdges.push({
-              id: `edge-8765-${Date.now()}-${importedCount}`,
-              source: 'mem-bridge-06',
-              target: id,
-              relation: 'SINCRONIZADO_8765',
-              weight: 0.94,
-            });
-            importedCount++;
+            break;
           }
-        });
+          if (!Array.isArray(payload) && typeof payload.memory_count === 'number') {
+            remoteMemoryCount = Math.max(remoteMemoryCount, payload.memory_count);
+          }
+          if (!Array.isArray(payload) && typeof payload.total_memories === 'number') {
+            remoteMemoryCount = Math.max(remoteMemoryCount, payload.total_memories);
+          }
+        } catch {
+          // Non-JSON 200 OK still confirms HTTP server on :8765 is alive
+        }
       }
+      if (!importMemories || httpExtractedItems.length > 0) {
+        break;
+      }
+    } catch {
+      // If first TCP attempt got ECONNREFUSED/abort, port :8765 is closed — stop probing further paths
+      break;
     }
-  } catch {
-    httpOnline = false;
+  }
+
+  const combinedImportItems =
+    httpExtractedItems.length > 0 ? httpExtractedItems : sqliteExtractedItems;
+
+  if (importMemories && combinedImportItems.length > 0) {
+    const nowIso = new Date().toISOString();
+    db.update((draft) => {
+      for (const item of combinedImportItems.slice(0, 25)) {
+        const content = String(item.content || '').trim();
+        const topic = String(item.topic || 'Antigravity Brain Sync').trim();
+        if (!content || draft.memories.some((m) => m.content === content)) continue;
+        const id = `mem-8765-${Date.now()}-${importedCount}`;
+        draft.memories.unshift({
+          id,
+          topic,
+          content,
+          category: 'FACT',
+          provenance: 'CONFIRMED',
+          confidence: 0.98,
+          tags: ['brain-8765', 'hybrid-sync'],
+          pinned: false,
+          sourceUri: httpOnline ? `${baseUrl}` : `sqlite://${detectedSqlitePath}`,
+          simHash: computeSimHash128(`${topic} ${content}`),
+          bq128Hex: computeBinaryQuantization128(`${topic} ${content}`),
+          tier: item.tier || 'SEMANTIC',
+          accessCount: 1,
+          lastAccessedAt: nowIso,
+          importance: 4,
+          validFrom: nowIso,
+          validUntil: null,
+          supersededBy: null,
+          createdAt: nowIso,
+          updatedAt: nowIso,
+        });
+        draft.graphEdges.push({
+          id: `edge-8765-${Date.now()}-${importedCount}`,
+          source: 'mem-bridge-06',
+          target: id,
+          relation: 'SINCRONIZADO_8765',
+          weight: 0.94,
+        });
+        importedCount++;
+      }
+    });
   }
 
   if (httpOnline) {
