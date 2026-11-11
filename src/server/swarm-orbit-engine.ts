@@ -878,33 +878,49 @@ export async function probeAndSyncBrain8765(importMemories = false): Promise<{
 }> {
   const t0 = Date.now();
   const state = db.getState();
-  const baseUrl = (state.settings.antigravityBrainUrl || 'http://127.0.0.1:8765').replace(/\/$/, '');
+  const displayUrl = (state.settings.antigravityBrainUrl || 'http://127.0.0.1:8765').replace(/\/$/, '');
+  // Normalize localhost -> 127.0.0.1 for fetch so Windows IPv6 (::1) never refuses connection against IPv4-bound Brain :8765
+  const ipv4Url = displayUrl.replace(/^http:\/\/localhost\b/i, 'http://127.0.0.1');
+  const candidateBaseUrls = ipv4Url !== displayUrl ? [ipv4Url, displayUrl] : [displayUrl];
 
-  const expandHome = (p: string) =>
-    p.startsWith('~/') || p.startsWith('~\\')
-      ? path.join(os.homedir(), p.slice(2))
-      : path.resolve(WORKSPACE_ROOT, p);
+  const expandHome = (rawPath: string) => {
+    const clean = rawPath.trim().replace(/^["']|["']$/g, '');
+    if (clean.startsWith('~/') || clean.startsWith('~\\')) {
+      return path.join(os.homedir(), clean.slice(2));
+    }
+    return path.resolve(WORKSPACE_ROOT, clean);
+  };
 
   const configuredDbRaw = (state.settings.antigravityBrainSqlitePath || '').trim();
   const candidateSqlitePaths = [
     ...(configuredDbRaw ? [expandHome(configuredDbRaw)] : []),
+    path.join(os.homedir(), '.gemini', 'antigravity', 'scratch', 'brain_mcp', 'brain.db'),
+    path.join(os.homedir(), '.gemini', 'antigravity', 'brain.db'),
     path.resolve(WORKSPACE_ROOT, '..', 'antigravity-brain', 'brain.db'),
     path.resolve(WORKSPACE_ROOT, '..', 'antigravity-brain', 'data', 'brain.db'),
     path.join(os.homedir(), 'Desktop', 'antigravity-brain', 'brain.db'),
     path.join(os.homedir(), 'Desktop', 'antigravity-brain', 'data', 'brain.db'),
     path.join(os.homedir(), '.antigravity-brain', 'brain.db'),
-    path.join(os.homedir(), '.gemini', 'antigravity', 'brain.db'),
     path.resolve(WORKSPACE_ROOT, 'brain.db'),
   ];
-  const detectedSqlitePath = candidateSqlitePaths.find((p) => fs.existsSync(p));
+  const detectedSqlitePath = candidateSqlitePaths.find((p) => {
+    try {
+      return fs.existsSync(p) && fs.statSync(p).isFile();
+    } catch {
+      return false;
+    }
+  });
+
   let sqliteWalDetected = false;
   let sqliteMemCount = 0;
-  const sqliteExtractedItems: { topic?: string; content?: string; tier?: MemoryTier }[] = [];
+  const sqliteExtractedItems: { topic?: string; content?: string; tier?: MemoryTier; workspace?: string }[] = [];
 
   if (detectedSqlitePath) {
+    sqliteWalDetected = true;
     try {
       const sqliteMod = require('node:sqlite') as {
-        DatabaseSync?: new (p: string, opts?: { readOnly?: boolean }) => {
+        DatabaseSync?: new (p: string, opts?: Record<string, unknown>) => {
+          exec: (sql: string) => void;
           prepare: (sql: string) => {
             get: () => Record<string, unknown> | undefined;
             all: () => Record<string, unknown>[];
@@ -913,42 +929,109 @@ export async function probeAndSyncBrain8765(importMemories = false): Promise<{
         };
       };
       if (sqliteMod?.DatabaseSync) {
-        const extDb = new sqliteMod.DatabaseSync(detectedSqlitePath, { readOnly: true });
+        let extDb: InstanceType<NonNullable<typeof sqliteMod.DatabaseSync>> | null = null;
         try {
-          const tables = extDb
+          extDb = new sqliteMod.DatabaseSync(detectedSqlitePath);
+          extDb.exec('PRAGMA query_only = ON; PRAGMA busy_timeout = 1500;');
+        } catch {
+          extDb = new sqliteMod.DatabaseSync(detectedSqlitePath, { readOnly: true });
+        }
+
+        try {
+          const allTables = extDb
             .prepare("SELECT name FROM sqlite_master WHERE type='table'")
             .all()
-            .map((r) => String(r.name || ''));
-          sqliteWalDetected = tables.length > 0;
+            .map((r) => String(r.name || ''))
+            .filter(
+              (name) =>
+                name &&
+                !name.startsWith('sqlite_') &&
+                !name.includes('_fts') &&
+                !name.endsWith('_idx') &&
+                !name.endsWith('_data') &&
+                !name.endsWith('_docsize') &&
+                !name.endsWith('_config')
+            );
 
-          const memTable = ['memories', 'memory_nodes', 'facts', 'nodes', 'episodes', 'items'].find(
-            (t) => tables.includes(t)
-          );
+          const preferredNames = [
+            'memories',
+            'memory',
+            'notes',
+            'vault',
+            'memory_nodes',
+            'entries',
+            'facts',
+            'nodes',
+            'episodes',
+            'items',
+          ];
+          let memTable = preferredNames.find((t) => allTables.includes(t));
+          if (!memTable && allTables.length > 0) {
+            // Pick table with content/text/body/summary column
+            for (const tbl of allTables) {
+              try {
+                const cols = extDb
+                  .prepare(`PRAGMA table_info("${tbl.replace(/"/g, '""')}")`)
+                  .all()
+                  .map((c) => String(c.name || '').toLowerCase());
+                if (cols.some((c) => ['content', 'body', 'text', 'summary', 'value'].includes(c))) {
+                  memTable = tbl;
+                  break;
+                }
+              } catch {
+                // ignore
+              }
+            }
+          }
+
           if (memTable) {
-            const cntRow = extDb.prepare(`SELECT count(*) as c FROM "${memTable}"`).get();
+            const safeTbl = memTable.replace(/"/g, '""');
+            const cntRow = extDb.prepare(`SELECT count(*) as c FROM "${safeTbl}"`).get();
             sqliteMemCount = Number(cntRow?.c ?? 0);
+
             if (importMemories && sqliteMemCount > 0) {
-              const rows = extDb.prepare(`SELECT * FROM "${memTable}" LIMIT 25`).all();
+              const cols = extDb
+                .prepare(`PRAGMA table_info("${safeTbl}")`)
+                .all()
+                .map((c) => String(c.name || ''));
+              const hasWorkspace = cols.includes('workspace');
+              const hasId = cols.includes('id');
+              const orderClause = hasId ? 'ORDER BY id DESC' : '';
+              const querySql = hasWorkspace
+                ? `SELECT * FROM "${safeTbl}" ORDER BY CASE WHEN lower(workspace) IN ('jarvis', 'jarvis_cortex_os', 'project-jarvis', 'brain_mcp', 'global') THEN 0 ELSE 1 END, ${hasId ? 'id DESC' : 'rowid DESC'} LIMIT 30`
+                : `SELECT * FROM "${safeTbl}" ${orderClause} LIMIT 30`;
+
+              const rows = extDb.prepare(querySql).all();
               for (const r of rows) {
-                const topic = String(
-                  r.topic ?? r.title ?? r.name ?? r.key ?? r.entity ?? 'Antigravity Brain SQLite'
+                const ws = r.workspace ? String(r.workspace).trim() : '';
+                const rawTitle = String(
+                  r.title ?? r.topic ?? r.name ?? r.key ?? r.entity ?? ''
                 ).trim();
                 const content = String(
-                  r.content ?? r.value ?? r.summary ?? r.body ?? r.description ?? r.text ?? ''
+                  r.content ?? r.body ?? r.text ?? r.summary ?? r.value ?? r.description ?? ''
                 ).trim();
+                const topic =
+                  rawTitle ||
+                  (content ? content.split('\n')[0].slice(0, 72) : 'Antigravity Brain Memory');
                 if (content) {
-                  sqliteExtractedItems.push({ topic, content, tier: 'SEMANTIC' });
+                  sqliteExtractedItems.push({
+                    topic: ws ? `[${ws}] ${topic}` : topic,
+                    content,
+                    tier: 'SEMANTIC',
+                    workspace: ws,
+                  });
                 }
               }
             }
           } else {
-            sqliteMemCount = tables.length;
+            sqliteMemCount = allTables.length;
           }
         } finally {
           extDb.close();
         }
       }
-    } catch {
+    } catch (err) {
+      debugLog('WARN', 'BRAIN:8765', `SQLite read warning on ${detectedSqlitePath}: ${(err as Error).message}`);
       sqliteWalDetected = true;
     }
   }
@@ -962,70 +1045,87 @@ export async function probeAndSyncBrain8765(importMemories = false): Promise<{
     '/api/memories',
     '/api/jarvis?action=overview',
     '/api/jarvis?action=memories',
-    '/api/bootstrap',
-    '/api/status',
-    '/api/health',
     '/api/graph',
+    '/api/vault',
+    '/api/overview',
+    '/api/stats',
+    '/api/status',
+    '/api/bootstrap',
+    '/api/health',
     '/',
   ];
   let httpExtractedItems: { topic?: string; content?: string; tier?: MemoryTier }[] = [];
 
-  for (const probePath of probePaths) {
-    try {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 900);
-      const resp = await fetch(`${baseUrl}${probePath}`, {
-        headers: { Accept: 'application/json', 'X-Jarvis-Cortex-Port': '8766' },
-        signal: controller.signal,
-      });
-      clearTimeout(timer);
+  outerProbe: for (const candidateBase of candidateBaseUrls) {
+    for (const probePath of probePaths) {
+      try {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), 900);
+        const resp = await fetch(`${candidateBase}${probePath}`, {
+          headers: { Accept: 'application/json, text/html;q=0.8', 'X-Jarvis-Cortex-Port': '8766' },
+          signal: controller.signal,
+        });
+        clearTimeout(timer);
 
-      if (!resp.ok) continue;
-      httpOnline = true;
+        if (!resp.ok) continue;
+        httpOnline = true;
 
-      const ct = resp.headers.get('content-type') || '';
-      if (ct.includes('json') || probePath.startsWith('/api/')) {
-        const rawText = await resp.text();
-        try {
-          const payload = JSON.parse(rawText) as Record<string, unknown> | unknown[];
-          const candidateArr = Array.isArray(payload)
-            ? payload
-            : ((payload.memories ||
-                (payload.state as Record<string, unknown> | undefined)?.memories ||
-                payload.facts ||
-                payload.nodes ||
-                payload.items) as unknown[] | undefined);
-          if (Array.isArray(candidateArr) && candidateArr.length > 0) {
-            remoteMemoryCount = Math.max(remoteMemoryCount, candidateArr.length);
-            httpExtractedItems = candidateArr.map((raw) => {
-              const obj = (raw || {}) as Record<string, unknown>;
-              return {
-                topic: String(obj.topic ?? obj.title ?? obj.name ?? 'Antigravity Brain Sync'),
-                content: String(obj.content ?? obj.summary ?? obj.value ?? obj.text ?? ''),
-                tier: (obj.tier as MemoryTier) || 'SEMANTIC',
-              };
-            });
-            break;
+        const ct = resp.headers.get('content-type') || '';
+        if (ct.includes('json') || probePath.startsWith('/api/')) {
+          const rawText = await resp.text();
+          try {
+            const payload = JSON.parse(rawText) as Record<string, unknown> | unknown[];
+            const candidateArr = Array.isArray(payload)
+              ? payload
+              : ((payload.memories ||
+                  (payload.state as Record<string, unknown> | undefined)?.memories ||
+                  payload.nodes ||
+                  payload.facts ||
+                  payload.items ||
+                  payload.entries) as unknown[] | undefined);
+            if (Array.isArray(candidateArr) && candidateArr.length > 0) {
+              remoteMemoryCount = Math.max(remoteMemoryCount, candidateArr.length);
+              httpExtractedItems = candidateArr.map((raw) => {
+                const obj = (raw || {}) as Record<string, unknown>;
+                const ws = obj.workspace ? `[${String(obj.workspace)}] ` : '';
+                const baseTitle = String(
+                  obj.title ?? obj.topic ?? obj.name ?? 'Antigravity Brain Sync'
+                );
+                return {
+                  topic: `${ws}${baseTitle}`,
+                  content: String(obj.content ?? obj.body ?? obj.summary ?? obj.value ?? obj.text ?? ''),
+                  tier: (obj.tier as MemoryTier) || 'SEMANTIC',
+                };
+              });
+              break outerProbe;
+            }
+            if (!Array.isArray(payload)) {
+              const countVal =
+                payload.memory_count ??
+                payload.total_memories ??
+                payload.memoriesCount ??
+                payload.total;
+              if (typeof countVal === 'number') {
+                remoteMemoryCount = Math.max(remoteMemoryCount, countVal);
+              }
+            }
+          } catch {
+            // Non-JSON 200 OK (e.g. SPA index.html on '/') still confirms HTTP server on :8765 is live
           }
-          if (!Array.isArray(payload) && typeof payload.memory_count === 'number') {
-            remoteMemoryCount = Math.max(remoteMemoryCount, payload.memory_count);
-          }
-          if (!Array.isArray(payload) && typeof payload.total_memories === 'number') {
-            remoteMemoryCount = Math.max(remoteMemoryCount, payload.total_memories);
-          }
-        } catch {
-          // Non-JSON 200 OK still confirms HTTP server on :8765 is alive
         }
-      }
-      if (!importMemories || httpExtractedItems.length > 0) {
+
+        if (!importMemories || sqliteExtractedItems.length > 0) {
+          break outerProbe;
+        }
+      } catch {
+        // Connection failed on this candidateBase (e.g. ::1 vs 127.0.0.1) — try next candidateBase
         break;
       }
-    } catch {
-      // If first TCP attempt got ECONNREFUSED/abort, port :8765 is closed — stop probing further paths
-      break;
     }
+    if (httpOnline) break;
   }
 
+  // Prefer SQLite direct WAL items when HTTP only returned SPA HTML or fewer items
   const combinedImportItems =
     httpExtractedItems.length > 0 ? httpExtractedItems : sqliteExtractedItems;
 
@@ -1046,7 +1146,7 @@ export async function probeAndSyncBrain8765(importMemories = false): Promise<{
           confidence: 0.98,
           tags: ['brain-8765', 'hybrid-sync'],
           pinned: false,
-          sourceUri: httpOnline ? `${baseUrl}` : `sqlite://${detectedSqlitePath}`,
+          sourceUri: detectedSqlitePath ? `sqlite://${detectedSqlitePath}` : displayUrl,
           simHash: computeSimHash128(`${topic} ${content}`),
           bq128Hex: computeBinaryQuantization128(`${topic} ${content}`),
           tier: item.tier || 'SEMANTIC',
@@ -1075,7 +1175,7 @@ export async function probeAndSyncBrain8765(importMemories = false): Promise<{
     try {
       const c2 = new AbortController();
       const t2 = setTimeout(() => c2.abort(), 800);
-      const rSwarm = await fetch(`${baseUrl}/api/swarm`, { signal: c2.signal });
+      const rSwarm = await fetch(`${ipv4Url}/api/swarm`, { signal: c2.signal });
       clearTimeout(t2);
       remoteSwarmActive = rSwarm.ok;
     } catch {
@@ -1085,7 +1185,7 @@ export async function probeAndSyncBrain8765(importMemories = false): Promise<{
 
   const latencyMs = Math.max(1, Date.now() - t0);
   const status: BrainLiveStatus = {
-    endpointUrl: baseUrl,
+    endpointUrl: displayUrl,
     httpOnline,
     sqliteWalDetected,
     sqlitePath: detectedSqlitePath,
@@ -1098,13 +1198,13 @@ export async function probeAndSyncBrain8765(importMemories = false): Promise<{
 
   const message =
     status.mode === 'HYBRID_LIVE_8765'
-      ? `Ponte híbrida ${baseUrl} ativa (${importedCount} novos factos sincronizados · ${latencyMs}ms).`
+      ? `Ponte híbrida ${displayUrl} ativa (${remoteMemoryCount} memórias no Brain · +${importedCount} novas sincronizadas · ${latencyMs}ms).`
       : `Motores v7.2 a operar nativamente no Jarvis (porta :8765 offline neste contentor · zero perda funcional).`;
 
   debugLog(
     'DEBUG',
     'BRAIN:8765',
-    `Probe ${baseUrl} -> mode=${status.mode} (http=${httpOnline}, sqliteWal=${sqliteWalDetected}, imported=${importedCount})`,
+    `Probe ${displayUrl} -> mode=${status.mode} (http=${httpOnline}, sqliteWal=${sqliteWalDetected}, remoteCount=${remoteMemoryCount}, imported=${importedCount})`,
     { durationMs: latencyMs }
   );
 

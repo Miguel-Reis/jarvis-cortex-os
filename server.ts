@@ -2,7 +2,10 @@ import express from 'express';
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import dns from 'node:dns';
 import { fileURLToPath } from 'node:url';
+
+dns.setDefaultResultOrder('ipv4first');
 import {
   compressFactTelegraphic,
   computeBinaryQuantization128,
