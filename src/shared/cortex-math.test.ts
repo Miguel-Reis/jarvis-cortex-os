@@ -1,15 +1,22 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  applyBulkProjectProactivity,
   buildDeterministicWorkflowFromPrompt,
+  buildSparklineSvgPoints,
+  computeArchitecturalDrift,
   computeBinaryQuantization128,
   computeEbbinghausRetention,
   computeHippoRagPPR,
+  computeMcpLatencyStats,
+  computeProjectProactiveFrequency,
+  computeProjectsPortfolioSummary,
   computeQ18Score,
   computeSimHash128,
   computeViewStepCompletion,
   detectContradictedMemories,
   detectPromptInjection,
+  evaluateProjectProactivity,
   findShortestGraphPath,
   getVisibleSidebarIds,
   hammingSimilarity128,
@@ -220,6 +227,7 @@ test('computeViewStepCompletion calculates normalized [0..1] progress per module
   } as unknown as JarvisStoreData;
 
   assert.equal(computeViewStepCompletion('brief', mockStore), 0.605);
+  assert.equal(computeViewStepCompletion('brain', mockStore), 0.5);
   assert.equal(computeViewStepCompletion('swarm', mockStore), 1);
   assert.equal(computeViewStepCompletion('orbit', mockStore), 0.5);
   assert.equal(computeViewStepCompletion('mcp', mockStore), 0.688);
@@ -228,13 +236,14 @@ test('computeViewStepCompletion calculates normalized [0..1] progress per module
   assert.equal(computeViewStepCompletion('skills', mockStore), 1);
 });
 
-test('getVisibleSidebarIds hides non-critical sidebar items in Focus Mode while preserving active and pending-approval items', () => {
-  const all = ['brief', 'swarm', 'orbit', 'mcp', 'chat', 'workflows', 'workspace', 'memory', 'skills', 'devices', 'authority'];
+test('getVisibleSidebarIds hides non-critical sidebar items in Focus Mode while preserving active, brain, and pending-approval items', () => {
+  const all = ['brief', 'brain', 'swarm', 'orbit', 'mcp', 'chat', 'workflows', 'workspace', 'memory', 'skills', 'devices', 'authority'];
 
   assert.deepEqual(getVisibleSidebarIds(all, false, 'brief', 0), all);
 
   assert.deepEqual(getVisibleSidebarIds(all, true, 'brief', 0), [
     'brief',
+    'brain',
     'swarm',
     'orbit',
     'mcp',
@@ -246,6 +255,7 @@ test('getVisibleSidebarIds hides non-critical sidebar items in Focus Mode while 
 
   assert.deepEqual(getVisibleSidebarIds(all, true, 'brief', 2), [
     'brief',
+    'brain',
     'swarm',
     'orbit',
     'mcp',
@@ -258,6 +268,7 @@ test('getVisibleSidebarIds hides non-critical sidebar items in Focus Mode while 
 
   assert.deepEqual(getVisibleSidebarIds(all, true, 'devices', 0), [
     'brief',
+    'brain',
     'swarm',
     'orbit',
     'mcp',
@@ -442,3 +453,252 @@ test('MCP Authority Gate blocks SSRF metadata & shell chaining while governing s
   assert.equal(governedStdio.requiresHumanApproval, true);
   assert.equal(governedStdio.verdict, 'REQUIRES_STDIO_APPROVAL');
 });
+
+test('computeMcpLatencyStats & buildSparklineSvgPoints compute real-time p95, jitter, uptime and SVG coordinates', () => {
+  const stats = computeMcpLatencyStats({
+    latencyHistory: [1.1, 1.4, 0.9, 1.2, 2.8, 1.3],
+    probeCount: 10,
+    errorCount: 1,
+    healthStatus: 'ONLINE',
+  });
+  assert.equal(stats.currentMs, 1.3);
+  assert.equal(stats.minMs, 0.9);
+  assert.equal(stats.maxMs, 2.8);
+  assert.equal(stats.p95Ms, 2.8);
+  assert.ok(stats.jitterMs > 0);
+  assert.equal(stats.uptimePercent, 90);
+
+  const svg = buildSparklineSvgPoints(stats.samples, 136, 28);
+  assert.ok(svg.polylinePoints.split(' ').length === 6);
+  assert.ok(svg.areaPath.startsWith('M '));
+  assert.ok(svg.areaPath.endsWith(' Z'));
+});
+
+test('computeArchitecturalDrift detects missing referenced files vs aligned AST decisions', () => {
+  const drift = computeArchitecturalDrift({
+    memories: [
+      {
+        id: 'm-ok',
+        topic: 'Servidor Principal Express',
+        content: 'Rota principal mantida em server.ts com SSE.',
+        category: 'DECISION',
+        provenance: 'CONFIRMED',
+        confidence: 0.99,
+        tags: [],
+        pinned: true,
+        sourceUri: 'local',
+        simHash: '1'.repeat(32),
+        createdAt: '2026-01-01T00:00:00Z',
+        updatedAt: '2026-01-01T00:00:00Z',
+      },
+      {
+        id: 'm-missing',
+        topic: 'Módulo Legado Removido',
+        content: 'Dependemos de legacy_router_v0.ts para autenticação.',
+        category: 'DECISION',
+        provenance: 'CONFIRMED',
+        confidence: 0.99,
+        tags: [],
+        pinned: false,
+        sourceUri: 'local',
+        simHash: '2'.repeat(32),
+        createdAt: '2026-01-01T00:00:00Z',
+        updatedAt: '2026-01-01T00:00:00Z',
+      },
+    ],
+    symbols: [
+      {
+        id: 's1',
+        name: 'startServer',
+        kind: 'function',
+        filePath: 'server.ts',
+        startLine: 10,
+        endLine: 100,
+        signature: 'startServer()',
+        imports: [],
+      },
+    ],
+    coChanges: [],
+    knownFiles: ['server.ts', 'src/App.tsx'],
+  });
+
+  assert.equal(drift.length, 2);
+  assert.equal(drift[0].severity, 'NOMINAL');
+  assert.equal(drift[1].severity, 'DRIFT_DETECTED');
+});
+
+test('evaluateProjectProactivity computes health score and actionable insights when contracts or git changes exist', () => {
+  const evaluated = evaluateProjectProactivity({
+    project: {
+      id: 'proj-1',
+      name: 'Jarvis Core',
+      slug: 'jarvis-core',
+      rootPath: '.',
+      techStack: 'TypeScript + React',
+      gitBranch: 'main',
+      description: 'Core project',
+      status: 'ACTIVE',
+      proactiveEnabled: true,
+      proactiveIntervalSec: 90,
+      healthScore: 100,
+      openTasksCount: 2,
+      assignedAgentIds: ['room-exec'],
+      proactiveInsights: [],
+    },
+    modifiedGitFilesCount: 8,
+    symbolCount: 120,
+    unverifiedContractsCount: 2,
+    pendingDotsCount: 1,
+  });
+
+  assert.ok(evaluated.healthScore < 96);
+  assert.equal(evaluated.insights.length, 3);
+  assert.equal(evaluated.insights[0].actionKind, 'VERIFY_CONTRACTS');
+});
+
+test('applyBulkProjectProactivity toggles proactiveEnabled across all registered projects simultaneously', () => {
+  const baseProjects = [
+    {
+      id: 'proj-1',
+      name: 'Jarvis Core',
+      slug: 'jarvis-core',
+      rootPath: '.',
+      techStack: 'TypeScript',
+      gitBranch: 'main',
+      description: 'Core',
+      status: 'ACTIVE' as const,
+      proactiveEnabled: true,
+      proactiveIntervalSec: 90,
+      healthScore: 95,
+      openTasksCount: 1,
+      assignedAgentIds: ['room-exec'],
+      proactiveInsights: [],
+    },
+    {
+      id: 'proj-2',
+      name: 'Sidecar Native',
+      slug: 'sidecar-native',
+      rootPath: 'jarvis_os',
+      techStack: 'Python 3.11',
+      gitBranch: 'main',
+      description: 'Sidecar',
+      status: 'ACTIVE' as const,
+      proactiveEnabled: false,
+      proactiveIntervalSec: 120,
+      healthScore: 92,
+      openTasksCount: 0,
+      assignedAgentIds: ['room-eng'],
+      proactiveInsights: [],
+    },
+  ];
+
+  const disabledAll = applyBulkProjectProactivity(baseProjects, false);
+  assert.equal(disabledAll.enabledCount, 0);
+  assert.equal(disabledAll.allEnabled, false);
+  assert.ok(disabledAll.projects.every((p) => p.proactiveEnabled === false));
+
+  const enabledAll = applyBulkProjectProactivity(disabledAll.projects, true);
+  assert.equal(enabledAll.enabledCount, 2);
+  assert.equal(enabledAll.allEnabled, true);
+  assert.ok(enabledAll.projects.every((p) => p.proactiveEnabled === true));
+});
+
+test('computeProjectProactiveFrequency computes 10-point intervention series and SVG sparkline geometry', () => {
+  const activeProj = {
+    id: 'proj-jarvis-core',
+    name: 'Jarvis Core',
+    slug: 'jarvis-core',
+    rootPath: '.',
+    techStack: 'TypeScript',
+    gitBranch: 'main',
+    description: 'Core',
+    status: 'ACTIVE' as const,
+    proactiveEnabled: true,
+    proactiveIntervalSec: 60,
+    healthScore: 82,
+    openTasksCount: 2,
+    assignedAgentIds: ['room-exec'],
+    proactiveInsights: [
+      {
+        id: 'ins-1',
+        projectId: 'proj-jarvis-core',
+        createdAt: '2026-11-11T00:00:00Z',
+        category: 'TEST_GATE' as const,
+        severity: 'WARNING' as const,
+        title: 'Contratos por verificar',
+        detail: 'Detalhe',
+        suggestedActionLabel: 'Verificar',
+        suggestedCommandOrPrompt: 'verify_all_contracts',
+        actionKind: 'VERIFY_CONTRACTS' as const,
+        status: 'OPEN' as const,
+      },
+    ],
+  };
+
+  const activeStats = computeProjectProactiveFrequency(activeProj, 124, 26);
+  assert.equal(activeStats.samples.length, 10);
+  assert.ok(activeStats.currentPerHour > 0);
+  assert.ok(activeStats.peakPerHour >= activeStats.currentPerHour);
+  assert.ok(activeStats.polylinePoints.includes(','));
+  assert.ok(activeStats.areaPath.startsWith('M '));
+
+  const pausedStats = computeProjectProactiveFrequency(
+    { ...activeProj, proactiveEnabled: false },
+    124,
+    26
+  );
+  assert.equal(pausedStats.currentPerHour, 0);
+  assert.equal(pausedStats.trendDirection, 'PAUSED');
+});
+
+test('computeProjectsPortfolioSummary aggregates total projects, active hours, and running background agents', () => {
+  const summary = computeProjectsPortfolioSummary({
+    projects: [
+      {
+        id: 'proj-1',
+        name: 'Jarvis Core',
+        slug: 'jarvis-core',
+        rootPath: '.',
+        techStack: 'TypeScript',
+        gitBranch: 'main',
+        description: 'Core',
+        status: 'ACTIVE',
+        proactiveEnabled: true,
+        proactiveIntervalSec: 60,
+        healthScore: 95,
+        openTasksCount: 3,
+        symbolCount: 120,
+        assignedAgentIds: ['room-exec', 'room-eng'],
+        proactiveInsights: [],
+      },
+      {
+        id: 'proj-2',
+        name: 'Python Sidecar',
+        slug: 'python-sidecar',
+        rootPath: 'jarvis_os',
+        techStack: 'Python 3.11',
+        gitBranch: 'main',
+        description: 'Sidecar',
+        status: 'ACTIVE',
+        proactiveEnabled: true,
+        proactiveIntervalSec: 90,
+        healthScore: 92,
+        openTasksCount: 2,
+        symbolCount: 80,
+        assignedAgentIds: ['room-eng', 'room-ops'],
+        proactiveInsights: [],
+      },
+    ],
+    dotsTasks: [{ status: 'IN_PROGRESS', assignedAgent: 'SCOUT-01' }],
+    heartbeatTotalBeats: 14,
+  });
+
+  assert.equal(summary.totalProjects, 2);
+  assert.equal(summary.activeProjectsCount, 2);
+  assert.ok(summary.totalActiveHours > 20);
+  assert.equal(summary.runningBackgroundAgents, 4);
+  assert.equal(summary.uniqueAssignedAgentsCount, 3);
+});
+
+
+

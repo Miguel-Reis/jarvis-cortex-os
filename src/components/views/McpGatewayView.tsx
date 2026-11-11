@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Activity,
   AlertTriangle,
@@ -14,13 +14,18 @@ import {
   ShieldAlert,
   ShieldCheck,
   Trash2,
+  WifiOff,
   Wrench,
   X,
 } from 'lucide-react';
 import { apiJson } from '../../lib/api';
 import { useToast } from '../ToastContext';
 import type { NavSectionId } from '../../lib/i18n';
-import { validateMcpServerAuthorityGate } from '../../shared/cortex-math';
+import {
+  buildSparklineSvgPoints,
+  computeMcpLatencyStats,
+  validateMcpServerAuthorityGate,
+} from '../../shared/cortex-math';
 import type {
   McpAuthorityGateResult,
   McpCustomServer,
@@ -148,6 +153,17 @@ export const McpGatewayView: React.FC<McpGatewayViewProps> = ({
   const [rpcElapsedMs, setRpcElapsedMs] = useState<number | null>(null);
   const [rpcResultText, setRpcResultText] = useState<string>('');
 
+  // Real-Time JSON-RPC 2.0 Heartbeat Monitor State
+  const [autoHeartbeatEnabled, setAutoHeartbeatEnabled] = useState<boolean>(true);
+  const [heartbeatIntervalSec, setHeartbeatIntervalSec] = useState<5 | 10 | 30>(10);
+  const [heartbeatRunning, setHeartbeatRunning] = useState<boolean>(false);
+  const [heartbeatTargetId, setHeartbeatTargetId] = useState<string | null>(null);
+  const [heartbeatSeq, setHeartbeatSeq] = useState<number>(1);
+  const [lastHeartbeatIso, setLastHeartbeatIso] = useState<string | null>(null);
+  const [lastRpcRoundTripMs, setLastRpcRoundTripMs] = useState<number | null>(null);
+  const heartbeatInFlightRef = useRef(false);
+  const initialHeartbeatFiredRef = useRef(false);
+
   const loadGateway = useCallback(async () => {
     try {
       const res = await apiJson<McpGatewayPayload>('/api/mcp/gateway');
@@ -163,9 +179,97 @@ export const McpGatewayView: React.FC<McpGatewayViewProps> = ({
     }
   }, [pushToast]);
 
+  const executeHeartbeatProbeRpc = useCallback(
+    async (options?: { serverId?: string; silent?: boolean }) => {
+      const silent = Boolean(options?.silent);
+      if (heartbeatInFlightRef.current && silent) return;
+      heartbeatInFlightRef.current = true;
+      setHeartbeatRunning(true);
+      if (options?.serverId) setHeartbeatTargetId(options.serverId);
+
+      const clientT0 = performance.now();
+      try {
+        const rpcRes = await apiJson<{
+          jsonrpc: string;
+          id: number;
+          result?: {
+            heartbeatAt: string;
+            roundTripMs: number;
+            probedCount: number;
+            overview: McpGatewayPayload;
+          };
+          error?: { code: number; message: string };
+        }>('/api/mcp', {
+          method: 'POST',
+          body: JSON.stringify({
+            jsonrpc: '2.0',
+            id: Date.now(),
+            method: 'gateway/heartbeat',
+            params: options?.serverId ? { serverId: options.serverId } : {},
+          }),
+        });
+
+        const clientRtt = Number((performance.now() - clientT0).toFixed(2));
+        if (rpcRes.result?.overview) {
+          setData(rpcRes.result.overview);
+          setHeartbeatSeq((prev) => prev + 1);
+          setLastHeartbeatIso(rpcRes.result.heartbeatAt);
+          setLastRpcRoundTripMs(rpcRes.result.roundTripMs || clientRtt);
+
+          if (!silent) {
+            pushToast({
+              title: options?.serverId
+                ? 'Ping JSON-RPC 2.0 concluído'
+                : `Heartbeat JSON-RPC (${rpcRes.result.probedCount} ativos)`,
+              detail: `Round-trip ${rpcRes.result.roundTripMs} ms · Latência média ${rpcRes.result.overview.summary.avgLatencyMs} ms`,
+              tone: 'success',
+            });
+          }
+        } else if (rpcRes.error && !silent) {
+          pushToast({
+            title: 'Erro no Heartbeat JSON-RPC',
+            detail: rpcRes.error.message,
+            tone: 'error',
+          });
+        }
+      } catch (err) {
+        if (!silent) {
+          pushToast({
+            title: 'Falha de comunicação no Heartbeat JSON-RPC',
+            detail: (err as Error).message,
+            tone: 'error',
+          });
+        }
+      } finally {
+        heartbeatInFlightRef.current = false;
+        setHeartbeatRunning(false);
+        setHeartbeatTargetId(null);
+      }
+    },
+    [pushToast]
+  );
+
   useEffect(() => {
     loadGateway();
   }, [loadGateway]);
+
+  // Initial live JSON-RPC heartbeat probe once gateway data mounts
+  useEffect(() => {
+    if (!loading && data && !initialHeartbeatFiredRef.current) {
+      initialHeartbeatFiredRef.current = true;
+      executeHeartbeatProbeRpc({ silent: true });
+    }
+  }, [loading, data, executeHeartbeatProbeRpc]);
+
+  // Scheduled periodic JSON-RPC 2.0 heartbeat loop
+  useEffect(() => {
+    if (!autoHeartbeatEnabled || loading) return;
+    const timer = window.setInterval(() => {
+      if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
+      executeHeartbeatProbeRpc({ silent: true });
+    }, heartbeatIntervalSec * 1000);
+    return () => window.clearInterval(timer);
+  }, [autoHeartbeatEnabled, heartbeatIntervalSec, loading, executeHeartbeatProbeRpc]);
 
   // Live Pre-Flight Authority Gate Evaluation (mirrors server policy, can also be verified against /validate-server)
   const liveAuthorityPreview = useMemo(() => {
@@ -952,6 +1056,287 @@ export const McpGatewayView: React.FC<McpGatewayViewProps> = ({
           </p>
         </div>
       </div>
+
+      {/* VISUAL HEALTH MONITORING CARD (JSON-RPC 2.0 HEARTBEAT & REAL-TIME LATENCY) */}
+      <section
+        aria-label="Monitor de Saúde e Latência MCP em Tempo Real"
+        className="bg-[#0d1117] border border-slate-800/80 rounded-xl overflow-hidden"
+      >
+        <div className="px-5 py-3.5 border-b border-slate-800/80 flex flex-col xl:flex-row xl:items-center justify-between gap-3">
+          <div className="space-y-0.5 min-w-0">
+            <div className="flex flex-wrap items-center gap-2">
+              <Activity className="w-4 h-4 text-cyan-400 shrink-0" />
+              <h2 className="text-sm font-semibold text-slate-100">
+                Monitor de Saúde em Tempo Real · Heartbeat JSON-RPC 2.0
+              </h2>
+            </div>
+            <div className="flex flex-wrap items-center gap-2 text-xs text-slate-400 font-mono tabular-nums">
+              <span>{data.servers.filter((s) => s.enabled).length} servidores ativos</span>
+              <span className="text-slate-600" aria-hidden="true">
+                ·
+              </span>
+              <span>Pulso #{heartbeatSeq}</span>
+              <span className="text-slate-600" aria-hidden="true">
+                ·
+              </span>
+              <span>
+                Última sonda:{' '}
+                {lastHeartbeatIso
+                  ? new Date(lastHeartbeatIso).toLocaleTimeString('pt-PT', {
+                      hour: '2-digit',
+                      minute: '2-digit',
+                      second: '2-digit',
+                    })
+                  : new Date(
+                      data.servers[0]?.lastCheckedAt || Date.now()
+                    ).toLocaleTimeString('pt-PT', {
+                      hour: '2-digit',
+                      minute: '2-digit',
+                      second: '2-digit',
+                    })}
+              </span>
+              {lastRpcRoundTripMs !== null && (
+                <>
+                  <span className="text-slate-600" aria-hidden="true">
+                    ·
+                  </span>
+                  <span className="text-slate-300">Sweep RTT {lastRpcRoundTripMs} ms</span>
+                </>
+              )}
+            </div>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2 shrink-0">
+            {/* Segmented Cadence Selector */}
+            <div
+              role="group"
+              aria-label="Cadência do Heartbeat JSON-RPC"
+              className="flex items-center gap-0.5 p-1 bg-[#07090e] border border-slate-800 rounded-lg"
+            >
+              {([5, 10, 30] as const).map((sec) => (
+                <button
+                  key={sec}
+                  type="button"
+                  onClick={() => setHeartbeatIntervalSec(sec)}
+                  className={`px-2.5 py-1 text-xs font-mono tabular-nums rounded-md transition-colors whitespace-nowrap shrink-0 ${
+                    heartbeatIntervalSec === sec
+                      ? 'bg-[#151c26] text-cyan-300'
+                      : 'text-slate-400 hover:text-slate-200'
+                  }`}
+                >
+                  {sec}s
+                </button>
+              ))}
+            </div>
+
+            {/* Auto-Heartbeat Toggle */}
+            <button
+              type="button"
+              role="switch"
+              aria-checked={autoHeartbeatEnabled}
+              onClick={() => setAutoHeartbeatEnabled((prev) => !prev)}
+              className={`px-3 py-1.5 text-xs font-mono rounded-lg border transition-colors whitespace-nowrap shrink-0 ${
+                autoHeartbeatEnabled
+                  ? 'bg-[#151c26] border-emerald-500/45 text-emerald-300'
+                  : 'bg-[#07090e] border-slate-800 text-slate-400 hover:text-slate-200'
+              }`}
+            >
+              Auto-Heartbeat: {autoHeartbeatEnabled ? 'ON' : 'OFF'}
+            </button>
+
+            {/* Manual Immediate JSON-RPC Heartbeat Trigger */}
+            <button
+              type="button"
+              onClick={() => executeHeartbeatProbeRpc({ silent: false })}
+              disabled={heartbeatRunning}
+              className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium bg-[#151c26] border border-slate-700/90 text-slate-100 rounded-lg hover:border-cyan-500/60 disabled:opacity-60 transition-colors whitespace-nowrap shrink-0"
+            >
+              <RefreshCw
+                className={`w-3.5 h-3.5 text-cyan-400 ${
+                  heartbeatRunning && !heartbeatTargetId ? 'animate-spin' : ''
+                }`}
+              />
+              {heartbeatRunning && !heartbeatTargetId ? 'A Pulsar...' : 'Pulsar JSON-RPC'}
+            </button>
+          </div>
+        </div>
+
+        {data.servers.filter((s) => s.enabled).length === 0 ? (
+          <div className="px-6 py-8 text-center space-y-2.5">
+            <p className="text-sm font-medium text-slate-200">
+              Nenhum servidor MCP ativo em monitorização.
+            </p>
+            <p className="text-xs text-slate-400 max-w-lg mx-auto">
+              Ativa uma conexão existente ou regista um novo servidor HTTP Streamable, SSE ou stdio para visualizar a telemetria de latência JSON-RPC em tempo real.
+            </p>
+            <div className="pt-1">
+              <button
+                type="button"
+                onClick={() => openServerRegistrationForm()}
+                className="px-3.5 py-1.5 text-xs font-semibold bg-cyan-500 text-slate-950 rounded-lg hover:bg-cyan-400 transition-colors whitespace-nowrap"
+              >
+                Registar Servidor MCP
+              </button>
+            </div>
+          </div>
+        ) : (
+          <div className="divide-y divide-slate-800/70">
+            {data.servers
+              .filter((srv) => srv.enabled)
+              .map((srv) => {
+                const stats = computeMcpLatencyStats({
+                  latencyHistory: srv.latencyHistory,
+                  fallbackLatencyMs: srv.lastLatencyMs,
+                  probeCount: srv.probeCount,
+                  errorCount: srv.errorCount,
+                  healthStatus: srv.healthStatus,
+                });
+                const spark = buildSparklineSvgPoints(stats.samples, 136, 28);
+                const probeTotal = srv.probeCount ?? stats.samples.length;
+                const endpointDisplay =
+                  srv.transport === 'STDIO'
+                    ? `${srv.command || ''} ${(srv.args || []).join(' ')}`.trim()
+                    : srv.endpointUrl || '';
+                const isSingleProbing = heartbeatRunning && heartbeatTargetId === srv.id;
+
+                const strokeColor =
+                  srv.healthStatus === 'ONLINE' && stats.currentMs < 150
+                    ? '#34d399'
+                    : srv.healthStatus === 'OFFLINE'
+                      ? '#fb7185'
+                      : '#fbbf24';
+
+                const fillColor =
+                  srv.healthStatus === 'ONLINE' && stats.currentMs < 150
+                    ? 'rgba(52, 211, 153, 0.14)'
+                    : srv.healthStatus === 'OFFLINE'
+                      ? 'rgba(251, 113, 133, 0.12)'
+                      : 'rgba(251, 191, 36, 0.12)';
+
+                return (
+                  <div
+                    key={`hb-${srv.id}`}
+                    className="px-5 py-3.5 grid grid-cols-1 lg:grid-cols-12 items-center gap-4 hover:bg-[#151c26]/25 transition-colors"
+                  >
+                    {/* Col 1-4: Server Name, Transport & JSON-RPC Probe Method */}
+                    <div className="lg:col-span-4 min-w-0 space-y-0.5">
+                      <div className="flex flex-wrap items-center gap-2 text-xs">
+                        <span className="font-semibold text-slate-100 truncate">{srv.name}</span>
+                        <span className="text-slate-600" aria-hidden="true">
+                          ·
+                        </span>
+                        <span className="text-cyan-300 font-mono">
+                          {TRANSPORT_LABELS[srv.transport]}
+                        </span>
+                      </div>
+                      <div className="flex items-center gap-2 text-xs font-mono text-slate-500 min-w-0">
+                        <span className="shrink-0">
+                          {srv.lastRpcMethod ||
+                            (srv.transport === 'HTTP_STREAMABLE'
+                              ? 'JSON-RPC 2.0 ping + tools/list'
+                              : srv.transport === 'SSE'
+                                ? 'SSE Handshake GET'
+                                : 'stdio execFile Probe')}
+                        </span>
+                        <span className="text-slate-700" aria-hidden="true">
+                          ·
+                        </span>
+                        <span className="truncate text-slate-400">{endpointDisplay}</span>
+                      </div>
+                    </div>
+
+                    {/* Col 5-6: Explicit Connection Status + Availability */}
+                    <div className="lg:col-span-2 min-w-0 flex flex-col space-y-0.5 text-xs font-mono tabular-nums">
+                      <div className="flex items-center gap-1.5">
+                        {srv.healthStatus === 'ONLINE' ? (
+                          <span className="flex items-center gap-1.5 text-emerald-400 font-semibold whitespace-nowrap">
+                            <CheckCircle2 className="w-3.5 h-3.5 shrink-0" />
+                            Ligado (Online)
+                          </span>
+                        ) : srv.healthStatus === 'PENDING_AUTH' ? (
+                          <span className="flex items-center gap-1.5 text-amber-300 font-semibold whitespace-nowrap">
+                            <ShieldCheck className="w-3.5 h-3.5 shrink-0" />
+                            Contenção Auth
+                          </span>
+                        ) : srv.healthStatus === 'DEGRADED' ? (
+                          <span className="flex items-center gap-1.5 text-amber-400 font-semibold whitespace-nowrap">
+                            <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
+                            Degradado
+                          </span>
+                        ) : (
+                          <span className="flex items-center gap-1.5 text-rose-400 font-semibold whitespace-nowrap">
+                            <WifiOff className="w-3.5 h-3.5 shrink-0" />
+                            Offline
+                          </span>
+                        )}
+                      </div>
+                      <span className="text-slate-500 truncate">
+                        {stats.uptimePercent}% · {probeTotal}p · {srv.discoveredTools.length} tools
+                      </span>
+                    </div>
+
+                    {/* Col 7-8: Real-Time 18-Sample SVG Latency Sparkline */}
+                    <div className="lg:col-span-2 min-w-0 flex items-center overflow-hidden">
+                      <svg
+                        viewBox="0 0 136 28"
+                        role="img"
+                        aria-label={`Curva de latência de ${srv.name}: atual ${stats.currentMs} ms`}
+                        className="w-full max-w-[132px] h-7 overflow-hidden shrink-0"
+                      >
+                        <path d={spark.areaPath} fill={fillColor} />
+                        <polyline
+                          fill="none"
+                          stroke={strokeColor}
+                          strokeWidth="1.75"
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                          points={spark.polylinePoints}
+                        />
+                      </svg>
+                    </div>
+
+                    {/* Col 9-12: Tabular RTT, Min/P95/Jitter & Per-Server JSON-RPC Ping */}
+                    <div className="lg:col-span-4 min-w-0 flex items-center justify-between lg:justify-end gap-3">
+                      <div className="min-w-0 text-left lg:text-right font-mono tabular-nums space-y-0.5">
+                        <p
+                          className={`text-sm font-bold ${
+                            srv.healthStatus === 'ONLINE'
+                              ? 'text-slate-100'
+                              : srv.healthStatus === 'OFFLINE'
+                                ? 'text-rose-400'
+                                : 'text-amber-300'
+                          }`}
+                        >
+                          {stats.currentMs} ms
+                        </p>
+                        <p className="text-[11px] text-slate-500 truncate">
+                          mín {Math.round(stats.minMs * 10) / 10} · p95{' '}
+                          {Math.round(stats.p95Ms * 10) / 10} · ±
+                          {Math.round(stats.jitterMs * 10) / 10} ms
+                        </p>
+                      </div>
+
+                      <button
+                        type="button"
+                        onClick={() =>
+                          executeHeartbeatProbeRpc({ serverId: srv.id, silent: false })
+                        }
+                        disabled={heartbeatRunning}
+                        title={`Enviar sonda JSON-RPC imediata para ${srv.name}`}
+                        className="flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-mono bg-[#151c26] border border-slate-700/90 text-slate-200 rounded-md hover:border-cyan-500/60 hover:text-cyan-300 disabled:opacity-50 transition-colors whitespace-nowrap shrink-0"
+                      >
+                        <RefreshCw
+                          className={`w-3 h-3 ${isSingleProbing ? 'animate-spin text-cyan-400' : ''}`}
+                        />
+                        Ping RPC
+                      </button>
+                    </div>
+                  </div>
+                );
+              })}
+          </div>
+        )}
+      </section>
 
       {/* Primary Segmented Workspace Switcher */}
       <div className="flex flex-wrap items-center justify-between gap-4 border-b border-slate-800/80 pb-3">
@@ -2059,6 +2444,8 @@ export const McpGatewayView: React.FC<McpGatewayViewProps> = ({
                     const m = e.target.value;
                     setRpcMethod(m);
                     if (
+                      m === 'ping' ||
+                      m === 'gateway/heartbeat' ||
                       m === 'initialize' ||
                       m === 'tools/list' ||
                       m === 'resources/list' ||
@@ -2087,6 +2474,8 @@ export const McpGatewayView: React.FC<McpGatewayViewProps> = ({
                   }}
                   className="w-full px-3 py-2 text-xs font-mono bg-[#151c26] border border-slate-700/80 rounded-lg text-slate-100 focus:outline-none focus:border-cyan-500"
                 >
+                  <option value="ping">ping</option>
+                  <option value="gateway/heartbeat">gateway/heartbeat</option>
                   <option value="initialize">initialize</option>
                   <option value="tools/list">tools/list</option>
                   <option value="tools/call">tools/call</option>

@@ -19,10 +19,13 @@ import type {
 import { db } from './db.ts';
 import {
   collectOSTelemetry,
+  collectSidecarHostSnapshot,
+  dispatchSidecarHostCommand,
   executeGovernedCommand,
   getGitOverview,
   listWorkspaceFiles,
   readSafeWorkspaceFile,
+  triggerSidecarHotkey,
 } from './os-adapter.ts';
 import {
   buildScoutWorkspaceIndex,
@@ -178,6 +181,24 @@ const AGENT_TOOL_DECLARATIONS: FunctionDeclaration[] = [
         command: { type: Type.STRING, description: 'Shell command to execute or queue for approval.' },
       },
       required: ['command'],
+    },
+  },
+  {
+    name: 'sidecar_host_control',
+    description: 'Interact directly with the host machine running the Sidecar: inspect active windows & top CPU/RAM processes, trigger global hotkeys, or dispatch governed host commands.',
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        action: {
+          type: Type.STRING,
+          description: 'One of SNAPSHOT (windows & processes), HOTKEY (trigger shortcut), or EXEC (governed host command).',
+        },
+        target: {
+          type: Type.STRING,
+          description: 'Hotkey combo (e.g. Alt+Space) or host command when action is HOTKEY or EXEC.',
+        },
+      },
+      required: ['action'],
     },
   },
 ];
@@ -409,6 +430,51 @@ async function executeAgentTool(
     };
   }
 
+  if (name === 'sidecar_host_control') {
+    const action = String(args.action || 'SNAPSHOT').toUpperCase();
+    const target = String(args.target || '').trim();
+    if (action === 'HOTKEY') {
+      const rec = await triggerSidecarHotkey(target || 'Alt+Space');
+      return {
+        record: {
+          id,
+          name,
+          args,
+          status: 'SUCCESS',
+          outputSummary: rec.output,
+          durationMs: rec.durationMs,
+        },
+        rawResult: { commandRecord: rec },
+      };
+    }
+    if (action === 'EXEC' && target) {
+      const rec = await dispatchSidecarHostCommand({ command: target, kind: 'HOST_EXEC' });
+      return {
+        record: {
+          id,
+          name,
+          args,
+          status: rec.status === 'PENDING_APPROVAL' ? 'PENDING_APPROVAL' : rec.status === 'BLOCKED' ? 'ERROR' : 'SUCCESS',
+          outputSummary: rec.output.slice(0, 240),
+          durationMs: rec.durationMs,
+        },
+        rawResult: { commandRecord: rec },
+      };
+    }
+    const snap = await collectSidecarHostSnapshot();
+    return {
+      record: {
+        id,
+        name,
+        args,
+        status: 'SUCCESS',
+        outputSummary: `Host ${snap.hostname} (${snap.platform}/${snap.arch}) · ${snap.activeWindows.length} janela(s) · Top proc: ${snap.topProcesses[0]?.name || 'node'} (${snap.topProcesses[0]?.cpuPercent ?? 0}% CPU).`,
+        durationMs: Math.max(1, Date.now() - t0),
+      },
+      rawResult: { snapshot: snap },
+    };
+  }
+
   return {
     record: {
       id,
@@ -483,6 +549,35 @@ async function runDeterministicReActTurn(
         ? `- **Telemetria Nativa (${tel.platform}/${tel.arch})**: Host \`${tel.hostname}\`, CPU **${tel.cpuUsagePercent}%** (${tel.cpuCores} núcleos), RAM **${tel.ramUsedGb}/${tel.ramTotalGb} GB** (${tel.ramPercent}%), Disco **${tel.diskUsedGb}/${tel.diskTotalGb} GB** (${tel.diskPercent}%).`
         : `- **Native Telemetry (${tel.platform}/${tel.arch})**: Host \`${tel.hostname}\`, CPU **${tel.cpuUsagePercent}%**, RAM **${tel.ramUsedGb}/${tel.ramTotalGb} GB** (${tel.ramPercent}%).`
     );
+  }
+
+  if (
+    lower.includes('sidecar') ||
+    lower.includes('processo') ||
+    lower.includes('janela') ||
+    lower.includes('hotkey') ||
+    lower.includes('máquina') ||
+    lower.includes('maquina')
+  ) {
+    const isHotkey = lower.includes('hotkey') || lower.includes('alt+space') || lower.includes('ctrl+shift');
+    const { record, rawResult } = await executeAgentTool(
+      'sidecar_host_control',
+      isHotkey ? { action: 'HOTKEY', target: 'Alt+Space' } : { action: 'SNAPSHOT' },
+      activePort
+    );
+    toolCalls.push(record);
+    if (isHotkey) {
+      findings.push(`- **Interação Direta Sidecar (Hotkey)**: ${record.outputSummary}`);
+    } else {
+      const snap = rawResult.snapshot as Awaited<ReturnType<typeof collectSidecarHostSnapshot>>;
+      const topProcs = snap.topProcesses
+        .slice(0, 4)
+        .map((p) => `\`${p.name}\` (PID ${p.pid}, ${p.cpuPercent}% CPU, ${p.memPercent}% RAM)`)
+        .join(', ');
+      findings.push(
+        `- **Ponte Direta Máquina Sidecar (\`${snap.hostname}\`)**: ${snap.activeWindows.length} janela(s) ativas · Processos de topo: ${topProcs}.`
+      );
+    }
   }
 
   if (lower.includes('git') || lower.includes('commit') || lower.includes('branch')) {
@@ -650,14 +745,54 @@ export async function runAgentChatTurn(params: {
   });
   roomDeltaHashes.set(room.id, nextDeltaHash);
 
-  const ai = state.settings.modelProvider === 'GEMINI_STUDIO' ? getGeminiClient() : null;
+  const activeProject =
+    (state.projects || []).find((p) => p.id === (room.projectId || state.activeProjectId)) ||
+    (state.projects || [])[0];
+  const enabledSkillsSummary = state.skills
+    .filter((s) => s.enabled)
+    .slice(0, 5)
+    .map((s) => `${s.name} (${s.quickCommand})`)
+    .join(', ');
+
+  // Track PRE_PROMPT plugin invocations
+  db.update((draft) => {
+    for (const plug of draft.plugins || []) {
+      if (plug.enabled && plug.installed && plug.hook === 'PRE_PROMPT') {
+        plug.invocationsCount = (plug.invocationsCount || 0) + 1;
+        plug.lastTriggeredAt = nowIso;
+      }
+    }
+  });
+
+  const provider = state.settings.modelProvider;
+  const ai = provider === 'GEMINI_STUDIO' ? getGeminiClient() : null;
   let replyText = '';
   let toolCalls: ToolCallRecord[] = [];
   let engineUsed = 'LOCAL_DETERMINISTIC_REACT_V3';
 
+  const lookaheadText =
+    jevDecision.lookaheadAlerts.length > 0
+      ? `Notice Lookahead AST:\n${jevDecision.lookaheadAlerts.map((a) => `- ${a.reason}`).join('\n')}`
+      : '';
+
+  const systemInstruction = [
+    getPersonalityDirective(state.settings.personalityMode, state.settings.language),
+    room.systemPrompt,
+    `Operador: ${state.settings.operatorName} (${state.settings.organizationName}). Rota JEV-S1: [${jevDecision.tier}] ${jevDecision.intent}.`,
+    activeProject
+      ? `Projeto Ativo: "${activeProject.name}" em "${activeProject.rootPath}" (${activeProject.techStack}, branch ${activeProject.gitBranch}, Proatividade=${activeProject.proactiveEnabled ? 'ON' : 'OFF'}).`
+      : '',
+    enabledSkillsSummary ? `Skills Ativas: ${enabledSkillsSummary}.` : '',
+    compressedContextBlock ? `Memória TOON:\n${compressedContextBlock}` : '',
+    lookaheadText,
+    'Usa as ferramentas disponíveis sempre que o utilizador pedir dados reais da máquina Sidecar, sistema, Swarm 48x, AST, ficheiros, Git, workflows ou memórias.',
+  ]
+    .filter(Boolean)
+    .join('\n\n');
+
   if (ai && !jevDecision.microTick) {
     try {
-      const modelName = state.settings.preferredGeminiModel || 'gemini-3.8-flash';
+      const modelName = room.modelOverride || state.settings.preferredGeminiModel || 'gemini-3.8-flash';
       const recentHistory = state.messages
         .filter((m) => m.roomId === room.id)
         .slice(-6)
@@ -681,21 +816,11 @@ export async function runAgentChatTurn(params: {
 
       const contents: unknown[] = [...recentHistory, { role: 'user', parts: currentParts }];
 
-      const lookaheadText =
-        jevDecision.lookaheadAlerts.length > 0
-          ? `Notice Lookahead AST:\n${jevDecision.lookaheadAlerts.map((a) => `- ${a.reason}`).join('\n')}`
-          : '';
-
-      const systemInstruction = [
-        getPersonalityDirective(state.settings.personalityMode, state.settings.language),
-        room.systemPrompt,
-        `Operador: ${state.settings.operatorName} (${state.settings.organizationName}). Rota JEV-S1: [${jevDecision.tier}] ${jevDecision.intent}.`,
-        compressedContextBlock ? `Memória TOON:\n${compressedContextBlock}` : '',
-        lookaheadText,
-        'Usa as ferramentas disponíveis sempre que o utilizador pedir dados reais de sistema, Swarm 48x, AST, ficheiros, Git, workflows ou memórias.',
-      ]
-        .filter(Boolean)
-        .join('\n\n');
+      const allowedSet = new Set(room.allowedTools || []);
+      const filteredDecls =
+        allowedSet.size > 0
+          ? AGENT_TOOL_DECLARATIONS.filter((d) => d.name && allowedSet.has(d.name))
+          : AGENT_TOOL_DECLARATIONS;
 
       for (let step = 0; step < 3; step++) {
         const response = await ai.models.generateContent({
@@ -703,7 +828,7 @@ export async function runAgentChatTurn(params: {
           contents: contents as never,
           config: {
             systemInstruction,
-            tools: [{ functionDeclarations: AGENT_TOOL_DECLARATIONS }],
+            tools: filteredDecls.length > 0 ? [{ functionDeclarations: filteredDecls }] : undefined,
           },
         });
 
@@ -743,6 +868,79 @@ export async function runAgentChatTurn(params: {
         if (toolCalls.length === 0) toolCalls = det.toolCalls;
       }
     } catch {
+      const det = await runDeterministicReActTurn(userText, attachments, activePort, jevDecision);
+      replyText = det.reply;
+      toolCalls = det.toolCalls;
+      engineUsed = det.engineUsed;
+    }
+  } else if (provider === 'OLLAMA_LOCAL' && !jevDecision.microTick) {
+    try {
+      const base = (state.settings.ollamaEndpoint || 'http://127.0.0.1:11434').replace(/\/$/, '');
+      const model = room.modelOverride || state.settings.ollamaModel || 'qwen2.5-coder:7b';
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), 6000);
+      const r = await fetch(`${base}/api/chat`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model,
+          stream: false,
+          messages: [
+            { role: 'system', content: systemInstruction },
+            { role: 'user', content: userText },
+          ],
+        }),
+        signal: ctrl.signal,
+      });
+      clearTimeout(timer);
+      if (r.ok) {
+        const data = (await r.json()) as { message?: { content?: string } };
+        replyText = String(data.message?.content || '').trim();
+        engineUsed = `OLLAMA (${model})`;
+      }
+    } catch {
+      // Fallback to deterministic engine if local Ollama is offline
+    }
+    if (!replyText) {
+      const det = await runDeterministicReActTurn(userText, attachments, activePort, jevDecision);
+      replyText = det.reply;
+      toolCalls = det.toolCalls;
+      engineUsed = `${det.engineUsed} (Fallback Ollama Offline)`;
+    }
+  } else if (provider === 'OPENROUTER_COMPAT' && !jevDecision.microTick) {
+    const orKey = process.env.OPENROUTER_API_KEY?.trim();
+    if (orKey) {
+      try {
+        const base = (state.settings.openRouterEndpoint || 'https://openrouter.ai/api/v1').replace(/\/$/, '');
+        const model = room.modelOverride || state.settings.openRouterModel || 'anthropic/claude-3.7-sonnet';
+        const ctrl = new AbortController();
+        const timer = setTimeout(() => ctrl.abort(), 8000);
+        const r = await fetch(`${base}/chat/completions`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${orKey}`,
+          },
+          body: JSON.stringify({
+            model,
+            messages: [
+              { role: 'system', content: systemInstruction },
+              { role: 'user', content: userText },
+            ],
+          }),
+          signal: ctrl.signal,
+        });
+        clearTimeout(timer);
+        if (r.ok) {
+          const data = (await r.json()) as { choices?: { message?: { content?: string } }[] };
+          replyText = String(data.choices?.[0]?.message?.content || '').trim();
+          engineUsed = `OPENROUTER (${model})`;
+        }
+      } catch {
+        // Fallback below
+      }
+    }
+    if (!replyText) {
       const det = await runDeterministicReActTurn(userText, attachments, activePort, jevDecision);
       replyText = det.reply;
       toolCalls = det.toolCalls;
@@ -937,4 +1135,101 @@ export async function generateWorkflowFromNaturalLanguage(prompt: string): Promi
   }
 
   return { ...det, engineUsed: 'LOCAL_DETERMINISTIC_DAG' };
+}
+
+export async function testModelProviderConnection(params?: {
+  provider?: string;
+  ollamaEndpoint?: string;
+  openRouterEndpoint?: string;
+}): Promise<{
+  ok: boolean;
+  provider: string;
+  latencyMs: number;
+  detail: string;
+  envKeysStatus: { geminiConfigured: boolean; openRouterConfigured: boolean };
+}> {
+  const t0 = Date.now();
+  const state = db.getState();
+  const provider = params?.provider || state.settings.modelProvider;
+  const envKeysStatus = {
+    geminiConfigured: Boolean(process.env.GEMINI_API_KEY?.trim()),
+    openRouterConfigured: Boolean(process.env.OPENROUTER_API_KEY?.trim()),
+  };
+
+  if (provider === 'LOCAL_DETERMINISTIC') {
+    return {
+      ok: true,
+      provider,
+      latencyMs: Math.max(1, Date.now() - t0),
+      detail: 'Motor Determinístico Local ReAct v3 ativo (0ms rede, 100% autónomo sem chaves externas).',
+      envKeysStatus,
+    };
+  }
+
+  if (provider === 'GEMINI_STUDIO') {
+    if (!envKeysStatus.geminiConfigured) {
+      return {
+        ok: false,
+        provider,
+        latencyMs: Math.max(1, Date.now() - t0),
+        detail: 'Variável GEMINI_API_KEY ausente no servidor (.env). O fallback determinístico local assumirá automaticamente.',
+        envKeysStatus,
+      };
+    }
+    return {
+      ok: true,
+      provider,
+      latencyMs: Math.max(1, Date.now() - t0),
+      detail: `GEMINI_API_KEY detetada no servidor · Modelo ativo: ${state.settings.preferredGeminiModel}.`,
+      envKeysStatus,
+    };
+  }
+
+  if (provider === 'OLLAMA_LOCAL') {
+    const base = (params?.ollamaEndpoint || state.settings.ollamaEndpoint || 'http://127.0.0.1:11434').replace(/\/$/, '');
+    try {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), 1600);
+      const r = await fetch(`${base}/api/tags`, { signal: ctrl.signal });
+      clearTimeout(timer);
+      if (r.ok) {
+        const data = (await r.json()) as { models?: { name: string }[] };
+        const count = data.models?.length ?? 0;
+        return {
+          ok: true,
+          provider,
+          latencyMs: Math.max(1, Date.now() - t0),
+          detail: `Ollama online em ${base} (${count} modelo(s) locais disponíveis).`,
+          envKeysStatus,
+        };
+      }
+      return {
+        ok: false,
+        provider,
+        latencyMs: Math.max(1, Date.now() - t0),
+        detail: `Ollama respondeu HTTP ${r.status} em ${base}.`,
+        envKeysStatus,
+      };
+    } catch {
+      return {
+        ok: false,
+        provider,
+        latencyMs: Math.max(1, Date.now() - t0),
+        detail: `Sem resposta em ${base}. Quando offline, o Jarvis usa automaticamente o motor determinístico local.`,
+        envKeysStatus,
+      };
+    }
+  }
+
+  // OPENROUTER_COMPAT
+  const base = (params?.openRouterEndpoint || state.settings.openRouterEndpoint || 'https://openrouter.ai/api/v1').replace(/\/$/, '');
+  return {
+    ok: envKeysStatus.openRouterConfigured,
+    provider,
+    latencyMs: Math.max(1, Date.now() - t0),
+    detail: envKeysStatus.openRouterConfigured
+      ? `OPENROUTER_API_KEY configurada no servidor · Endpoint ${base}.`
+      : `OPENROUTER_API_KEY não definida no ambiente (.env). Configura no servidor para ativar chamadas remotas em ${base}.`,
+    envKeysStatus,
+  };
 }

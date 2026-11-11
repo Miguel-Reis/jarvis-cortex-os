@@ -1,17 +1,25 @@
-import React, { useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 import {
   Code2,
   FileCode2,
   Folder,
+  FolderGit2,
   GitBranch,
   Play,
+  Plus,
   RefreshCw,
   ShieldAlert,
+  Sparkles,
   Terminal,
 } from 'lucide-react';
 import { apiJson } from '../../lib/api';
 import { useToast } from '../ToastContext';
-import type { CoChangeEdge, ScoutSymbolEntry } from '../../shared/types';
+import type {
+  CoChangeEdge,
+  JarvisStoreData,
+  ProjectWorkspace,
+  ScoutSymbolEntry,
+} from '../../shared/types';
 
 interface FileEntry {
   path: string;
@@ -30,13 +38,17 @@ interface BlastRadiusReport {
 }
 
 interface WorkspaceViewProps {
+  store: JarvisStoreData;
   initialFilePath?: string;
   onRefreshBootstrap: () => Promise<void>;
+  onOpenProjectsModal?: () => void;
 }
 
 export const WorkspaceView: React.FC<WorkspaceViewProps> = ({
+  store,
   initialFilePath,
   onRefreshBootstrap,
+  onOpenProjectsModal,
 }) => {
   const { pushToast } = useToast();
   const [files, setFiles] = useState<FileEntry[]>([]);
@@ -49,7 +61,6 @@ export const WorkspaceView: React.FC<WorkspaceViewProps> = ({
   const [fileContent, setFileContent] = useState<string>('');
   const [fileFilter, setFileFilter] = useState('');
 
-  // SCOUT-01 AST Symbols (:Lstart-end) & Co-Change Blast Radius
   const [fileSymbols, setFileSymbols] = useState<ScoutSymbolEntry[]>([]);
   const [blastRadius, setBlastRadius] = useState<BlastRadiusReport | null>(null);
 
@@ -58,21 +69,13 @@ export const WorkspaceView: React.FC<WorkspaceViewProps> = ({
     'Consola Governada J.A.R.V.I.S. pronta. Comandos de leitura/testes executam diretamente; comandos mutáveis requerem aprovação na Inbox de Autoridade.'
   );
   const [runningCmd, setRunningCmd] = useState(false);
+  const [scanningProj, setScanningProj] = useState(false);
 
-  const loadOverview = async () => {
-    try {
-      const res = await apiJson<{
-        files: FileEntry[];
-        git: { branch: string; statusLines: string[]; recentCommits: string[] };
-      }>('/api/workspace/overview');
-      setFiles(res.files);
-      setGitInfo(res.git);
-    } catch (err) {
-      pushToast({ title: 'Erro ao ler workspace', detail: (err as Error).message, tone: 'error' });
-    }
-  };
+  const projects = store.projects || [];
+  const activeProject =
+    projects.find((p) => p.id === store.activeProjectId) || projects[0];
 
-  const loadFile = async (relPath: string) => {
+  const loadFile = useCallback(async (relPath: string) => {
     setSelectedFile(relPath);
     try {
       const [fileRes, blastRes] = await Promise.all([
@@ -89,12 +92,80 @@ export const WorkspaceView: React.FC<WorkspaceViewProps> = ({
       setFileSymbols([]);
       setBlastRadius(null);
     }
-  };
+  }, []);
+
+  const loadOverview = useCallback(
+    async (projectId?: string, autoSelectFirst = false) => {
+      try {
+        const pid = projectId || activeProject?.id || '';
+        const res = await apiJson<{
+          files: FileEntry[];
+          git: { branch: string; statusLines: string[]; recentCommits: string[] };
+        }>(`/api/workspace/overview?projectId=${encodeURIComponent(pid)}`);
+        setFiles(res.files);
+        setGitInfo(res.git);
+
+        const firstFile = res.files.find((f) => !f.isDirectory);
+        if (autoSelectFirst && firstFile) {
+          loadFile(firstFile.path);
+        }
+      } catch (err) {
+        pushToast({
+          title: 'Erro ao ler workspace',
+          detail: (err as Error).message,
+          tone: 'error',
+        });
+      }
+    },
+    [activeProject?.id, loadFile, pushToast]
+  );
 
   useEffect(() => {
-    loadOverview();
+    loadOverview(activeProject?.id, false);
+  }, [activeProject?.id, loadOverview]);
+
+  useEffect(() => {
     loadFile(initialFilePath || 'AGENTS.md');
-  }, [initialFilePath]);
+  }, [initialFilePath, loadFile]);
+
+  const handleSwitchProject = async (proj: ProjectWorkspace) => {
+    await apiJson(`/api/projects/${proj.id}/activate`, { method: 'POST' });
+    await onRefreshBootstrap();
+    await loadOverview(proj.id, true);
+  };
+
+  const handleToggleProjectProactive = async () => {
+    if (!activeProject) return;
+    await apiJson(`/api/projects/${activeProject.id}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ proactiveEnabled: !activeProject.proactiveEnabled }),
+    });
+    await onRefreshBootstrap();
+    pushToast({
+      title: !activeProject.proactiveEnabled
+        ? `Proatividade ativada em ${activeProject.name}`
+        : `Proatividade pausada em ${activeProject.name}`,
+      tone: 'info',
+    });
+  };
+
+  const handleScanProjectNow = async () => {
+    if (!activeProject) return;
+    setScanningProj(true);
+    try {
+      await apiJson('/api/projects/proactive-scan', {
+        method: 'POST',
+        body: JSON.stringify({ projectId: activeProject.id }),
+      });
+      await onRefreshBootstrap();
+      pushToast({
+        title: `Scan proativo concluído: ${activeProject.name}`,
+        tone: 'success',
+      });
+    } finally {
+      setScanningProj(false);
+    }
+  };
 
   const handleRunCommand = async (cmdOverride?: string) => {
     const cmd = (cmdOverride ?? commandInput).trim();
@@ -117,19 +188,24 @@ export const WorkspaceView: React.FC<WorkspaceViewProps> = ({
       if (res.result.status === 'PENDING_APPROVAL') {
         pushToast({
           title: 'Comando enviado para Inbox de Autoridade',
-          detail: 'Aprova em Autoridade & Definições para executar.',
+          detail: 'Aprova em Definições & Autoridade para executar.',
           tone: 'warning',
         });
       }
     } catch (err) {
-      pushToast({ title: 'Erro ao executar comando', detail: (err as Error).message, tone: 'error' });
+      pushToast({
+        title: 'Erro ao executar comando',
+        detail: (err as Error).message,
+        tone: 'error',
+      });
     } finally {
       setRunningCmd(false);
     }
   };
 
   const visibleFiles = files.filter(
-    (f) => !f.isDirectory && (!fileFilter || f.path.toLowerCase().includes(fileFilter.toLowerCase()))
+    (f) =>
+      !f.isDirectory && (!fileFilter || f.path.toLowerCase().includes(fileFilter.toLowerCase()))
   );
 
   const presetDiagnostics = [
@@ -141,19 +217,84 @@ export const WorkspaceView: React.FC<WorkspaceViewProps> = ({
 
   return (
     <div className="space-y-6">
+      {/* Concurrent Multi-Project Workspace Bar */}
+      <section className="jarvis-surface border border-slate-800/80 rounded-xl p-4 space-y-3">
+        <div className="flex flex-col md:flex-row md:items-center justify-between gap-3">
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="text-xs font-mono uppercase tracking-wider text-slate-400 flex items-center gap-1.5 mr-1">
+              <FolderGit2 className="w-4 h-4 text-cyan-400" />
+              Projetos em Simultâneo:
+            </span>
+            {projects.map((proj) => {
+              const active = proj.id === activeProject?.id;
+              return (
+                <button
+                  key={proj.id}
+                  type="button"
+                  onClick={() => handleSwitchProject(proj)}
+                  className={`px-3 py-1.5 rounded-lg text-xs font-medium border transition-colors ${
+                    active
+                      ? 'bg-[#141b25] border-cyan-500/60 text-cyan-300'
+                      : 'bg-[#07090e] border-slate-800 text-slate-400 hover:text-slate-200'
+                  }`}
+                >
+                  {proj.name}{' '}
+                  <span className="font-mono text-[11px] opacity-75">({proj.rootPath})</span>
+                </button>
+              );
+            })}
+            {onOpenProjectsModal && (
+              <button
+                type="button"
+                onClick={onOpenProjectsModal}
+                className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-xs font-medium bg-[#141b25] border border-slate-700 text-slate-200 hover:border-cyan-500/50"
+              >
+                <Plus className="w-3.5 h-3.5 text-cyan-400" />
+                Novo Projeto
+              </button>
+            )}
+          </div>
+
+          {activeProject && (
+            <div className="flex flex-wrap items-center gap-2 shrink-0">
+              <button
+                type="button"
+                onClick={handleToggleProjectProactive}
+                className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-mono border transition-colors ${
+                  activeProject.proactiveEnabled
+                    ? 'bg-emerald-500/10 border-emerald-500/40 text-emerald-300'
+                    : 'bg-[#07090e] border-slate-800 text-slate-400'
+                }`}
+              >
+                <Sparkles className="w-3.5 h-3.5" />
+                {activeProject.proactiveEnabled ? 'Proatividade ON' : 'Proatividade OFF'}
+              </button>
+              <button
+                type="button"
+                disabled={scanningProj}
+                onClick={handleScanProjectNow}
+                className="px-3 py-1.5 rounded-lg text-xs font-medium bg-[#141b25] border border-slate-700 text-slate-200 hover:border-cyan-500/50"
+              >
+                {scanningProj ? 'A analisar...' : 'Scan Projeto'}
+              </button>
+            </div>
+          )}
+        </div>
+      </section>
+
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
         {/* File Explorer */}
-        <section className="lg:col-span-4 bg-[#0d1117] border border-slate-800/80 rounded-xl p-5 flex flex-col gap-3 max-h-[560px]">
+        <section className="lg:col-span-4 jarvis-surface border border-slate-800/80 rounded-xl p-5 flex flex-col gap-3 max-h-[560px]">
           <div className="flex items-center justify-between gap-2">
-            <h2 className="text-sm font-semibold text-slate-100 flex items-center gap-2">
+            <h2 className="text-sm font-semibold text-slate-100 font-display flex items-center gap-2">
               <Folder className="w-4 h-4 text-cyan-400" />
-              Ficheiros do Workspace
+              Ficheiros ({activeProject?.rootPath || '.'})
             </h2>
             <button
               type="button"
-              onClick={loadOverview}
+              onClick={() => loadOverview(activeProject?.id, false)}
               aria-label="Atualizar árvore de ficheiros"
-              className="p-1.5 text-slate-400 hover:text-slate-100 rounded-md hover:bg-[#151c26]"
+              className="p-1.5 text-slate-400 hover:text-slate-100 rounded-md hover:bg-[#141b25]"
             >
               <RefreshCw className="w-3.5 h-3.5" />
             </button>
@@ -176,7 +317,7 @@ export const WorkspaceView: React.FC<WorkspaceViewProps> = ({
                 className={`w-full flex items-center justify-between gap-2 px-2.5 py-1.5 rounded-md text-left text-xs transition-colors ${
                   selectedFile === f.path
                     ? 'bg-cyan-500/15 text-cyan-200 font-medium'
-                    : 'text-slate-300 hover:bg-[#151c26]'
+                    : 'text-slate-300 hover:bg-[#141b25]'
                 }`}
               >
                 <span className="flex items-center gap-2 min-w-0">
@@ -192,22 +333,27 @@ export const WorkspaceView: React.FC<WorkspaceViewProps> = ({
         </section>
 
         {/* Code / Markdown Viewer + SCOUT-01 AST (:Lstart-end) Strip */}
-        <section className="lg:col-span-8 bg-[#0d1117] border border-slate-800/80 rounded-xl p-5 flex flex-col gap-3 max-h-[560px]">
+        <section className="lg:col-span-8 jarvis-surface border border-slate-800/80 rounded-xl p-5 flex flex-col gap-3 max-h-[560px]">
           <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-800 pb-3">
-            <div className="flex items-center gap-2 min-w-0">
-              <p className="text-xs font-mono text-cyan-300 truncate">{selectedFile}</p>
+            <div className="flex items-center gap-2 min-w-0 text-xs font-mono">
+              <span className="text-cyan-300 truncate">{selectedFile}</span>
               {blastRadius && (
-                <span
-                  className={`px-2 py-0.5 text-[11px] font-mono rounded border ${
-                    blastRadius.blastRadiusScore >= 6
-                      ? 'bg-rose-500/10 border-rose-500/40 text-rose-300'
-                      : blastRadius.blastRadiusScore >= 3.5
-                        ? 'bg-amber-500/10 border-amber-500/40 text-amber-300'
-                        : 'bg-emerald-500/10 border-emerald-500/40 text-emerald-300'
-                  }`}
-                >
-                  Blast {blastRadius.blastRadiusScore}/10 · {fileSymbols.length} símbolos AST
-                </span>
+                <>
+                  <span className="text-slate-600">·</span>
+                  <span
+                    className={
+                      blastRadius.blastRadiusScore >= 6
+                        ? 'text-rose-300'
+                        : blastRadius.blastRadiusScore >= 3.5
+                          ? 'text-amber-300'
+                          : 'text-emerald-300'
+                    }
+                  >
+                    Blast {blastRadius.blastRadiusScore}/10
+                  </span>
+                  <span className="text-slate-600">·</span>
+                  <span className="text-slate-400">{fileSymbols.length} símbolos AST</span>
+                </>
               )}
             </div>
             <span className="text-xs text-slate-500 font-mono tabular-nums">
@@ -215,7 +361,6 @@ export const WorkspaceView: React.FC<WorkspaceViewProps> = ({
             </span>
           </div>
 
-          {/* Line-Indexed AST Symbols (:Lstart-end) */}
           {fileSymbols.length > 0 && (
             <div className="flex items-center gap-1.5 overflow-x-auto pb-1">
               <Code2 className="w-3.5 h-3.5 text-cyan-400 shrink-0" />
@@ -252,9 +397,9 @@ export const WorkspaceView: React.FC<WorkspaceViewProps> = ({
 
       {/* Bottom Split: Governed Diagnostic Console + Git Inspector */}
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
-        <section className="lg:col-span-7 bg-[#0d1117] border border-slate-800/80 rounded-xl p-6 space-y-4">
+        <section className="lg:col-span-7 jarvis-surface border border-slate-800/80 rounded-xl p-6 space-y-4">
           <div className="flex flex-wrap items-center justify-between gap-3">
-            <h3 className="text-sm font-semibold text-slate-100 flex items-center gap-2">
+            <h3 className="text-sm font-semibold text-slate-100 font-display flex items-center gap-2">
               <Terminal className="w-4 h-4 text-emerald-400" />
               Terminal de Diagnóstico Governado
             </h3>
@@ -265,7 +410,7 @@ export const WorkspaceView: React.FC<WorkspaceViewProps> = ({
                   type="button"
                   disabled={runningCmd}
                   onClick={() => handleRunCommand(preset.cmd)}
-                  className="px-2.5 py-1 text-xs bg-[#151c26] border border-slate-800 hover:border-cyan-500/50 rounded-md text-slate-300 whitespace-nowrap"
+                  className="px-2.5 py-1 text-xs bg-[#141b25] border border-slate-800 hover:border-cyan-500/50 rounded-md text-slate-300 whitespace-nowrap"
                 >
                   {preset.label}
                 </button>
@@ -302,9 +447,9 @@ export const WorkspaceView: React.FC<WorkspaceViewProps> = ({
           </pre>
         </section>
 
-        <section className="lg:col-span-5 bg-[#0d1117] border border-slate-800/80 rounded-xl p-6 space-y-4">
+        <section className="lg:col-span-5 jarvis-surface border border-slate-800/80 rounded-xl p-6 space-y-4">
           <div className="flex items-center justify-between">
-            <h3 className="text-sm font-semibold text-slate-100 flex items-center gap-2">
+            <h3 className="text-sm font-semibold text-slate-100 font-display flex items-center gap-2">
               <GitBranch className="w-4 h-4 text-amber-400" />
               Inspetor Git ({gitInfo.branch})
             </h3>
@@ -332,7 +477,9 @@ export const WorkspaceView: React.FC<WorkspaceViewProps> = ({
                   </p>
                 ))
               ) : (
-                <p className="text-xs text-slate-500">Sem histórico de commits visível neste contentor.</p>
+                <p className="text-xs text-slate-500">
+                  Sem histórico de commits visível neste contentor.
+                </p>
               )}
             </div>
           </div>

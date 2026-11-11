@@ -3,6 +3,16 @@ import tailwindcss from '@tailwindcss/vite';
 
 export default defineConfig({
   plugins: [tailwindcss()],
+  resolve: {
+    dedupe: ['three'],
+  },
+  optimizeDeps: {
+    include: [
+      'three',
+      'three/examples/jsm/controls/OrbitControls.js',
+      'three/examples/jsm/environments/RoomEnvironment.js',
+    ],
+  },
   esbuild: {
     jsx: 'automatic',
   },

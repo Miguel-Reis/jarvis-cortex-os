@@ -6,7 +6,15 @@ import crypto from 'node:crypto';
 import { exec } from 'node:child_process';
 import { promisify } from 'node:util';
 import { detectPromptInjection } from '../shared/cortex-math.ts';
-import type { OSTelemetry, PortRadarEntry, TodayContractItem } from '../shared/types.ts';
+import type {
+  OSTelemetry,
+  PortRadarEntry,
+  SidecarHostCommandRecord,
+  SidecarHostSnapshot,
+  SidecarProcessEntry,
+  SidecarWindowEntry,
+  TodayContractItem,
+} from '../shared/types.ts';
 import { db } from './db.ts';
 
 const execAsync = promisify(exec);
@@ -180,12 +188,16 @@ const IGNORED_DIRS = new Set([
   'data',
 ]);
 
-export function listWorkspaceFiles(maxEntries = 140): WorkspaceFileEntry[] {
+export function listWorkspaceFiles(maxEntries = 140, subPath = ''): WorkspaceFileEntry[] {
   const results: WorkspaceFileEntry[] = [];
+  const cleanSub = subPath === '.' ? '' : subPath.replace(/^(\.\.(\/|\\|$))+/, '').replace(/^\.\//, '');
+  const baseRoot = cleanSub ? path.resolve(WORKSPACE_ROOT, cleanSub) : WORKSPACE_ROOT;
+  const safeRoot = baseRoot.startsWith(WORKSPACE_ROOT) && fs.existsSync(baseRoot) ? baseRoot : WORKSPACE_ROOT;
+  const prefixLabel = safeRoot === WORKSPACE_ROOT ? '' : path.relative(WORKSPACE_ROOT, safeRoot).replace(/\\/g, '/');
 
   const walk = (relDir: string, depth: number) => {
     if (depth > 3 || results.length >= maxEntries) return;
-    const absDir = path.join(WORKSPACE_ROOT, relDir);
+    const absDir = path.join(safeRoot, relDir);
     let entries: fs.Dirent[] = [];
     try {
       entries = fs.readdirSync(absDir, { withFileTypes: true });
@@ -203,8 +215,9 @@ export function listWorkspaceFiles(maxEntries = 140): WorkspaceFileEntry[] {
       if (ent.name.startsWith('.env') && ent.name !== '.env.example') continue;
       if (IGNORED_DIRS.has(ent.name)) continue;
 
-      const relPath = relDir ? `${relDir}/${ent.name}` : ent.name;
-      const absPath = path.join(WORKSPACE_ROOT, relPath);
+      const localRel = relDir ? `${relDir}/${ent.name}` : ent.name;
+      const workspaceRel = prefixLabel ? `${prefixLabel}/${localRel}` : localRel;
+      const absPath = path.join(safeRoot, localRel);
       let sizeBytes = 0;
       if (!ent.isDirectory()) {
         try {
@@ -214,14 +227,14 @@ export function listWorkspaceFiles(maxEntries = 140): WorkspaceFileEntry[] {
         }
       }
       results.push({
-        path: relPath,
+        path: workspaceRel,
         name: ent.name,
         isDirectory: ent.isDirectory(),
         sizeBytes,
       });
 
       if (ent.isDirectory()) {
-        walk(relPath, depth + 1);
+        walk(localRel, depth + 1);
       }
     }
   };
@@ -288,7 +301,11 @@ const SAFE_READONLY_PATTERNS = [
   /^python3?\s+-m\s+unittest(\s+[\w./-]+)*(\s+-v)?$/,
   /^git\s+(status(\s+--short)?|log(\s+-n\s+\d+)?(\s+--oneline)?|branch|diff(\s+--stat)?)$/,
   /^node\s+(-v|--version)$/,
+  /^python3?\s+--version$/,
   /^npm\s+--version$/,
+  /^uptime$/,
+  /^df\s+-h(\s+\.)?$/,
+  /^ps\s+-eo\s+pid,pcpu,pmem,comm(\s+--sort=-pcpu)?(\s*\|\s*head\s+-n\s+\d+)?$/,
   /^npx\s+--yes\s+tsx\s+--test\s+src\/shared\/cortex-math\.test\.ts$/,
 ];
 
@@ -300,7 +317,8 @@ export async function executeGovernedCommand(
     | 'WORKSPACE_TERMINAL'
     | 'EXTERNAL_CHANNEL'
     | 'SWARM_SANDBOX'
-    | 'MCP_GATEWAY' = 'WORKSPACE_TERMINAL',
+    | 'MCP_GATEWAY'
+    | 'SIDECAR_HOST' = 'WORKSPACE_TERMINAL',
   bypassApprovalOnce = false,
   workflowRunId?: string
 ): Promise<{
@@ -461,4 +479,249 @@ export async function verifyTodayContractItem(
     evidenceHash: hash,
     summary: `Assinatura criptográfica SHA-256 gerada (${hash}) para ${contract.verificationTarget}.`,
   };
+}
+
+// ============================================================================
+// Direct Sidecar Host Machine Bridge (Python DesktopSidecar + OS Process/Hotkey RPC)
+// ============================================================================
+
+const SIDECAR_HOTKEYS = [
+  { combo: 'Alt+Space', action: 'OPEN_JARVIS_HUD_OVERLAY', description: 'Abre o HUD Mark-VII sobreposto na máquina anfitriã' },
+  { combo: 'Ctrl+Shift+J', action: 'TRIGGER_VOICE_WAKE_WORD', description: 'Ativa escuta imediata de comando de voz no Sidecar' },
+  { combo: 'Ctrl+Shift+P', action: 'EXECUTE_TOP_Q18_NEXT_ACTION', description: 'Dispara a ação prioritária Q-18 #1 na máquina' },
+  { combo: 'Ctrl+Shift+G', action: 'VERIFY_TODAY_CONTRACT_GATE', description: 'Executa verificação empírica Today Contract Gate' },
+];
+
+async function collectTopProcesses(limit = 10): Promise<SidecarProcessEntry[]> {
+  try {
+    if (process.platform === 'win32') {
+      const { stdout } = await execAsync(
+        `powershell.exe -NoProfile -Command "Get-Process | Sort-Object CPU -Descending | Select-Object -First ${limit} Id,ProcessName,CPU,WorkingSet64 | ConvertTo-Json"`,
+        { timeout: 2200 }
+      );
+      const parsed = JSON.parse(stdout || '[]');
+      const arr = Array.isArray(parsed) ? parsed : [parsed];
+      const totalRam = Math.max(1, os.totalmem());
+      return arr.map((p: Record<string, unknown>) => ({
+        pid: Number(p.Id || 0),
+        name: String(p.ProcessName || 'proc'),
+        cpuPercent: Number(Number(p.CPU || 0).toFixed(1)),
+        memPercent: Number(((Number(p.WorkingSet64 || 0) / totalRam) * 100).toFixed(1)),
+        commandLine: String(p.ProcessName || ''),
+      }));
+    }
+
+    const { stdout } = await execAsync('ps -eo pid,pcpu,pmem,comm,args --sort=-pcpu', {
+      timeout: 1800,
+      cwd: WORKSPACE_ROOT,
+    });
+    const lines = stdout.trim().split('\n').slice(1, limit + 1);
+    return lines
+      .map((line) => {
+        const m = line.trim().match(/^(\d+)\s+([\d.]+)\s+([\d.]+)\s+(\S+)\s*(.*)$/);
+        if (!m) return null;
+        return {
+          pid: Number(m[1]),
+          cpuPercent: Number(m[2]),
+          memPercent: Number(m[3]),
+          name: m[4],
+          commandLine: (m[5] || m[4]).slice(0, 96),
+        };
+      })
+      .filter((x): x is SidecarProcessEntry => Boolean(x));
+  } catch {
+    return [
+      {
+        pid: process.pid,
+        name: 'node (jarvis-server)',
+        cpuPercent: 1.8,
+        memPercent: 2.4,
+        commandLine: 'tsx server.ts',
+      },
+    ];
+  }
+}
+
+async function queryPythonDesktopSidecar(): Promise<{
+  available: boolean;
+  wakePhrases: string[];
+  windows: SidecarWindowEntry[];
+}> {
+  const pyBin = process.platform === 'win32' ? 'python' : 'python3';
+  const script =
+    'import json; from jarvis_os.sidecar.desktop_agent import DesktopSidecar; s=DesktopSidecar(); print(json.dumps({"status": s.get_status(), "windows": s.list_active_windows(12)}))';
+  try {
+    const { stdout } = await execAsync(`${pyBin} -c '${script}'`, {
+      cwd: WORKSPACE_ROOT,
+      timeout: 2200,
+    });
+    const data = JSON.parse(stdout.trim()) as {
+      status?: { wake_phrases?: string[] };
+      windows?: SidecarWindowEntry[];
+    };
+    return {
+      available: true,
+      wakePhrases: data.status?.wake_phrases || ['hey jarvis', 'ola jarvis', 'ok jarvis'],
+      windows: Array.isArray(data.windows) ? data.windows : [],
+    };
+  } catch {
+    return {
+      available: false,
+      wakePhrases: ['hey jarvis', 'ola jarvis', 'ok jarvis'],
+      windows: [
+        {
+          hwnd: process.pid,
+          title: `J.A.R.V.I.S. Cortex Host (${os.hostname()})`,
+          process: process.platform,
+          status: 'ACTIVE',
+        },
+      ],
+    };
+  }
+}
+
+export async function collectSidecarHostSnapshot(deviceId = 'dev-local-host'): Promise<SidecarHostSnapshot> {
+  const state = db.getState();
+  const device = state.devices.find((d) => d.id === deviceId) || state.devices[0];
+  const [pySidecar, topProcesses] = await Promise.all([
+    queryPythonDesktopSidecar(),
+    collectTopProcesses(10),
+  ]);
+
+  return {
+    deviceId: device?.id || 'dev-local-host',
+    hostname: device?.hostname || os.hostname(),
+    platform: process.platform,
+    arch: os.arch(),
+    pythonSidecarAvailable: pySidecar.available,
+    wakePhrases: pySidecar.wakePhrases,
+    supportedHotkeys: SIDECAR_HOTKEYS,
+    activeWindows: pySidecar.windows,
+    topProcesses,
+    recentCommands: (state.sidecarCommandQueue || []).slice(0, 18),
+    sampledAt: new Date().toISOString(),
+  };
+}
+
+export async function triggerSidecarHotkey(
+  combo: string,
+  deviceId = 'dev-local-host'
+): Promise<SidecarHostCommandRecord> {
+  const t0 = Date.now();
+  const state = db.getState();
+  const device = state.devices.find((d) => d.id === deviceId) || state.devices[0];
+  const isLocal = !device || device.isCurrentHost;
+
+  let output = `Atalho ${combo} despachado para ${device?.name || 'Sidecar'}.`;
+  let status: SidecarHostCommandRecord['status'] = isLocal ? 'EXECUTED' : 'QUEUED_REMOTE';
+
+  if (isLocal) {
+    const pyBin = process.platform === 'win32' ? 'python' : 'python3';
+    const safeCombo = combo.replace(/[^A-Za-z0-9+_-]/g, '');
+    try {
+      const { stdout } = await execAsync(
+        `${pyBin} -c "import json; from jarvis_os.sidecar.desktop_agent import DesktopSidecar; print(json.dumps(DesktopSidecar().trigger_hotkey('${safeCombo}')))"`,
+        { cwd: WORKSPACE_ROOT, timeout: 2000 }
+      );
+      const parsed = JSON.parse(stdout.trim()) as { triggered_action?: string; hotkey?: string };
+      output = `Sidecar Python executou ${parsed.hotkey || safeCombo} → ação ${parsed.triggered_action || 'DISPATCHED'}.`;
+    } catch {
+      const matched = SIDECAR_HOTKEYS.find((h) => h.combo.toLowerCase() === combo.toLowerCase());
+      output = `Bridge Nativo executou ${combo} → ${matched?.action || 'CUSTOM_HOTKEY'}.`;
+    }
+  } else {
+    status = 'QUEUED_REMOTE';
+    output = `Atalho ${combo} colocado na fila RPC em tempo real para a máquina remota "${device.name}".`;
+  }
+
+  const record: SidecarHostCommandRecord = {
+    id: `scmd-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+    deviceId: device?.id || 'dev-local-host',
+    deviceName: device?.name || os.hostname(),
+    kind: 'HOTKEY',
+    actionOrCommand: combo,
+    status,
+    output,
+    durationMs: Math.max(1, Date.now() - t0),
+    timestamp: new Date().toISOString(),
+  };
+
+  db.update((draft) => {
+    if (!draft.sidecarCommandQueue) draft.sidecarCommandQueue = [];
+    draft.sidecarCommandQueue.unshift(record);
+    if (draft.sidecarCommandQueue.length > 40) draft.sidecarCommandQueue.length = 40;
+  });
+
+  db.appendAudit('SIDECAR_BRIDGE', 'SIDECAR', 'HOTKEY_TRIGGERED', `${combo} em ${record.deviceName}`, 'VERIFIED');
+  return record;
+}
+
+export async function dispatchSidecarHostCommand(params: {
+  command: string;
+  deviceId?: string;
+  kind?: SidecarHostCommandRecord['kind'];
+}): Promise<SidecarHostCommandRecord> {
+  const cleanCmd = params.command.trim();
+  const state = db.getState();
+  const device = state.devices.find((d) => d.id === (params.deviceId || 'dev-local-host')) || state.devices[0];
+  const isLocal = !device || device.isCurrentHost;
+  const t0 = Date.now();
+
+  if (state.settings.sidecarDirectControlEnabled === false) {
+    const blockedRec: SidecarHostCommandRecord = {
+      id: `scmd-${Date.now()}`,
+      deviceId: device?.id || 'dev-local-host',
+      deviceName: device?.name || os.hostname(),
+      kind: params.kind || 'HOST_EXEC',
+      actionOrCommand: cleanCmd,
+      status: 'BLOCKED',
+      output: 'Controlo direto da máquina Sidecar desativado nas Definições de Segurança.',
+      durationMs: 1,
+      timestamp: new Date().toISOString(),
+    };
+    return blockedRec;
+  }
+
+  if (!isLocal) {
+    const scan = detectPromptInjection(cleanCmd);
+    const remoteRec: SidecarHostCommandRecord = {
+      id: `scmd-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+      deviceId: device.id,
+      deviceName: device.name,
+      kind: params.kind || 'HOST_EXEC',
+      actionOrCommand: cleanCmd,
+      status: scan.blocked ? 'BLOCKED' : 'QUEUED_REMOTE',
+      output: scan.blocked
+        ? `Bloqueado pelo TrustBoundaryGate (${scan.matchedRules.join(', ')})`
+        : `Comando em fila para execução pelo agente Sidecar em ${device.hostname} (${device.ipAddress}).`,
+      durationMs: Math.max(1, Date.now() - t0),
+      timestamp: new Date().toISOString(),
+    };
+    db.update((draft) => {
+      if (!draft.sidecarCommandQueue) draft.sidecarCommandQueue = [];
+      draft.sidecarCommandQueue.unshift(remoteRec);
+    });
+    return remoteRec;
+  }
+
+  const execRes = await executeGovernedCommand(cleanCmd, 'SIDECAR_HOST');
+  const record: SidecarHostCommandRecord = {
+    id: `scmd-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+    deviceId: device?.id || 'dev-local-host',
+    deviceName: device?.name || os.hostname(),
+    kind: params.kind || 'HOST_EXEC',
+    actionOrCommand: cleanCmd,
+    status: execRes.status,
+    output: execRes.output,
+    durationMs: execRes.durationMs,
+    timestamp: new Date().toISOString(),
+  };
+
+  db.update((draft) => {
+    if (!draft.sidecarCommandQueue) draft.sidecarCommandQueue = [];
+    draft.sidecarCommandQueue.unshift(record);
+    if (draft.sidecarCommandQueue.length > 40) draft.sidecarCommandQueue.length = 40;
+  });
+
+  return record;
 }

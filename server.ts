@@ -12,6 +12,7 @@ import {
   findShortestGraphPath,
   rankQ18Actions,
   redactAiDefenceSecrets,
+  routeJevS1,
   searchMemories4WayRRF,
   validateChannelSender,
   validateMcpServerAuthorityGate,
@@ -21,6 +22,11 @@ import {
   buildDefaultMcpRegistryTools,
   MCP_STANDARD_LIBRARY,
 } from './src/shared/mcp-catalog.ts';
+import {
+  CORTEX_PLUGINS_CATALOG,
+  SPECIALIST_AGENT_TEMPLATES,
+  STANDARD_SKILLS_LIBRARY,
+} from './src/shared/skills-plugins-catalog.ts';
 import type {
   ChannelPlatform,
   McpCustomServer,
@@ -30,22 +36,30 @@ import type {
   McpTransportType,
   MemoryCategory,
   MemoryTier,
+  PluginItem,
+  PluginLifecycleHook,
+  ProjectWorkspace,
+  Room,
   SwarmLane,
   TodayContractItem,
 } from './src/shared/types.ts';
 import { db } from './src/server/db.ts';
 import {
   collectOSTelemetry,
+  collectSidecarHostSnapshot,
+  dispatchSidecarHostCommand,
   executeGovernedCommand,
   getGitOverview,
   listWorkspaceFiles,
   readSafeWorkspaceFile,
+  triggerSidecarHotkey,
   verifyTodayContractItem,
 } from './src/server/os-adapter.ts';
 import {
   generateWorkflowFromNaturalLanguage,
   runAgentChatTurn,
   synthesizeBriefText,
+  testModelProviderConnection,
 } from './src/server/gemini-engine.ts';
 import {
   registerWorkflowBroadcaster,
@@ -57,6 +71,7 @@ import {
   buildScoutWorkspaceIndex,
   createSubagentSandbox,
   generateScoutArchitectureReport,
+  getBrainCognitiveOverview,
   launchAsymmetricSwarm,
   lookupWorkspaceSymbols,
   mergeSubagentSandbox,
@@ -64,6 +79,7 @@ import {
   probeAndSyncBrain8765,
   registerSwarmOrbitBroadcaster,
   rollbackSubagentSandbox,
+  runProjectProactiveScan,
   storeBiTemporalMemory,
 } from './src/server/swarm-orbit-engine.ts';
 import {
@@ -160,6 +176,7 @@ async function startServer() {
     res.json({
       storageEngine: db.getEngineName(),
       geminiAvailable: Boolean(process.env.GEMINI_API_KEY?.trim()),
+      openRouterAvailable: Boolean(process.env.OPENROUTER_API_KEY?.trim()),
       activePort: PORT,
       brain8765: brainProbe.status,
       state: {
@@ -169,6 +186,266 @@ async function startServer() {
       pprNodes,
       telemetry,
     });
+  });
+
+  // ==========================================================================
+  // 0B. Multi-Project Workspaces & Proactive Project Engine
+  // ==========================================================================
+  app.get('/api/projects', (_req, res) => {
+    const state = db.getState();
+    res.json({
+      projects: state.projects || [],
+      activeProjectId: state.activeProjectId || 'proj-jarvis-core',
+    });
+  });
+
+  app.post('/api/projects', async (req, res) => {
+    const {
+      name,
+      rootPath,
+      techStack,
+      gitBranch,
+      description,
+      proactiveEnabled,
+      proactiveIntervalSec,
+      assignedAgentIds,
+    } = req.body || {};
+
+    const cleanName = String(name || '').trim();
+    if (!cleanName) {
+      res.status(400).json({ error: 'Nome do projeto é obrigatório.' });
+      return;
+    }
+
+    const slug = cleanName
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/(^-|-$)/g, '');
+    const nowIso = new Date().toISOString();
+    const id = `proj-${Date.now()}`;
+    const newProj: ProjectWorkspace = {
+      id,
+      name: cleanName,
+      slug: slug || id,
+      rootPath: String(rootPath || '.').trim() || '.',
+      techStack: String(techStack || 'TypeScript · Node.js').trim(),
+      gitBranch: String(gitBranch || 'main').trim() || 'main',
+      description: String(description || 'Projeto registado na carteira multi-projeto do Jarvis.').trim(),
+      status: 'ACTIVE',
+      proactiveEnabled: proactiveEnabled !== false,
+      proactiveIntervalSec: Math.max(30, Number(proactiveIntervalSec) || 90),
+      healthScore: 95,
+      openTasksCount: 1,
+      assignedAgentIds: Array.isArray(assignedAgentIds)
+        ? assignedAgentIds.map(String)
+        : ['room-exec', 'room-eng'],
+      lastProactiveAt: nowIso,
+      proactiveInsights: [],
+    };
+
+    db.update((draft) => {
+      if (!draft.projects) draft.projects = [];
+      draft.projects.unshift(newProj);
+      draft.activeProjectId = newProj.id;
+    });
+
+    if (newProj.proactiveEnabled) {
+      await runProjectProactiveScan(newProj.id).catch(() => {});
+    }
+
+    db.appendAudit('OPERATOR', 'PROJECT', 'PROJECT_CREATED', `${newProj.name} (${newProj.rootPath})`, 'VERIFIED');
+    broadcastSse('state_updated', { section: 'projects' });
+    res.json({
+      project: (db.getState().projects || []).find((p) => p.id === id) || newProj,
+      projects: db.getState().projects,
+      activeProjectId: db.getState().activeProjectId,
+    });
+  });
+
+  app.post('/api/projects/bulk-proactive', async (req, res) => {
+    const proactiveEnabled = Boolean(req.body?.proactiveEnabled);
+    let updatedCount = 0;
+
+    db.update((draft) => {
+      const list = draft.projects || [];
+      for (const proj of list) {
+        proj.proactiveEnabled = proactiveEnabled;
+        if (!proactiveEnabled) {
+          const hist = Array.isArray(proj.proactiveFrequencyHistory)
+            ? proj.proactiveFrequencyHistory
+            : [];
+          proj.proactiveFrequencyHistory = [...hist, 0].slice(-12);
+        }
+        updatedCount += 1;
+      }
+    });
+
+    if (proactiveEnabled) {
+      await runProjectProactiveScan().catch(() => {});
+    }
+
+    db.appendAudit(
+      'OPERATOR',
+      'PROJECT',
+      'PROJECTS_BULK_PROACTIVE',
+      `Proatividade em massa definida para ${proactiveEnabled ? 'ON' : 'OFF'} (${updatedCount} projetos)`,
+      'VERIFIED'
+    );
+    broadcastSse('state_updated', { section: 'projects' });
+    res.json({
+      ok: true,
+      proactiveEnabled,
+      updatedCount,
+      projects: db.getState().projects || [],
+    });
+  });
+
+  app.post('/api/projects/:id/activate', (req, res) => {
+    let found: ProjectWorkspace | undefined;
+    db.update((draft) => {
+      const target = (draft.projects || []).find((p) => p.id === req.params.id);
+      if (target) {
+        draft.activeProjectId = target.id;
+        if (target.status === 'STANDBY') target.status = 'ACTIVE';
+        found = { ...target };
+      }
+    });
+    if (!found) {
+      res.status(404).json({ error: 'Projeto não encontrado.' });
+      return;
+    }
+    broadcastSse('state_updated', { section: 'projects' });
+    res.json({ project: found, activeProjectId: found.id });
+  });
+
+  app.patch('/api/projects/:id', async (req, res) => {
+    const body = req.body || {};
+    let updated: ProjectWorkspace | null = null;
+    let scanNeeded = false;
+
+    db.update((draft) => {
+      const target = (draft.projects || []).find((p) => p.id === req.params.id);
+      if (!target) return;
+      if (typeof body.name === 'string' && body.name.trim()) target.name = body.name.trim();
+      if (typeof body.rootPath === 'string' && body.rootPath.trim()) target.rootPath = body.rootPath.trim();
+      if (typeof body.techStack === 'string') target.techStack = body.techStack.trim();
+      if (typeof body.description === 'string') target.description = body.description.trim();
+      if (body.status && ['ACTIVE', 'STANDBY', 'AUDITING'].includes(body.status)) {
+        target.status = body.status;
+      }
+      if (typeof body.proactiveEnabled === 'boolean') {
+        target.proactiveEnabled = body.proactiveEnabled;
+        if (body.proactiveEnabled) {
+          scanNeeded = true;
+        } else {
+          const hist = Array.isArray(target.proactiveFrequencyHistory)
+            ? target.proactiveFrequencyHistory
+            : [];
+          target.proactiveFrequencyHistory = [...hist, 0].slice(-12);
+        }
+      }
+      if (typeof body.proactiveIntervalSec === 'number') {
+        target.proactiveIntervalSec = Math.max(30, Math.min(3600, body.proactiveIntervalSec));
+      }
+      if (Array.isArray(body.assignedAgentIds)) {
+        target.assignedAgentIds = body.assignedAgentIds.map(String);
+      }
+      updated = { ...target };
+    });
+
+    if (!updated) {
+      res.status(404).json({ error: 'Projeto não encontrado.' });
+      return;
+    }
+
+    if (scanNeeded) {
+      await runProjectProactiveScan(req.params.id).catch(() => {});
+      updated = (db.getState().projects || []).find((p) => p.id === req.params.id) || updated;
+    }
+
+    db.appendAudit('OPERATOR', 'PROJECT', 'PROJECT_UPDATED', `${updated.name} (Proatividade=${updated.proactiveEnabled ? 'ON' : 'OFF'})`, 'VERIFIED');
+    broadcastSse('state_updated', { section: 'projects' });
+    res.json({ project: updated, projects: db.getState().projects });
+  });
+
+  app.delete('/api/projects/:id', (req, res) => {
+    const current = db.getState().projects || [];
+    if (current.length <= 1) {
+      res.status(400).json({ error: 'Deve existir pelo menos 1 projeto ativo no Jarvis.' });
+      return;
+    }
+    let removed = '';
+    db.update((draft) => {
+      const target = (draft.projects || []).find((p) => p.id === req.params.id);
+      if (target) removed = target.name;
+      draft.projects = (draft.projects || []).filter((p) => p.id !== req.params.id);
+      if (draft.activeProjectId === req.params.id && draft.projects[0]) {
+        draft.activeProjectId = draft.projects[0].id;
+      }
+    });
+    if (!removed) {
+      res.status(404).json({ error: 'Projeto não encontrado.' });
+      return;
+    }
+    broadcastSse('state_updated', { section: 'projects' });
+    res.json({ ok: true, projects: db.getState().projects, activeProjectId: db.getState().activeProjectId });
+  });
+
+  app.post('/api/projects/proactive-scan', async (req, res) => {
+    const projectId = req.body?.projectId ? String(req.body.projectId) : undefined;
+    const scanned = await runProjectProactiveScan(projectId);
+    res.json({ scanned, projects: db.getState().projects });
+  });
+
+  app.post('/api/projects/:id/insights/:insightId/resolve', async (req, res) => {
+    const mode: 'EXECUTE' | 'DISMISS' = req.body?.mode === 'DISMISS' ? 'DISMISS' : 'EXECUTE';
+    const state = db.getState();
+    const proj = (state.projects || []).find((p) => p.id === req.params.id);
+    const insight = proj?.proactiveInsights.find((i) => i.id === req.params.insightId);
+    if (!proj || !insight) {
+      res.status(404).json({ error: 'Insight proativo não encontrado.' });
+      return;
+    }
+
+    let executionSummary = 'Insight dispensado pelo Operador.';
+    if (mode === 'EXECUTE') {
+      if (insight.actionKind === 'VERIFY_CONTRACTS') {
+        for (const c of state.contracts) {
+          const vRes = await verifyTodayContractItem(c, PORT);
+          db.update((draft) => {
+            const target = draft.contracts.find((x) => x.id === c.id);
+            if (target) {
+              target.status = vRes.verified ? 'VERIFIED' : 'FAILED';
+              target.evidenceHash = vRes.evidenceHash;
+              target.lastCheckedAt = new Date().toISOString();
+              target.outputSummary = vRes.summary;
+            }
+          });
+        }
+        executionSummary = 'Todos os contratos Today Contract Gate foram verificados com SHA-256.';
+      } else if (insight.actionKind === 'EXEC_COMMAND') {
+        const execRes = await executeGovernedCommand(insight.suggestedCommandOrPrompt, 'WORKSPACE_TERMINAL');
+        executionSummary = execRes.output.slice(0, 260);
+      } else if (insight.actionKind === 'OPEN_CHAT') {
+        const turn = await runAgentChatTurn({
+          roomId: proj.assignedAgentIds[0] || 'room-exec',
+          userText: insight.suggestedCommandOrPrompt,
+          activePort: PORT,
+        });
+        executionSummary = turn.assistantMessage.content.slice(0, 260);
+      }
+    }
+
+    db.update((draft) => {
+      const p = (draft.projects || []).find((x) => x.id === req.params.id);
+      const ins = p?.proactiveInsights.find((x) => x.id === req.params.insightId);
+      if (ins) {
+        ins.status = mode === 'EXECUTE' ? 'EXECUTED' : 'DISMISSED';
+      }
+    });
+
+    broadcastSse('state_updated', { section: 'projects' });
+    res.json({ ok: true, executionSummary, projects: db.getState().projects });
   });
 
   // ==========================================================================
@@ -277,6 +554,8 @@ async function startServer() {
     }
 
     let detail = `Ação Q-18 "${cand.title}" concluída.`;
+    let navigateTo: string | undefined;
+
     if (cand.actionPayload.kind === 'VERIFY_CONTRACT') {
       const targetContract = db.getState().contracts.find((c) => c.id === cand.actionPayload.refId);
       if (targetContract) {
@@ -295,6 +574,14 @@ async function startServer() {
     } else if (cand.actionPayload.kind === 'RUN_WORKFLOW') {
       const run = await runWorkflowById(cand.actionPayload.refId, 'MANUAL');
       detail = `Workflow executado (${run?.status || 'OK'}).`;
+    } else if (cand.actionPayload.kind === 'RUN_DIAGNOSTIC') {
+      const telemetry = await collectOSTelemetry(PORT);
+      const pendingCount = db.getState().approvals.filter((a) => a.status === 'PENDING').length;
+      detail = `Diagnóstico concluído: CPU ${telemetry.cpuUsagePercent}% · RAM ${telemetry.ramPercent}% · ${pendingCount} pedido(s) pendentes na Inbox de Autoridade.`;
+      navigateTo = cand.actionPayload.refId || 'authority';
+    } else if (cand.actionPayload.kind === 'OPEN_ROOM') {
+      detail = `Sala tática "${cand.actionPayload.refId}" pronta para sessão multi-agente.`;
+      navigateTo = 'chat';
     }
 
     db.update((draft) => {
@@ -306,6 +593,7 @@ async function startServer() {
     res.json({
       ok: true,
       detail,
+      navigateTo,
       candidates: rankQ18Actions(db.getState().candidates),
       contracts: db.getState().contracts,
     });
@@ -389,6 +677,105 @@ async function startServer() {
       draft.messages = draft.messages.filter((m) => m.roomId !== req.params.roomId);
     });
     res.json({ ok: true });
+  });
+
+  app.post('/api/rooms', (req, res) => {
+    const body = req.body || {};
+    const tpl = body.templateId
+      ? SPECIALIST_AGENT_TEMPLATES.find((t) => t.id === String(body.templateId))
+      : undefined;
+
+    const name = String(body.name || tpl?.name || '').trim();
+    if (!name) {
+      res.status(400).json({ error: 'Nome do agente/sala é obrigatório.' });
+      return;
+    }
+
+    const validColors = ['cyan', 'amber', 'emerald', 'rose', 'violet'] as const;
+    const accentColor = validColors.includes(body.accentColor)
+      ? body.accentColor
+      : tpl?.accentColor || 'cyan';
+
+    const room: Room = {
+      id: `room-custom-${Date.now()}`,
+      name,
+      callsign: String(body.callsign || tpl?.callsign || `AGENT-${Math.floor(10 + Math.random() * 89)}`).trim(),
+      roleTitle: String(body.roleTitle || tpl?.roleTitle || 'Agente Especialista Personalizado').trim(),
+      description: String(body.description || tpl?.description || 'Agente recrutado pelo Operador.').trim(),
+      systemPrompt: String(
+        body.systemPrompt ||
+          tpl?.systemPrompt ||
+          `Atua como ${name} no J.A.R.V.I.S. Cortex OS em Português de Portugal (PT-PT).`
+      ).trim(),
+      accentColor,
+      allowedTools: Array.isArray(body.allowedTools)
+        ? body.allowedTools.map(String)
+        : tpl?.allowedTools || ['search_memories', 'lookup_ast_symbol'],
+      projectId: body.projectId ? String(body.projectId) : undefined,
+      modelOverride: body.modelOverride ? String(body.modelOverride).trim() : undefined,
+      isCustom: true,
+    };
+
+    const nowIso = new Date().toISOString();
+    db.update((draft) => {
+      draft.rooms.push(room);
+      draft.messages.push({
+        id: `msg-welcome-${room.id}`,
+        roomId: room.id,
+        role: 'assistant',
+        content: `Agente **${room.name}** (\`${room.callsign}\`) operacional e integrado na frota. Ferramentas autorizadas: \`${room.allowedTools.join(', ')}\`.`,
+        createdAt: nowIso,
+        engineUsed: 'AGENT_RECRUITMENT_GATE',
+      });
+    });
+
+    db.appendAudit('OPERATOR', 'ORBIT', 'AGENT_RECRUITED', `${room.name} (${room.callsign})`, 'VERIFIED');
+    broadcastSse('state_updated', { section: 'rooms' });
+    res.json({ room, rooms: db.getState().rooms });
+  });
+
+  app.patch('/api/rooms/:id', (req, res) => {
+    const body = req.body || {};
+    let updated: Room | null = null;
+    db.update((draft) => {
+      const target = draft.rooms.find((r) => r.id === req.params.id);
+      if (!target) return;
+      if (typeof body.name === 'string' && body.name.trim()) target.name = body.name.trim();
+      if (typeof body.roleTitle === 'string' && body.roleTitle.trim()) target.roleTitle = body.roleTitle.trim();
+      if (typeof body.systemPrompt === 'string' && body.systemPrompt.trim()) {
+        target.systemPrompt = body.systemPrompt.trim();
+      }
+      if (Array.isArray(body.allowedTools)) {
+        target.allowedTools = body.allowedTools.map(String);
+      }
+      if (body.projectId !== undefined) {
+        target.projectId = body.projectId ? String(body.projectId) : undefined;
+      }
+      updated = { ...target };
+    });
+    if (!updated) {
+      res.status(404).json({ error: 'Agente/sala não encontrado.' });
+      return;
+    }
+    res.json({ room: updated, rooms: db.getState().rooms });
+  });
+
+  app.delete('/api/rooms/:id', (req, res) => {
+    const room = db.getState().rooms.find((r) => r.id === req.params.id);
+    if (!room) {
+      res.status(404).json({ error: 'Agente não encontrado.' });
+      return;
+    }
+    if (!room.isCustom && db.getState().rooms.length <= 2) {
+      res.status(400).json({ error: 'Mantém pelo menos as salas nucleares de comando.' });
+      return;
+    }
+    db.update((draft) => {
+      draft.rooms = draft.rooms.filter((r) => r.id !== req.params.id);
+      draft.messages = draft.messages.filter((m) => m.roomId !== req.params.id);
+    });
+    broadcastSse('state_updated', { section: 'rooms' });
+    res.json({ ok: true, rooms: db.getState().rooms });
   });
 
   // ==========================================================================
@@ -484,17 +871,30 @@ async function startServer() {
   // ==========================================================================
   // 4. Workspace Files, Git, AST Symbol Lookup & Governed Terminal
   // ==========================================================================
-  app.get('/api/workspace/overview', async (_req, res) => {
+  app.get('/api/workspace/overview', async (req, res) => {
+    const state = db.getState();
+    const projectId = String(req.query.projectId || state.activeProjectId || '');
+    const activeProject =
+      (state.projects || []).find((p) => p.id === projectId) || (state.projects || [])[0];
+    const subPath = activeProject?.rootPath || '.';
+
     const [files, git, scout] = await Promise.all([
-      Promise.resolve(listWorkspaceFiles(160)),
+      Promise.resolve(listWorkspaceFiles(160, subPath)),
       getGitOverview(),
       buildScoutWorkspaceIndex(),
     ]);
+
+    const cleanPrefix = subPath === '.' ? '' : subPath.replace(/^\.\//, '');
+    const scopedSymbols = cleanPrefix
+      ? scout.symbols.filter((s) => s.filePath.startsWith(cleanPrefix))
+      : scout.symbols;
+
     res.json({
+      activeProject,
       files,
       git,
       astSummary: {
-        symbolsCount: scout.symbols.length,
+        symbolsCount: scopedSymbols.length,
         coChangesCount: scout.coChanges.length,
         topCoChanges: scout.coChanges.slice(0, 8),
       },
@@ -669,6 +1069,32 @@ async function startServer() {
       brainUrl: syncRes.status.endpointUrl,
       status: syncRes.status,
       message: syncRes.message,
+    });
+  });
+
+  app.get('/api/brain/overview', async (_req, res) => {
+    const overview = await getBrainCognitiveOverview();
+    res.json(overview);
+  });
+
+  app.post('/api/brain/router-simulate', async (req, res) => {
+    const prompt = String(req.body?.prompt || 'Analisa o acoplamento AST de server.ts').trim();
+    const scoutIdx = await buildScoutWorkspaceIndex();
+    const state = db.getState();
+    const nativeEligible = state.mcpRegistryTools
+      ? state.mcpRegistryTools.filter((t) => t.enabled && t.jevEligible).map((t) => t.name)
+      : undefined;
+    const routed = routeJevS1({
+      prompt,
+      memories: state.memories,
+      scoutSymbols: scoutIdx.symbols,
+      activeMcpCatalog: nativeEligible,
+    });
+    res.json({
+      ...routed.decision,
+      decision: routed.decision,
+      nextDeltaHash: routed.nextDeltaHash,
+      compressedContextBlock: routed.compressedContextBlock,
     });
   });
 
@@ -931,8 +1357,13 @@ async function startServer() {
   });
 
   app.post('/api/mcp', async (req, res) => {
-    const rpcResponse = await handleMcpJsonRpc(req.body || {});
-    broadcastSse('state_updated', { section: 'mcp' });
+    const method = String(req.body?.method || '');
+    const rpcResponse = await handleMcpJsonRpc(req.body || {}, PORT);
+    if (method === 'gateway/heartbeat' || method === 'ping') {
+      broadcastSse('mcp_heartbeat', { method, timestamp: new Date().toISOString() });
+    } else {
+      broadcastSse('state_updated', { section: 'mcp' });
+    }
     res.json(rpcResponse);
   });
 
@@ -1367,6 +1798,15 @@ async function startServer() {
       authStatus: stdioPreApproved ? 'AUTHORIZED' : 'PENDING_APPROVAL',
       healthStatus: stdioPreApproved ? 'ONLINE' : 'PENDING_AUTH',
       lastLatencyMs: 0,
+      latencyHistory: [],
+      probeCount: 0,
+      errorCount: 0,
+      lastRpcMethod:
+        transport === 'HTTP_STREAMABLE'
+          ? 'JSON-RPC 2.0 ping + tools/list'
+          : transport === 'SSE'
+            ? 'SSE Handshake GET'
+            : 'stdio execFile Probe',
       discoveredTools: libItem?.sampleTools ? [...libItem.sampleTools] : [],
       lastCheckedAt: nowIso,
       lastError: stdioPreApproved
@@ -1524,10 +1964,54 @@ async function startServer() {
   });
 
   // ==========================================================================
-  // 6. Modular OpenClaw Skills & Multi-Channel Gateway
+  // 6. Modular OpenClaw Skills, Standard Library, Plugins & Multi-Channel Gateway
   // ==========================================================================
+  app.get('/api/skills/catalog', (_req, res) => {
+    const state = db.getState();
+    res.json({
+      installedSkills: state.skills,
+      skillsLibrary: STANDARD_SKILLS_LIBRARY,
+      plugins: state.plugins || [],
+      pluginsCatalog: CORTEX_PLUGINS_CATALOG,
+      agentTemplates: SPECIALIST_AGENT_TEMPLATES,
+    });
+  });
+
+  app.post('/api/skills/install-template', (req, res) => {
+    const templateId = String(req.body?.templateId || '');
+    const tpl = STANDARD_SKILLS_LIBRARY.find((t) => t.id === templateId);
+    if (!tpl) {
+      res.status(404).json({ error: 'Template de skill não encontrado na biblioteca.' });
+      return;
+    }
+    const already = db.getState().skills.find((s) => s.slug === tpl.slug);
+    if (already) {
+      res.json({ skill: already, skills: db.getState().skills, alreadyInstalled: true });
+      return;
+    }
+    const newSkill = {
+      id: `skill-lib-${Date.now()}`,
+      name: tpl.name,
+      slug: tpl.slug,
+      category: tpl.category,
+      origin: 'LIBRARY' as const,
+      description: tpl.description,
+      enabled: true,
+      systemInstruction: tpl.systemInstruction,
+      allowedTools: [...tpl.allowedTools],
+      quickCommand: tpl.quickCommand,
+      version: tpl.version,
+    };
+    db.update((draft) => {
+      draft.skills.unshift(newSkill);
+    });
+    db.appendAudit('OPERATOR', 'SYSTEM', 'SKILL_INSTALLED_LIBRARY', newSkill.name, 'VERIFIED');
+    broadcastSse('state_updated', { section: 'skills' });
+    res.json({ skill: newSkill, skills: db.getState().skills });
+  });
+
   app.post('/api/skills', (req, res) => {
-    const { name, description, systemInstruction, quickCommand, allowedTools } = req.body || {};
+    const { name, category, description, systemInstruction, quickCommand, allowedTools } = req.body || {};
     if (!name?.trim() || !systemInstruction?.trim()) {
       res.status(400).json({ error: 'Nome e instruções de sistema são obrigatórios.' });
       return;
@@ -1540,6 +2024,8 @@ async function startServer() {
       id: `skill-${Date.now()}`,
       name: String(name).trim(),
       slug: slug || `skill-${Date.now()}`,
+      category: (category || 'CUSTOM') as 'CUSTOM',
+      origin: 'CUSTOM' as const,
       description: String(description || 'Skill personalizada OpenClaw').trim(),
       enabled: true,
       systemInstruction: String(systemInstruction).trim(),
@@ -1551,7 +2037,7 @@ async function startServer() {
       draft.skills.unshift(skill);
     });
     db.appendAudit('OPERATOR', 'SYSTEM', 'SKILL_CREATED', skill.name, 'VERIFIED');
-    res.json({ skill });
+    res.json({ skill, skills: db.getState().skills });
   });
 
   app.patch('/api/skills/:id', (req, res) => {
@@ -1569,6 +2055,79 @@ async function startServer() {
       return;
     }
     res.json({ skill: updated });
+  });
+
+  app.delete('/api/skills/:id', (req, res) => {
+    db.update((draft) => {
+      draft.skills = draft.skills.filter((s) => s.id !== req.params.id);
+    });
+    res.json({ ok: true, skills: db.getState().skills });
+  });
+
+  app.post('/api/plugins', (req, res) => {
+    const body = req.body || {};
+    const name = String(body.name || '').trim();
+    if (!name) {
+      res.status(400).json({ error: 'Nome do plugin é obrigatório.' });
+      return;
+    }
+    const slug = name
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/(^-|-$)/g, '');
+    const plugin: PluginItem = {
+      id: `plug-custom-${Date.now()}`,
+      name,
+      slug: slug || `plug-${Date.now()}`,
+      category: body.category || 'WORKFLOW',
+      description: String(body.description || 'Plugin personalizado registado no Cortex OS.').trim(),
+      version: String(body.version || '1.0.0').trim(),
+      author: String(body.author || db.getState().settings.operatorName).trim(),
+      hook: (body.hook || 'POST_TURN') as PluginLifecycleHook,
+      enabled: true,
+      installed: true,
+      config: body.config && typeof body.config === 'object' ? body.config : {},
+      invocationsCount: 0,
+    };
+    db.update((draft) => {
+      if (!draft.plugins) draft.plugins = [];
+      draft.plugins.unshift(plugin);
+    });
+    db.appendAudit('OPERATOR', 'SYSTEM', 'PLUGIN_INSTALLED', plugin.name, 'VERIFIED');
+    res.json({ plugin, plugins: db.getState().plugins });
+  });
+
+  app.patch('/api/plugins/:id', (req, res) => {
+    const body = req.body || {};
+    let updated: PluginItem | null = null;
+    db.update((draft) => {
+      const target = (draft.plugins || []).find((p) => p.id === req.params.id);
+      if (!target) return;
+      if (typeof body.installed === 'boolean') {
+        target.installed = body.installed;
+        if (!body.installed) target.enabled = false;
+      }
+      if (typeof body.enabled === 'boolean') {
+        target.enabled = body.enabled;
+        if (body.enabled) target.installed = true;
+      }
+      if (body.config && typeof body.config === 'object') {
+        target.config = { ...target.config, ...body.config };
+      }
+      updated = { ...target };
+    });
+    if (!updated) {
+      res.status(404).json({ error: 'Plugin não encontrado.' });
+      return;
+    }
+    res.json({ plugin: updated, plugins: db.getState().plugins });
+  });
+
+  app.delete('/api/plugins/:id', (req, res) => {
+    db.update((draft) => {
+      draft.plugins = (draft.plugins || []).filter((p) => p.id !== req.params.id);
+    });
+    res.json({ ok: true, plugins: db.getState().plugins });
   });
 
   app.post('/api/channels', (req, res) => {
@@ -1728,6 +2287,103 @@ async function startServer() {
     });
   });
 
+  app.get('/api/sidecar/host-snapshot', async (req, res) => {
+    const deviceId = req.query.deviceId ? String(req.query.deviceId) : 'dev-local-host';
+    const snapshot = await collectSidecarHostSnapshot(deviceId);
+    res.json({ snapshot });
+  });
+
+  app.post('/api/sidecar/hotkey', async (req, res) => {
+    const combo = String(req.body?.combo || 'Alt+Space').trim();
+    const deviceId = String(req.body?.deviceId || 'dev-local-host');
+    const record = await triggerSidecarHotkey(combo, deviceId);
+    broadcastSse('sidecar_event', { record });
+    res.json({ record, snapshot: await collectSidecarHostSnapshot(deviceId) });
+  });
+
+  app.post('/api/sidecar/host-exec', async (req, res) => {
+    const command = String(req.body?.command || '').trim();
+    const deviceId = String(req.body?.deviceId || 'dev-local-host');
+    const kind = req.body?.kind || 'HOST_EXEC';
+    if (!command) {
+      res.status(400).json({ error: 'Comando para a máquina Sidecar é obrigatório.' });
+      return;
+    }
+    const record = await dispatchSidecarHostCommand({ command, deviceId, kind });
+    broadcastSse('sidecar_event', { record });
+    broadcastSse('state_updated', { section: 'approvals' });
+    res.json({
+      record,
+      approvals: db.getState().approvals,
+      snapshot: await collectSidecarHostSnapshot(deviceId),
+    });
+  });
+
+  app.post('/api/sidecar/enroll', (req, res) => {
+    const { token, hostname, osType, ipAddress } = req.body || {};
+    const cleanTok = String(token || '').trim();
+    const state = db.getState();
+    const matchedTok = state.enrollmentTokens.find((t) => t.token === cleanTok);
+    if (!matchedTok && cleanTok) {
+      res.status(403).json({ error: 'Token de emparelhamento Sidecar inválido ou expirado.' });
+      return;
+    }
+    const nowIso = new Date().toISOString();
+    const devId = `dev-sidecar-${Date.now()}`;
+    const cleanHost = String(hostname || matchedTok?.label || 'sidecar-workstation').trim();
+    const node = {
+      id: devId,
+      name: cleanHost,
+      osType: (['WINDOWS', 'LINUX', 'MACOS'].includes(osType) ? osType : matchedTok?.targetOs || 'WINDOWS') as
+        | 'WINDOWS'
+        | 'LINUX'
+        | 'MACOS',
+      hostname: cleanHost,
+      ipAddress: String(ipAddress || '192.168.1.48').trim(),
+      status: 'ONLINE' as const,
+      isCurrentHost: false,
+      lastSeenAt: nowIso,
+      capabilities: ['SidecarRPC', 'Hotkeys', 'ClipboardGuard', 'ProcessRadar'],
+    };
+
+    db.update((draft) => {
+      draft.devices.push(node);
+      if (matchedTok) {
+        const tRef = draft.enrollmentTokens.find((x) => x.id === matchedTok.id);
+        if (tRef) tRef.usedByDeviceId = devId;
+      }
+    });
+    db.appendAudit('SIDECAR_ENROLL', 'SIDECAR', 'DEVICE_PAIRED', `${node.name} (${node.ipAddress})`, 'VERIFIED');
+    broadcastSse('state_updated', { section: 'devices' });
+    res.json({ device: node, devices: db.getState().devices });
+  });
+
+  app.get('/api/sidecar/queue/:deviceId', (req, res) => {
+    const queued = (db.getState().sidecarCommandQueue || []).filter(
+      (c) => c.deviceId === req.params.deviceId && c.status === 'QUEUED_REMOTE'
+    );
+    res.json({ queue: queued });
+  });
+
+  app.post('/api/sidecar/queue/:commandId/result', (req, res) => {
+    const output = String(req.body?.output || 'Concluído no Sidecar remoto.');
+    let updated = null;
+    db.update((draft) => {
+      const target = (draft.sidecarCommandQueue || []).find((c) => c.id === req.params.commandId);
+      if (target) {
+        target.status = 'EXECUTED';
+        target.output = output;
+        updated = { ...target };
+      }
+    });
+    if (!updated) {
+      res.status(404).json({ error: 'Comando Sidecar não encontrado.' });
+      return;
+    }
+    broadcastSse('sidecar_event', { record: updated });
+    res.json({ record: updated });
+  });
+
   // ==========================================================================
   // 8. Authority Approvals Inbox, Canary Tester, Settings & Backup JSON
   // ==========================================================================
@@ -1765,10 +2421,18 @@ async function startServer() {
       } else if (appr.workflowRunId) {
         const pausedRun = db.getState().workflowRuns.find((r) => r.id === appr.workflowRunId);
         if (pausedRun) {
-          const resumed = await runWorkflowById(pausedRun.workflowId, 'MANUAL', true);
+          const resumed = await runWorkflowById(
+            pausedRun.workflowId,
+            'MANUAL',
+            true,
+            pausedRun.id
+          );
           executionOutput = `Workflow retomado e concluído (${resumed?.status}).`;
+        } else if (appr.commandOrAction) {
+          const execRes = await executeGovernedCommand(appr.commandOrAction, appr.source, true);
+          executionOutput = execRes.output;
         }
-      } else if (appr.source !== 'WORKFLOW') {
+      } else if (appr.commandOrAction) {
         const execRes = await executeGovernedCommand(appr.commandOrAction, appr.source, true);
         executionOutput = execRes.output;
       }
@@ -1821,8 +2485,14 @@ async function startServer() {
         ...updates,
       };
     });
+    startOrRefreshHeartbeatDaemon(PORT);
     db.appendAudit('OPERATOR', 'SYSTEM', 'SETTINGS_UPDATED', 'Preferências do sistema atualizadas.', 'VERIFIED');
     res.json({ settings: db.getState().settings });
+  });
+
+  app.post('/api/settings/test-provider', async (req, res) => {
+    const result = await testModelProviderConnection(req.body || {});
+    res.json(result);
   });
 
   app.get('/api/backup/export', (_req, res) => {

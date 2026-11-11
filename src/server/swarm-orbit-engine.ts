@@ -8,18 +8,23 @@ import { promisify } from 'node:util';
 import { createRequire } from 'node:module';
 import {
   compressFactTelegraphic,
+  computeArchitecturalDrift,
   computeBinaryQuantization128,
+  computeEbbinghausRetention,
   computeSimHash128,
   detectContradictedMemories,
+  evaluateProjectProactivity,
   redactAiDefenceSecrets,
 } from '../shared/cortex-math.ts';
 import type {
   AgentHandoff,
+  ArchitecturalDriftItem,
   BrainLiveStatus,
   CoChangeEdge,
   MemoryCategory,
   MemoryItem,
   MemoryTier,
+  ProjectWorkspace,
   SandboxFileSnapshot,
   ScoutSymbolEntry,
   SelfLearnCandidate,
@@ -29,6 +34,7 @@ import type {
   SwarmTask,
 } from '../shared/types.ts';
 import { db } from './db.ts';
+import { getGitOverview } from './os-adapter.ts';
 
 const execAsync = promisify(exec);
 const require = createRequire(import.meta.url);
@@ -1127,4 +1133,181 @@ export function harvestSelfLearnFromTurn(
   });
 
   return candidate;
+}
+
+// ============================================================================
+// 6. Dedicated Jarvis Brain Overview (Standalone Native vs :8765 Bridge + Drift)
+// ============================================================================
+
+export async function getBrainCognitiveOverview(): Promise<{
+  brain8765: BrainLiveStatus;
+  externalBrainInstalled: boolean;
+  standaloneOperationalPercent: number;
+  activeMemoriesCount: number;
+  supersededMemoriesCount: number;
+  graphEdgesCount: number;
+  selfLearnPendingCount: number;
+  tierDistribution: {
+    tier: MemoryTier;
+    count: number;
+    avgRetentionPercent: number;
+    halfLifeDays: number;
+  }[];
+  ebbinghausCurveDays: { day: number; working: number; episodic: number; semantic: number }[];
+  architecturalDrift: ArchitecturalDriftItem[];
+}> {
+  const [probe, scoutIdx] = await Promise.all([
+    probeAndSyncBrain8765(false),
+    buildScoutWorkspaceIndex(),
+  ]);
+
+  const state = db.getState();
+  const activeMems = state.memories.filter((m) => !m.supersededBy && !m.validUntil);
+  const supersededMems = state.memories.filter((m) => Boolean(m.supersededBy || m.validUntil));
+  const nowMs = Date.now();
+
+  const tiers: MemoryTier[] = ['WORKING', 'EPISODIC', 'SEMANTIC'];
+  const tierDistribution = tiers.map((tier) => {
+    const items = activeMems.filter((m) => (m.tier || 'EPISODIC') === tier);
+    if (items.length === 0) {
+      const isoNow = new Date(nowMs).toISOString();
+      const sample = computeEbbinghausRetention(
+        {
+          tier,
+          accessCount: 2,
+          importance: 4,
+          pinned: false,
+          createdAt: isoNow,
+          updatedAt: isoNow,
+          lastAccessedAt: isoNow,
+        },
+        nowMs
+      );
+      return {
+        tier,
+        count: 0,
+        avgRetentionPercent: 100,
+        halfLifeDays: sample.halfLifeDays,
+      };
+    }
+    let retSum = 0;
+    let hlSum = 0;
+    for (const m of items) {
+      const r = computeEbbinghausRetention(m, nowMs);
+      retSum += r.retentionScore * 100;
+      hlSum += r.halfLifeDays;
+    }
+    return {
+      tier,
+      count: items.length,
+      avgRetentionPercent: Number((retSum / items.length).toFixed(1)),
+      halfLifeDays: Number((hlSum / items.length).toFixed(1)),
+    };
+  });
+
+  const sampleDays = [0, 1, 3, 7, 14, 30, 60, 90];
+  const ebbinghausCurveDays = sampleDays.map((day) => ({
+    day,
+    working: Number((Math.exp((-Math.LN2 * day) / 2.2) * 100).toFixed(1)),
+    episodic: Number((Math.exp((-Math.LN2 * day) / 14) * 100).toFixed(1)),
+    semantic: Number((Math.exp((-Math.LN2 * day) / 90) * 100).toFixed(1)),
+  }));
+
+  const knownFiles = Array.from(scoutIdx.fileImports.keys());
+  const architecturalDrift = computeArchitecturalDrift({
+    memories: state.memories,
+    symbols: scoutIdx.symbols,
+    coChanges: scoutIdx.coChanges,
+    knownFiles,
+  });
+
+  return {
+    brain8765: probe.status,
+    externalBrainInstalled: probe.status.httpOnline || probe.status.sqliteWalDetected,
+    standaloneOperationalPercent: 100,
+    activeMemoriesCount: activeMems.length,
+    supersededMemoriesCount: supersededMems.length,
+    graphEdgesCount: state.graphEdges.length,
+    selfLearnPendingCount: (state.selfLearnQueue || []).filter((s) => s.status === 'PENDING').length,
+    tierDistribution,
+    ebbinghausCurveDays,
+    architecturalDrift,
+  };
+}
+
+// ============================================================================
+// 7. Multi-Project Proactivity Engine (Autonomous Per-Project Health & Insights)
+// ============================================================================
+
+export async function runProjectProactiveScan(targetProjectId?: string): Promise<ProjectWorkspace[]> {
+  const [git, scoutIdx] = await Promise.all([getGitOverview(), buildScoutWorkspaceIndex()]);
+  const state = db.getState();
+  const nowIso = new Date().toISOString();
+  const unverifiedContracts = state.contracts.filter((c) => c.status !== 'VERIFIED').length;
+  const pendingDots = (state.dotsTasks || []).filter((d) => d.status === 'READY' || d.status === 'IN_PROGRESS').length;
+
+  const updatedProjects: ProjectWorkspace[] = [];
+
+  db.update((draft) => {
+    const projects = draft.projects || [];
+    for (const proj of projects) {
+      if (targetProjectId && proj.id !== targetProjectId) continue;
+      if (!targetProjectId && !proj.proactiveEnabled) continue;
+
+      const cleanRoot = proj.rootPath === '.' ? '' : proj.rootPath.replace(/^\.\//, '');
+      const projectSymbols = cleanRoot
+        ? scoutIdx.symbols.filter((s) => s.filePath.startsWith(cleanRoot))
+        : scoutIdx.symbols;
+
+      const modifiedForProj = cleanRoot
+        ? git.statusLines.filter((l) => l.includes(cleanRoot)).length
+        : git.statusLines.length;
+
+      const evaluated = evaluateProjectProactivity({
+        project: proj,
+        modifiedGitFilesCount: modifiedForProj,
+        symbolCount: projectSymbols.length,
+        unverifiedContractsCount: unverifiedContracts,
+        pendingDotsCount: pendingDots,
+        nowIso,
+      });
+
+      proj.gitBranch = git.branch || proj.gitBranch || 'main';
+      proj.symbolCount = projectSymbols.length;
+      proj.healthScore = evaluated.healthScore;
+      proj.lastProactiveAt = nowIso;
+      proj.proactiveInsights = evaluated.insights;
+
+      const cadencePerHr = Math.max(1, Math.round(3600 / Math.max(30, proj.proactiveIntervalSec || 90)));
+      const freqSample = Number(
+        Math.min(
+          24,
+          Math.max(1.8, evaluated.insights.length * 2.5 + Math.min(5, cadencePerHr * 0.12))
+        ).toFixed(1)
+      );
+      const prevHist = Array.isArray(proj.proactiveFrequencyHistory)
+        ? proj.proactiveFrequencyHistory
+        : [];
+      proj.proactiveFrequencyHistory = [...prevHist, freqSample].slice(-12);
+
+      updatedProjects.push({ ...proj });
+    }
+
+    for (const plug of draft.plugins || []) {
+      if (plug.enabled && plug.installed && plug.hook === 'ON_PROACTIVE_SCAN' && updatedProjects.length > 0) {
+        plug.invocationsCount = (plug.invocationsCount || 0) + 1;
+        plug.lastTriggeredAt = nowIso;
+      }
+    }
+  });
+
+  if (updatedProjects.length > 0) {
+    sseBroadcast('proactive_scan', {
+      scannedCount: updatedProjects.length,
+      projects: updatedProjects,
+      timestamp: nowIso,
+    });
+  }
+
+  return updatedProjects;
 }

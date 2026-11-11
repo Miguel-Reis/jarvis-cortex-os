@@ -1,6 +1,7 @@
 import { db } from './db.ts';
 import { collectOSTelemetry, executeGovernedCommand } from './os-adapter.ts';
 import { synthesizeBriefText } from './gemini-engine.ts';
+import { runProjectProactiveScan } from './swarm-orbit-engine.ts';
 import type { Workflow, WorkflowRun, WorkflowStepLog } from '../shared/types.ts';
 
 type SseBroadcastFn = (event: string, data: unknown) => void;
@@ -14,13 +15,14 @@ export function registerWorkflowBroadcaster(fn: SseBroadcastFn): void {
 export async function runWorkflowById(
   workflowId: string,
   triggerSource: WorkflowRun['triggerSource'] = 'MANUAL',
-  bypassApproval = false
+  bypassApproval = false,
+  resumedRunId?: string
 ): Promise<WorkflowRun | null> {
   const state = db.getState();
   const wf: Workflow | undefined = state.workflows.find((w) => w.id === workflowId);
   if (!wf) return null;
 
-  const runId = `run-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+  const runId = resumedRunId || `run-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
   const startedAt = new Date().toISOString();
   const steps: WorkflowStepLog[] = [];
   let overallStatus: WorkflowRun['status'] = 'SUCCESS';
@@ -174,8 +176,15 @@ export async function runWorkflowById(
   };
 
   db.update((draft) => {
-    draft.workflowRuns.unshift(runRecord);
-    if (draft.workflowRuns.length > 60) draft.workflowRuns.length = 60;
+    const existingIdx = resumedRunId
+      ? draft.workflowRuns.findIndex((r) => r.id === resumedRunId)
+      : -1;
+    if (existingIdx >= 0) {
+      draft.workflowRuns[existingIdx] = runRecord;
+    } else {
+      draft.workflowRuns.unshift(runRecord);
+      if (draft.workflowRuns.length > 60) draft.workflowRuns.length = 60;
+    }
     const targetWf = draft.workflows.find((item) => item.id === wf.id);
     if (targetWf) {
       targetWf.lastRunAt = finishedAt;
@@ -238,6 +247,10 @@ export function startOrRefreshHeartbeatDaemon(activePort = 3000): void {
           draft.heartbeat.recentAlerts.length = 20;
         }
       });
+
+      if (db.getState().settings.proactiveGlobalEnabled !== false) {
+        await runProjectProactiveScan().catch(() => {});
+      }
 
       broadcastCallback('heartbeat', {
         timestamp: nowIso,

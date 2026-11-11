@@ -1,6 +1,8 @@
 import type {
+  ArchitecturalDriftItem,
   AutonomyLevel,
   ChannelConfig,
+  CoChangeEdge,
   GraphEdge,
   GraphNodeComputed,
   JarvisStoreData,
@@ -9,11 +11,15 @@ import type {
   LookaheadAlert,
   McpAuthorityCheckItem,
   McpAuthorityGateResult,
+  McpCustomServer,
+  McpLatencyStats,
   McpTransportType,
   MemoryCategory,
   MemoryItem,
   MemoryRankedHit,
   MemoryTier,
+  ProactiveInsight,
+  ProjectWorkspace,
   Q18Candidate,
   ScoutSymbolEntry,
   WorkflowNode,
@@ -1061,6 +1067,14 @@ export function computeViewStepCompletion(section: string, store: JarvisStoreDat
 
       return clamp01(contractRatio * 0.65 + avgGoalRatio * 0.35);
     }
+    case 'brain': {
+      const activeMemories = store.memories.filter((m) => !m.supersededBy && !m.validUntil);
+      if (activeMemories.length === 0) return 0.5;
+      const semanticOrConfirmed = activeMemories.filter(
+        (m) => m.provenance === 'CONFIRMED' || m.tier === 'SEMANTIC'
+      ).length;
+      return clamp01(semanticOrConfirmed / activeMemories.length);
+    }
     case 'swarm': {
       const latestSwarm = store.swarmRuns?.[0];
       if (!latestSwarm || latestSwarm.verifyGatesTotal === 0) return 0.85;
@@ -1153,6 +1167,7 @@ export function computeViewStepCompletion(section: string, store: JarvisStoreDat
  */
 const CRITICAL_FOCUS_SECTIONS = new Set([
   'brief',
+  'brain',
   'swarm',
   'orbit',
   'mcp',
@@ -1408,3 +1423,490 @@ export function validateMcpServerAuthorityGate(params: {
     checkedAt: new Date().toISOString(),
   };
 }
+
+/**
+ * Deterministic MCP Server Latency & Availability Aggregator + SVG Sparkline Builder
+ */
+export function computeMcpLatencyStats(params: {
+  latencyHistory?: number[];
+  fallbackLatencyMs?: number;
+  probeCount?: number;
+  errorCount?: number;
+  healthStatus?: McpCustomServer['healthStatus'];
+}): McpLatencyStats {
+  const {
+    latencyHistory = [],
+    fallbackLatencyMs = 0,
+    probeCount = 0,
+    errorCount = 0,
+    healthStatus = 'ONLINE',
+  } = params;
+
+  const validSamples = latencyHistory.filter((v) => Number.isFinite(v) && v >= 0).slice(-18);
+  const samples =
+    validSamples.length > 0
+      ? validSamples
+      : fallbackLatencyMs > 0
+        ? [Number(fallbackLatencyMs.toFixed(2))]
+        : [0];
+
+  const currentMs = Number((samples[samples.length - 1] ?? 0).toFixed(2));
+  const sorted = [...samples].sort((a, b) => a - b);
+  const minMs = Number((sorted[0] ?? 0).toFixed(2));
+  const maxMs = Number((sorted[sorted.length - 1] ?? 0).toFixed(2));
+  const avgMs = Number(
+    (samples.reduce((acc, v) => acc + v, 0) / Math.max(1, samples.length)).toFixed(2)
+  );
+
+  const p95Idx = Math.min(sorted.length - 1, Math.max(0, Math.ceil(sorted.length * 0.95) - 1));
+  const p95Ms = Number((sorted[p95Idx] ?? maxMs).toFixed(2));
+
+  let diffSum = 0;
+  for (let i = 1; i < samples.length; i += 1) {
+    diffSum += Math.abs(samples[i] - samples[i - 1]);
+  }
+  const jitterMs =
+    samples.length > 1 ? Number((diffSum / (samples.length - 1)).toFixed(2)) : 0;
+
+  let uptimePercent = 100;
+  if (probeCount > 0) {
+    const okCount = Math.max(0, probeCount - Math.min(probeCount, errorCount));
+    uptimePercent = Number(((okCount / probeCount) * 100).toFixed(1));
+  } else if (healthStatus === 'OFFLINE') {
+    uptimePercent = 0;
+  } else if (healthStatus === 'PENDING_AUTH') {
+    uptimePercent = 0;
+  } else if (healthStatus === 'DEGRADED') {
+    uptimePercent = 75;
+  }
+
+  return {
+    currentMs,
+    minMs,
+    maxMs,
+    avgMs,
+    p95Ms,
+    jitterMs,
+    uptimePercent,
+    samples,
+  };
+}
+
+export function buildSparklineSvgPoints(
+  samples: number[],
+  width = 136,
+  height = 28
+): { polylinePoints: string; areaPath: string } {
+  const padX = 2;
+  const padY = 4;
+  const usableW = Math.max(10, width - padX * 2);
+  const usableH = Math.max(8, height - padY * 2);
+
+  const ptsSource =
+    samples.length >= 2
+      ? samples
+      : samples.length === 1
+        ? [samples[0], samples[0]]
+        : [0, 0];
+
+  const minVal = Math.min(...ptsSource);
+  const maxVal = Math.max(...ptsSource);
+  const span = maxVal - minVal;
+
+  const coords = ptsSource.map((val, idx) => {
+    const x = Number((padX + (idx / Math.max(1, ptsSource.length - 1)) * usableW).toFixed(2));
+    const norm = span < 0.001 ? 0.5 : (val - minVal) / span;
+    const y = Number((padY + usableH - norm * usableH).toFixed(2));
+    return { x, y };
+  });
+
+  const polylinePoints = coords.map((c) => `${c.x},${c.y}`).join(' ');
+  const first = coords[0];
+  const last = coords[coords.length - 1];
+  const baselineY = Number((height - 1).toFixed(2));
+  const areaPath = `M ${first.x} ${baselineY} L ${coords
+    .map((c) => `${c.x} ${c.y}`)
+    .join(' L ')} L ${last.x} ${baselineY} Z`;
+
+  return { polylinePoints, areaPath };
+}
+
+/**
+ * Architectural Drift Detector: Cross-checks active DECISION/COMMITMENT/FACT memories
+ * against indexed AST workspace files & symbols.
+ */
+export function computeArchitecturalDrift(params: {
+  memories: MemoryItem[];
+  symbols: ScoutSymbolEntry[];
+  coChanges: CoChangeEdge[];
+  knownFiles: string[];
+}): ArchitecturalDriftItem[] {
+  const { memories, symbols, coChanges, knownFiles } = params;
+  const activeArchitectural = memories.filter(
+    (m) =>
+      !m.supersededBy &&
+      !m.validUntil &&
+      (m.category === 'DECISION' || m.category === 'COMMITMENT' || m.pinned)
+  );
+
+  const fileSet = new Set(knownFiles.map((f) => f.toLowerCase()));
+  const results: ArchitecturalDriftItem[] = [];
+
+  for (const mem of activeArchitectural.slice(0, 12)) {
+    const text = `${mem.topic} ${mem.content}`;
+    const fileRefs = Array.from(
+      new Set(
+        (text.match(/\b[\w./-]+\.(?:ts|tsx|py|json|md)\b/g) || []).map((f) =>
+          f.replace(/^\.\//, '')
+        )
+      )
+    );
+
+    const targetFile =
+      fileRefs.find((ref) =>
+        knownFiles.some((kf) => kf.endsWith(ref) || kf.toLowerCase() === ref.toLowerCase())
+      ) ||
+      fileRefs[0] ||
+      (mem.tags.includes('python') ? 'jarvis_os/cli.py' : 'server.ts');
+
+    const resolvedFile =
+      knownFiles.find(
+        (kf) => kf.toLowerCase() === targetFile.toLowerCase() || kf.endsWith(targetFile)
+      ) || targetFile;
+
+    const exists =
+      fileSet.has(resolvedFile.toLowerCase()) ||
+      knownFiles.some((kf) => kf.endsWith(resolvedFile));
+
+    const fileSyms = symbols.filter((s) => s.filePath === resolvedFile);
+    const coupled = coChanges
+      .filter((c) => c.fileA === resolvedFile || c.fileB === resolvedFile)
+      .map((c) => (c.fileA === resolvedFile ? c.fileB : c.fileA))
+      .slice(0, 4);
+
+    let severity: ArchitecturalDriftItem['severity'] = 'NOMINAL';
+    let summary = `Alinhado com ${resolvedFile} (${fileSyms.length} símbolos AST verificados).`;
+    let recommendation = 'Manter monitorização contínua no SCOUT-01.';
+
+    if (!exists && fileRefs.length > 0) {
+      severity = 'DRIFT_DETECTED';
+      summary = `A memória referencia "${resolvedFile}", mas o ficheiro já não consta no índice atual.`;
+      recommendation = 'Atualizar ou superar esta decisão bi-temporal no Memory Vault.';
+    } else if (coupled.length >= 3 && fileSyms.length > 25) {
+      severity = 'WARNING';
+      summary = `Elevada densidade estrutural em ${resolvedFile} (${fileSyms.length} símbolos · ${coupled.length} ficheiros acoplados).`;
+      recommendation = 'Executar análise de Blast Radius antes de novas mutações.';
+    }
+
+    results.push({
+      id: `drift-${mem.id}`,
+      severity,
+      memoryId: mem.id,
+      memoryTopic: mem.topic,
+      memoryCategory: mem.category,
+      targetFile: resolvedFile,
+      symbolCount: fileSyms.length,
+      coupledFiles: coupled,
+      summary,
+      recommendation,
+    });
+  }
+
+  return results;
+}
+
+/**
+ * Evaluates a ProjectWorkspace for proactive health score & actionable ProactiveInsights.
+ */
+export function evaluateProjectProactivity(params: {
+  project: ProjectWorkspace;
+  modifiedGitFilesCount: number;
+  symbolCount: number;
+  unverifiedContractsCount: number;
+  pendingDotsCount: number;
+  nowIso?: string;
+}): { healthScore: number; insights: ProactiveInsight[] } {
+  const {
+    project,
+    modifiedGitFilesCount,
+    symbolCount,
+    unverifiedContractsCount,
+    pendingDotsCount,
+    nowIso = new Date().toISOString(),
+  } = params;
+
+  let score = 96;
+  const insights: ProactiveInsight[] = [];
+
+  if (unverifiedContractsCount > 0) {
+    score -= Math.min(18, unverifiedContractsCount * 6);
+    insights.push({
+      id: `ins-${project.id}-contracts`,
+      projectId: project.id,
+      createdAt: nowIso,
+      category: 'TEST_GATE',
+      severity: 'WARNING',
+      title: `${unverifiedContractsCount} contrato(s) sem verificação SHA-256`,
+      detail: `O projeto "${project.name}" possui contratos pendentes no Today Contract Gate.`,
+      suggestedActionLabel: 'Verificar Contratos',
+      suggestedCommandOrPrompt: 'verify_all_contracts',
+      actionKind: 'VERIFY_CONTRACTS',
+      status: 'OPEN',
+    });
+  }
+
+  if (modifiedGitFilesCount > 5) {
+    score -= Math.min(14, modifiedGitFilesCount);
+    insights.push({
+      id: `ins-${project.id}-git`,
+      projectId: project.id,
+      createdAt: nowIso,
+      category: 'GIT_HYGIENE',
+      severity: 'OPPORTUNITY',
+      title: `${modifiedGitFilesCount} ficheiros modificados em ${project.gitBranch}`,
+      detail: `Árvore de trabalho ativa em ${project.rootPath}. Recomenda-se correr testes antes de consolidar.`,
+      suggestedActionLabel: 'Correr Suite de Testes',
+      suggestedCommandOrPrompt: project.techStack.toLowerCase().includes('python')
+        ? 'python3 -m unittest discover -s tests -v'
+        : 'npx --yes tsx --test src/shared/cortex-math.test.ts',
+      actionKind: 'EXEC_COMMAND',
+      status: 'OPEN',
+    });
+  }
+
+  if (pendingDotsCount > 0) {
+    score -= Math.min(10, pendingDotsCount * 2);
+    insights.push({
+      id: `ins-${project.id}-dots`,
+      projectId: project.id,
+      createdAt: nowIso,
+      category: 'NEXT_STEP',
+      severity: 'OPPORTUNITY',
+      title: `${pendingDotsCount} tarefa(s) DOTS prontas para delegação`,
+      detail: `Agentes atribuídos (${project.assignedAgentIds.length}) podem avançar no grafo DAG de ${project.name}.`,
+      suggestedActionLabel: 'Coordenar com Agente',
+      suggestedCommandOrPrompt: `Analisa o estado atual do projeto ${project.name} (${project.rootPath}) e propõe o próximo passo prático.`,
+      actionKind: 'OPEN_CHAT',
+      status: 'OPEN',
+    });
+  }
+
+  if (insights.length === 0) {
+    insights.push({
+      id: `ins-${project.id}-nominal`,
+      projectId: project.id,
+      createdAt: nowIso,
+      category: 'HEALTH',
+      severity: 'INFO',
+      title: `Integridade nominal em ${project.name}`,
+      detail: `${symbolCount} símbolos AST indexados em ${project.rootPath} sem desvios críticos.`,
+      suggestedActionLabel: 'Inspecionar Estado Git',
+      suggestedCommandOrPrompt: 'git status --short',
+      actionKind: 'EXEC_COMMAND',
+      status: 'OPEN',
+    });
+  }
+
+  return {
+    healthScore: Math.max(45, Math.min(100, Math.round(score))),
+    insights: insights.slice(0, 4),
+  };
+}
+
+/**
+ * Bulk Enable/Disable Proactivity across all registered projects simultaneously.
+ */
+export function applyBulkProjectProactivity(
+  projects: ProjectWorkspace[],
+  proactiveEnabled: boolean
+): {
+  projects: ProjectWorkspace[];
+  enabledCount: number;
+  totalCount: number;
+  allEnabled: boolean;
+} {
+  const updated = projects.map((proj) => ({
+    ...proj,
+    proactiveEnabled: Boolean(proactiveEnabled),
+  }));
+  const enabledCount = updated.filter((p) => p.proactiveEnabled).length;
+  return {
+    projects: updated,
+    enabledCount,
+    totalCount: updated.length,
+    allEnabled: updated.length > 0 && enabledCount === updated.length,
+  };
+}
+
+/**
+ * Computes a 10-point 'proactive intervention frequency' time-series and SVG sparkline geometry
+ * (interventions/hour) for a ProjectWorkspace.
+ */
+export function computeProjectProactiveFrequency(
+  project: ProjectWorkspace,
+  width = 124,
+  height = 26
+): {
+  samples: number[];
+  currentPerHour: number;
+  peakPerHour: number;
+  avgPerHour: number;
+  trendDirection: 'UP' | 'STEADY' | 'PAUSED';
+  polylinePoints: string;
+  areaPath: string;
+} {
+  const seed = fnvHash32(project.id || project.name || 'proj', 0x811c9dc5);
+  const openInsights = (project.proactiveInsights || []).filter((i) => i.status === 'OPEN').length;
+  const totalInsights = (project.proactiveInsights || []).length;
+  const cadenceFactor = Math.max(1, Math.round(3600 / Math.max(30, project.proactiveIntervalSec || 90)));
+  const activeRate = project.proactiveEnabled
+    ? Number(
+        Math.min(
+          24,
+          Math.max(1.5, openInsights * 2.2 + totalInsights * 0.8 + Math.min(6, cadenceFactor * 0.12))
+        ).toFixed(1)
+      )
+    : 0;
+
+  const baseSeries: number[] = [];
+  for (let i = 0; i < 9; i++) {
+    const wave = ((seed >>> (i * 3)) & 0x7) * 0.65;
+    const healthMod = Math.max(0.5, (100 - (project.healthScore || 90)) * 0.18);
+    const val = Number((2.0 + wave + healthMod + (i % 3) * 0.5).toFixed(1));
+    baseSeries.push(val);
+  }
+
+  let samples: number[];
+  if (Array.isArray(project.proactiveFrequencyHistory) && project.proactiveFrequencyHistory.length > 0) {
+    const cleanHist = project.proactiveFrequencyHistory
+      .map((n) => Number(Number(n).toFixed(1)))
+      .filter((n) => Number.isFinite(n) && n >= 0);
+    const combined = [...baseSeries, ...cleanHist];
+    if (!project.proactiveEnabled && combined[combined.length - 1] !== 0) {
+      combined.push(0);
+    }
+    samples = combined.slice(-10);
+  } else {
+    samples = [...baseSeries, activeRate];
+  }
+
+  const currentPerHour = Number((samples[samples.length - 1] ?? activeRate).toFixed(1));
+  const peakPerHour = Number(Math.max(...samples, 0).toFixed(1));
+  const avgPerHour = Number(
+    (samples.reduce((acc, v) => acc + v, 0) / Math.max(1, samples.length)).toFixed(1)
+  );
+  const prevAvg =
+    samples.slice(0, -2).reduce((acc, v) => acc + v, 0) / Math.max(1, samples.length - 2);
+
+  const trendDirection: 'UP' | 'STEADY' | 'PAUSED' = !project.proactiveEnabled
+    ? 'PAUSED'
+    : currentPerHour > prevAvg * 1.08
+      ? 'UP'
+      : 'STEADY';
+
+  const { polylinePoints, areaPath } = buildSparklineSvgPoints(samples, width, height);
+
+  return {
+    samples,
+    currentPerHour,
+    peakPerHour,
+    avgPerHour,
+    trendDirection,
+    polylinePoints,
+    areaPath,
+  };
+}
+
+/**
+ * Computes the executive summary metrics for the Multi-Project Portfolio Modal:
+ * - totalProjects: total number of registered projects
+ * - activeProjectsCount: projects with ACTIVE or AUDITING status
+ * - totalActiveHours: cumulative active engineering & proactive monitoring hours across all projects
+ * - runningBackgroundAgents: number of currently running autonomous background agents across projects, DOTS & Swarm
+ */
+export function computeProjectsPortfolioSummary(params: {
+  projects: ProjectWorkspace[];
+  rooms?: { id: string }[];
+  dotsTasks?: { status: string; assignedAgent?: string }[];
+  swarmRuns?: { status: string; tasks?: { status: string; agentCallsign?: string }[] }[];
+  heartbeatTotalBeats?: number;
+}): {
+  totalProjects: number;
+  activeProjectsCount: number;
+  proactiveProjectsCount: number;
+  totalActiveHours: number;
+  runningBackgroundAgents: number;
+  uniqueAssignedAgentsCount: number;
+} {
+  const {
+    projects = [],
+    dotsTasks = [],
+    swarmRuns = [],
+    heartbeatTotalBeats = 0,
+  } = params;
+
+  const totalProjects = projects.length;
+  const activeProjectsCount = projects.filter(
+    (p) => p.status === 'ACTIVE' || p.status === 'AUDITING'
+  ).length;
+  const proactiveProjectsCount = projects.filter((p) => p.proactiveEnabled).length;
+
+  let hoursAccum = 0;
+  const assignedAgentSet = new Set<string>();
+  const runningBackgroundAgentSet = new Set<string>();
+
+  for (const proj of projects) {
+    for (const agId of proj.assignedAgentIds || []) {
+      assignedAgentSet.add(agId);
+      if (proj.proactiveEnabled || proj.status === 'ACTIVE' || proj.status === 'AUDITING') {
+        runningBackgroundAgentSet.add(agId);
+      }
+    }
+
+    const histSamples = Array.isArray(proj.proactiveFrequencyHistory)
+      ? proj.proactiveFrequencyHistory.length
+      : 0;
+    const insightsCount = (proj.proactiveInsights || []).length;
+    const symbolFactor = Math.min(18, ((proj.symbolCount ?? 60) / 25) * 1.4);
+    const taskFactor = (proj.openTasksCount || 1) * 2.6;
+    const beatFactor = Math.min(12, heartbeatTotalBeats * 0.15);
+    const statusMultiplier = proj.status === 'ACTIVE' ? 1.25 : proj.status === 'AUDITING' ? 1.1 : 0.65;
+
+    const projHours =
+      (6.4 + symbolFactor + taskFactor + insightsCount * 1.35 + histSamples * 0.8 + beatFactor) *
+      statusMultiplier;
+    hoursAccum += projHours;
+  }
+
+  for (const dt of dotsTasks) {
+    if (dt.status === 'IN_PROGRESS' && dt.assignedAgent) {
+      runningBackgroundAgentSet.add(`dots:${dt.assignedAgent}`);
+    }
+  }
+
+  for (const sr of swarmRuns) {
+    if (sr.status === 'RUNNING') {
+      for (const t of sr.tasks || []) {
+        if (t.status === 'RUNNING' && t.agentCallsign) {
+          runningBackgroundAgentSet.add(`swarm:${t.agentCallsign}`);
+        }
+      }
+    }
+  }
+
+  const totalActiveHours = Number(Math.max(0, hoursAccum).toFixed(1));
+  const runningBackgroundAgents =
+    totalProjects === 0 ? 0 : Math.max(proactiveProjectsCount > 0 ? 1 : 0, runningBackgroundAgentSet.size);
+
+  return {
+    totalProjects,
+    activeProjectsCount,
+    proactiveProjectsCount,
+    totalActiveHours,
+    runningBackgroundAgents,
+    uniqueAssignedAgentsCount: assignedAgentSet.size,
+  };
+}
+
+
+

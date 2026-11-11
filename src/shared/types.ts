@@ -86,11 +86,15 @@ export interface RoutineCue {
 export interface Room {
   id: string;
   name: string;
+  callsign?: string;
   roleTitle: string;
   description: string;
   systemPrompt: string;
-  accentColor: 'cyan' | 'amber' | 'emerald' | 'rose';
+  accentColor: 'cyan' | 'amber' | 'emerald' | 'rose' | 'violet';
   allowedTools: string[];
+  projectId?: string;
+  modelOverride?: string;
+  isCustom?: boolean;
 }
 
 export interface AttachmentItem {
@@ -108,6 +112,7 @@ export interface ToolCallRecord {
   status: 'SUCCESS' | 'PENDING_APPROVAL' | 'ERROR';
   outputSummary: string;
   durationMs: number;
+  mcpServerName?: string;
 }
 
 export type MemoryTier = 'WORKING' | 'EPISODIC' | 'SEMANTIC';
@@ -210,6 +215,8 @@ export interface WorkflowRun {
   totalDurationMs: number;
   steps: WorkflowStepLog[];
   pendingApprovalId?: string;
+  autoHealSandboxId?: string;
+  autoHealSummary?: string;
 }
 
 export interface HeartbeatAlert {
@@ -290,12 +297,137 @@ export interface SkillItem {
   id: string;
   name: string;
   slug: string;
+  category?: 'ENGINEERING' | 'SECURITY' | 'MEMORY' | 'DEVOPS' | 'PRODUCTIVITY' | 'CUSTOM';
   description: string;
   enabled: boolean;
   systemInstruction: string;
   allowedTools: string[];
   quickCommand: string;
   version: string;
+  origin?: 'BUILTIN' | 'LIBRARY' | 'CUSTOM';
+}
+
+export interface SkillLibraryTemplate {
+  id: string;
+  name: string;
+  slug: string;
+  category: 'ENGINEERING' | 'SECURITY' | 'MEMORY' | 'DEVOPS' | 'PRODUCTIVITY';
+  description: string;
+  systemInstruction: string;
+  allowedTools: string[];
+  quickCommand: string;
+  version: string;
+  author: string;
+}
+
+export type PluginLifecycleHook =
+  | 'PRE_PROMPT'
+  | 'POST_TURN'
+  | 'ON_HEARTBEAT'
+  | 'ON_PROACTIVE_SCAN'
+  | 'SIDECAR_BRIDGE'
+  | 'SECURITY_GATE';
+
+export interface PluginItem {
+  id: string;
+  name: string;
+  slug: string;
+  category: 'SIDECAR' | 'COGNITION' | 'SECURITY' | 'WORKFLOW' | 'TELEMETRY';
+  description: string;
+  version: string;
+  author: string;
+  hook: PluginLifecycleHook;
+  enabled: boolean;
+  installed: boolean;
+  config: Record<string, string>;
+  invocationsCount: number;
+  lastTriggeredAt?: string;
+}
+
+export interface AgentTemplate {
+  id: string;
+  name: string;
+  callsign: string;
+  roleTitle: string;
+  description: string;
+  accentColor: Room['accentColor'];
+  systemPrompt: string;
+  allowedTools: string[];
+}
+
+export interface ProactiveInsight {
+  id: string;
+  projectId: string;
+  createdAt: string;
+  category: 'HEALTH' | 'GIT_HYGIENE' | 'TEST_GATE' | 'AST_DRIFT' | 'NEXT_STEP';
+  severity: 'INFO' | 'OPPORTUNITY' | 'WARNING';
+  title: string;
+  detail: string;
+  suggestedActionLabel: string;
+  suggestedCommandOrPrompt: string;
+  actionKind: 'EXEC_COMMAND' | 'OPEN_CHAT' | 'RUN_WORKFLOW' | 'VERIFY_CONTRACTS';
+  status: 'OPEN' | 'EXECUTED' | 'DISMISSED';
+}
+
+export interface ProjectWorkspace {
+  id: string;
+  name: string;
+  slug: string;
+  rootPath: string;
+  techStack: string;
+  gitBranch: string;
+  description: string;
+  status: 'ACTIVE' | 'STANDBY' | 'AUDITING';
+  proactiveEnabled: boolean;
+  proactiveIntervalSec: number;
+  healthScore: number;
+  openTasksCount: number;
+  symbolCount?: number;
+  assignedAgentIds: string[];
+  lastProactiveAt?: string;
+  proactiveFrequencyHistory?: number[];
+  proactiveInsights: ProactiveInsight[];
+}
+
+export interface SidecarWindowEntry {
+  hwnd: number;
+  title: string;
+  process: string;
+  status?: string;
+}
+
+export interface SidecarProcessEntry {
+  pid: number;
+  name: string;
+  cpuPercent: number;
+  memPercent: number;
+  commandLine: string;
+}
+
+export interface SidecarHostCommandRecord {
+  id: string;
+  deviceId: string;
+  deviceName: string;
+  kind: 'HOTKEY' | 'HOST_EXEC' | 'DIAGNOSTIC' | 'WINDOW_SCAN';
+  actionOrCommand: string;
+  status: 'EXECUTED' | 'QUEUED_REMOTE' | 'PENDING_APPROVAL' | 'BLOCKED';
+  output: string;
+  durationMs: number;
+  timestamp: string;
+}
+
+export interface SidecarHostSnapshot {
+  deviceId: string;
+  hostname: string;
+  platform: string;
+  arch: string;
+  pythonSidecarAvailable: boolean;
+  wakePhrases: string[];
+  supportedHotkeys: { combo: string; action: string; description: string }[];
+  activeWindows: SidecarWindowEntry[];
+  topProcesses: SidecarProcessEntry[];
+  recentCommands: SidecarHostCommandRecord[];
+  sampledAt: string;
 }
 
 export type ChannelPlatform = 'TELEGRAM' | 'DISCORD' | 'WEBHOOK' | 'SLACK';
@@ -370,7 +502,8 @@ export interface ApprovalRequest {
     | 'WORKSPACE_TERMINAL'
     | 'EXTERNAL_CHANNEL'
     | 'SWARM_SANDBOX'
-    | 'MCP_GATEWAY';
+    | 'MCP_GATEWAY'
+    | 'SIDECAR_HOST';
   riskLevel: 'MEDIUM' | 'HIGH' | 'CRITICAL';
   requestedAt: string;
   status: 'PENDING' | 'APPROVED_ONCE' | 'APPROVED_ALWAYS' | 'BLOCKED';
@@ -392,7 +525,9 @@ export interface AuditLogEntry {
     | 'SYSTEM'
     | 'SWARM'
     | 'ORBIT'
-    | 'MCP';
+    | 'MCP'
+    | 'PROJECT'
+    | 'SIDECAR';
   action: string;
   detail: string;
   status: 'ALLOWED' | 'BLOCKED' | 'VERIFIED';
@@ -446,6 +581,51 @@ export interface SandboxFileSnapshot {
   sha256Before: string;
   sha256After?: string;
   bytesBefore: number;
+}
+
+export interface SandboxDiffLine {
+  type: 'context' | 'added' | 'removed';
+  beforeLine: number | null;
+  afterLine: number | null;
+  content: string;
+}
+
+export interface SandboxFileDiff {
+  filePath: string;
+  existedBefore: boolean;
+  existsNow: boolean;
+  sha256Before: string;
+  sha256Current: string;
+  bytesBefore: number;
+  bytesCurrent: number;
+  changed: boolean;
+  addedCount: number;
+  removedCount: number;
+  lines: SandboxDiffLine[];
+}
+
+export interface SandboxDiffReport {
+  sandboxId: string;
+  label: string;
+  status: SubagentSandbox['status'];
+  inspectedAt: string;
+  changedFilesCount: number;
+  totalAddedLines: number;
+  totalRemovedLines: number;
+  files: SandboxFileDiff[];
+}
+
+export interface ArchitecturalDriftItem {
+  id: string;
+  severity: 'NOMINAL' | 'WARNING' | 'DRIFT_DETECTED';
+  memoryId: string;
+  memoryTopic: string;
+  memoryCategory: MemoryCategory;
+  targetFile: string;
+  symbolCount: number;
+  coupledFiles: string[];
+  summary: string;
+  recommendation: string;
 }
 
 export interface SubagentSandbox {
@@ -579,11 +759,15 @@ export interface AppSettings {
   openRouterEndpoint: string;
   openRouterModel: string;
   antigravityBrainUrl: string;
+  antigravityBrainSqlitePath?: string;
   alwaysApprovedCommands: string[];
   onboardingCompleted: boolean;
   wakeWordEnabled: boolean;
   voiceDspEnabled: boolean;
   focusModeEnabled: boolean;
+  proactiveGlobalEnabled?: boolean;
+  proactiveCadenceSec?: number;
+  sidecarDirectControlEnabled?: boolean;
 }
 
 export type McpTransportType = 'HTTP_STREAMABLE' | 'SSE' | 'STDIO';
@@ -648,6 +832,17 @@ export interface McpAuthorityGateResult {
   checkedAt: string;
 }
 
+export interface McpLatencyStats {
+  currentMs: number;
+  minMs: number;
+  maxMs: number;
+  avgMs: number;
+  p95Ms: number;
+  jitterMs: number;
+  uptimePercent: number;
+  samples: number[];
+}
+
 export interface McpCustomServer {
   id: string;
   name: string;
@@ -664,6 +859,10 @@ export interface McpCustomServer {
   authStatus: 'AUTHORIZED' | 'PENDING_APPROVAL';
   healthStatus: 'ONLINE' | 'DEGRADED' | 'OFFLINE' | 'PENDING_AUTH';
   lastLatencyMs: number;
+  latencyHistory?: number[];
+  probeCount?: number;
+  errorCount?: number;
+  lastRpcMethod?: string;
   discoveredTools: string[];
   lastCheckedAt: string;
   lastError?: string;
@@ -688,6 +887,8 @@ export interface McpStandardLibraryItem {
 
 export interface JarvisStoreData {
   settings: AppSettings;
+  projects?: ProjectWorkspace[];
+  activeProjectId?: string;
   goals: GoalItem[];
   contracts: TodayContractItem[];
   candidates: Q18Candidate[];
@@ -701,9 +902,11 @@ export interface JarvisStoreData {
   memories: MemoryItem[];
   graphEdges: GraphEdge[];
   skills: SkillItem[];
+  plugins?: PluginItem[];
   channels: ChannelConfig[];
   devices: DeviceNode[];
   enrollmentTokens: EnrollmentToken[];
+  sidecarCommandQueue?: SidecarHostCommandRecord[];
   approvals: ApprovalRequest[];
   auditLogs: AuditLogEntry[];
   // v3.0 Swarm 48x + Orbit Agent OS Collections

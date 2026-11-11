@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
+import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
 import { Box, Compass, Eye, Layers, RotateCcw } from 'lucide-react';
 import type { SwarmLane, SwarmRun } from '../shared/types';
 
@@ -104,10 +105,25 @@ export const SwarmOffice3D: React.FC<SwarmOffice3DProps> = ({
     const container = containerRef.current;
     if (!container) return;
 
+    const isSoftwareGl = (() => {
+      try {
+        const probeCanvas = document.createElement('canvas');
+        const gl = probeCanvas.getContext('webgl2') || probeCanvas.getContext('webgl');
+        if (!gl) return true;
+        const ext = gl.getExtension('WEBGL_debug_renderer_info');
+        const param = ext ? ext.UNMASKED_RENDERER_WEBGL : gl.RENDERER;
+        const gpu = String(gl.getParameter(param));
+        gl.getExtension('WEBGL_lose_context')?.loseContext();
+        return /SwiftShader|llvmpipe|softpipe|Software|Basic Render/i.test(gpu);
+      } catch {
+        return true;
+      }
+    })();
+
     let renderer: THREE.WebGLRenderer;
     try {
       renderer = new THREE.WebGLRenderer({
-        antialias: true,
+        antialias: !isSoftwareGl,
         powerPreference: 'high-performance',
       });
     } catch {
@@ -118,26 +134,40 @@ export const SwarmOffice3D: React.FC<SwarmOffice3DProps> = ({
     const width = container.clientWidth || 880;
     const height = container.clientHeight || 390;
 
-    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
+    renderer.setPixelRatio(isSoftwareGl ? 1 : Math.min(window.devicePixelRatio || 1, 2));
     renderer.setSize(width, height);
-    renderer.shadowMap.enabled = true;
-    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    renderer.shadowMap.enabled = !isSoftwareGl;
+    renderer.shadowMap.type = THREE.PCFShadowMap;
     renderer.toneMapping = THREE.ACESFilmicToneMapping;
     renderer.toneMappingExposure = 1.12;
 
     container.innerHTML = '';
     container.appendChild(renderer.domElement);
 
+    const onContextLost = (ev: Event) => {
+      ev.preventDefault();
+      setWebglFallback(true);
+    };
+    renderer.domElement.addEventListener('webglcontextlost', onContextLost);
+
     const scene = new THREE.Scene();
     scene.background = new THREE.Color(0x07090e);
     scene.fog = new THREE.FogExp2(0x07090e, 0.021);
+
+    const pmremGenerator = new THREE.PMREMGenerator(renderer);
+    const roomEnv = new RoomEnvironment();
+    const envTarget = pmremGenerator.fromScene(roomEnv, 0.04);
+    scene.environment = envTarget.texture;
+    roomEnv.dispose();
+    pmremGenerator.dispose();
 
     const camera = new THREE.PerspectiveCamera(42, width / height, 0.1, 140);
     camera.position.set(14.5, 12.2, 15.5);
     cameraRef.current = camera;
 
     const controls = new OrbitControls(camera, renderer.domElement);
-    controls.enableDamping = true;
+    controls.enableDamping = !isSoftwareGl;
     controls.dampingFactor = 0.06;
     controls.maxPolarAngle = Math.PI / 2.12;
     controls.minDistance = 7;
@@ -146,7 +176,7 @@ export const SwarmOffice3D: React.FC<SwarmOffice3DProps> = ({
     controls.update();
     controlsRef.current = controls;
 
-    const disposables: { dispose: () => void }[] = [];
+    const disposables: { dispose: () => void }[] = [envTarget];
     const track = <T extends { dispose: () => void }>(item: T): T => {
       disposables.push(item);
       return item;
@@ -399,6 +429,7 @@ export const SwarmOffice3D: React.FC<SwarmOffice3DProps> = ({
 
       instancedHeatmap.instanceMatrix.needsUpdate = true;
       if (instancedHeatmap.instanceColor) instancedHeatmap.instanceColor.needsUpdate = true;
+      instancedHeatmap.computeBoundingSphere();
       instancedHeatmap.userData = { kind: 'heatmap' };
       scene.add(instancedHeatmap);
       pickables.push(instancedHeatmap);
@@ -506,12 +537,38 @@ export const SwarmOffice3D: React.FC<SwarmOffice3DProps> = ({
       resizeObserver.observe(container);
     }
 
-    const timer = new THREE.Clock();
-    let rafId = 0;
+    const timer = new THREE.Timer();
+    let frameId = 0;
+    let disposed = false;
+
+    const afterDraw = (cb: () => void) => {
+      const gl = renderer.getContext() as WebGL2RenderingContext | null;
+      if (!gl || typeof gl.fenceSync !== 'function') {
+        frameId = window.setTimeout(cb, 80);
+        return;
+      }
+      const sync = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0);
+      gl.flush();
+      const poll = () => {
+        if (disposed) {
+          if (sync) gl.deleteSync(sync);
+          return;
+        }
+        const state = sync && gl.getSyncParameter(sync, gl.SYNC_STATUS);
+        if (state === gl.UNSIGNALED) {
+          frameId = window.setTimeout(poll, 5);
+        } else {
+          if (sync) gl.deleteSync(sync);
+          frameId = window.setTimeout(cb, 80);
+        }
+      };
+      frameId = window.setTimeout(poll, 5);
+    };
 
     const animate = () => {
-      rafId = requestAnimationFrame(animate);
-      const elapsed = timer.getElapsedTime();
+      if (disposed) return;
+      timer.update();
+      const elapsed = timer.getElapsed();
 
       scoutCore.rotation.y = elapsed * 0.7;
       scoutCore.position.y = 1.9 + Math.sin(elapsed * 2.1) * 0.12;
@@ -529,12 +586,22 @@ export const SwarmOffice3D: React.FC<SwarmOffice3DProps> = ({
 
       controls.update();
       renderer.render(scene, camera);
+
+      if (isSoftwareGl) {
+        afterDraw(animate);
+      } else {
+        frameId = requestAnimationFrame(animate);
+      }
     };
     animate();
 
     return () => {
-      cancelAnimationFrame(rafId);
+      disposed = true;
+      cancelAnimationFrame(frameId);
+      clearTimeout(frameId);
+      timer.dispose();
       resizeObserver?.disconnect();
+      renderer.domElement.removeEventListener('webglcontextlost', onContextLost);
       renderer.domElement.removeEventListener('pointermove', onPointerMove);
       renderer.domElement.removeEventListener('pointerdown', onPointerDown);
       renderer.domElement.removeEventListener('pointerup', onPointerUp);

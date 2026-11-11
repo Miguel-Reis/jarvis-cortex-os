@@ -12,7 +12,15 @@ import {
   buildDefaultMcpRegistryTools,
   buildSeedMcpServers,
 } from '../shared/mcp-catalog.ts';
-import type { JarvisStoreData, MemoryItem, SwarmLane, SwarmTask } from '../shared/types.ts';
+import { CORTEX_PLUGINS_CATALOG } from '../shared/skills-plugins-catalog.ts';
+import type {
+  JarvisStoreData,
+  MemoryItem,
+  PluginItem,
+  ProjectWorkspace,
+  SwarmLane,
+  SwarmTask,
+} from '../shared/types.ts';
 
 const require = createRequire(import.meta.url);
 
@@ -295,6 +303,114 @@ function buildInitialSeed(): JarvisStoreData {
 
   const seedSwarmTasks = buildInitialSwarmTasks(nowIso);
 
+  const seedProjects: ProjectWorkspace[] = [
+    {
+      id: 'proj-jarvis-core',
+      name: 'J.A.R.V.I.S. Cortex OS v3',
+      slug: 'jarvis-cortex-os',
+      rootPath: '.',
+      techStack: 'TypeScript · React 19 · Express · MCP 2026',
+      gitBranch: 'main',
+      description:
+        'Workspace principal unificado com Swarm 48x, Roteador JEV-S1, Cérebro Bi-Temporal e Gateway MCP 2026.',
+      status: 'ACTIVE',
+      proactiveEnabled: true,
+      proactiveIntervalSec: 90,
+      healthScore: 96,
+      openTasksCount: 3,
+      symbolCount: 148,
+      assignedAgentIds: ['room-exec', 'room-eng', 'room-sidecar'],
+      lastProactiveAt: nowIso,
+      proactiveInsights: [
+        {
+          id: 'ins-seed-core-1',
+          projectId: 'proj-jarvis-core',
+          createdAt: nowIso,
+          category: 'TEST_GATE',
+          severity: 'OPPORTUNITY',
+          title: '2 contratos do dia prontos para verificação empírica SHA-256',
+          detail:
+            'Proatividade ativa detetou contratos Today Contract Gate por validar antes do próximo fecho de ciclo.',
+          suggestedActionLabel: 'Verificar Contratos',
+          suggestedCommandOrPrompt: 'verify_all_contracts',
+          actionKind: 'VERIFY_CONTRACTS',
+          status: 'OPEN',
+        },
+        {
+          id: 'ins-seed-core-2',
+          projectId: 'proj-jarvis-core',
+          createdAt: nowIso,
+          category: 'NEXT_STEP',
+          severity: 'INFO',
+          title: '3 tarefas DOTS prontas para avanço paralelo nas lanes UI/TESTS/DOCS',
+          detail: 'O enxame assimétrico mantém convergência Ruflo EMA 0.962 sem conflitos de ficheiros.',
+          suggestedActionLabel: 'Coordenar com Agente',
+          suggestedCommandOrPrompt:
+            'Analisa as próximas tarefas DOTS do projeto J.A.R.V.I.S. Cortex OS v3 e recomenda o passo imediato.',
+          actionKind: 'OPEN_CHAT',
+          status: 'OPEN',
+        },
+      ],
+    },
+    {
+      id: 'proj-python-kernel',
+      name: 'Kernel Python & Sidecar Nativo',
+      slug: 'jarvis-python-kernel',
+      rootPath: 'jarvis_os',
+      techStack: 'Python 3.11+ · SQLite WAL · Zero-Dep Sidecar',
+      gitBranch: 'main',
+      description:
+        'Núcleo determinístico local (<15ms arranque) com telemetria de kernel, DesktopSidecar e sintetizador Mark-VII.',
+      status: 'ACTIVE',
+      proactiveEnabled: true,
+      proactiveIntervalSec: 120,
+      healthScore: 98,
+      openTasksCount: 1,
+      symbolCount: 46,
+      assignedAgentIds: ['room-sidecar', 'room-devops'],
+      lastProactiveAt: nowIso,
+      proactiveInsights: [
+        {
+          id: 'ins-seed-py-1',
+          projectId: 'proj-python-kernel',
+          createdAt: nowIso,
+          category: 'HEALTH',
+          severity: 'INFO',
+          title: 'Suite Python Zero-Dependency (15 testes) pronta para verificação rápida',
+          detail: 'Monitorização proativa confirmou 0 dependências externas pesadas em jarvis_os/.',
+          suggestedActionLabel: 'Correr Unittest Python',
+          suggestedCommandOrPrompt: 'python3 -m unittest discover -s tests -v',
+          actionKind: 'EXEC_COMMAND',
+          status: 'OPEN',
+        },
+      ],
+    },
+    {
+      id: 'proj-mcp-gateway',
+      name: 'Malha MCP 2026 & Motores Server',
+      slug: 'orbit-mcp-server',
+      rootPath: 'src/server',
+      techStack: 'Node.js 22 · JSON-RPC 2.0 · CoW Sandboxes',
+      gitBranch: 'main',
+      description:
+        'Subsistema backend dedicado a sondas JSON-RPC 2.0, Authority Gate SSRF/stdio e orquestração de enxame.',
+      status: 'STANDBY',
+      proactiveEnabled: false,
+      proactiveIntervalSec: 180,
+      healthScore: 94,
+      openTasksCount: 2,
+      symbolCount: 64,
+      assignedAgentIds: ['room-eng', 'room-research'],
+      proactiveInsights: [],
+    },
+  ];
+
+  const seedPlugins: PluginItem[] = CORTEX_PLUGINS_CATALOG.map((p, idx) => ({
+    ...p,
+    invocationsCount: p.enabled ? 12 + idx * 5 : 0,
+    lastTriggeredAt: p.enabled ? nowIso : undefined,
+  }));
+
   return {
     settings: {
       operatorName: 'Comandante',
@@ -309,6 +425,7 @@ function buildInitialSeed(): JarvisStoreData {
       openRouterEndpoint: 'https://openrouter.ai/api/v1',
       openRouterModel: 'anthropic/claude-3.7-sonnet',
       antigravityBrainUrl: 'http://127.0.0.1:8765',
+      antigravityBrainSqlitePath: '~/.antigravity-brain/brain.db',
       alwaysApprovedCommands: [
         'git status --short',
         'git log -n 5 --oneline',
@@ -320,7 +437,12 @@ function buildInitialSeed(): JarvisStoreData {
       wakeWordEnabled: false,
       voiceDspEnabled: true,
       focusModeEnabled: false,
+      proactiveGlobalEnabled: true,
+      proactiveCadenceSec: 90,
+      sidecarDirectControlEnabled: true,
     },
+    projects: seedProjects,
+    activeProjectId: 'proj-jarvis-core',
     goals: [
       {
         id: 'goal-01',
@@ -536,6 +658,7 @@ function buildInitialSeed(): JarvisStoreData {
       },
       {
         id: 'room-research',
+        callsign: 'HIPPO-CURATOR-04',
         name: 'Pesquisa & HippoRAG 4-Way',
         roleTitle: 'Curador Bi-Temporal & Ebbinghaus',
         description: 'Fusão 4-Way RRF no Memory Vault, linhagem bi-temporal e planeamento DOTS.',
@@ -543,6 +666,23 @@ function buildInitialSeed(): JarvisStoreData {
           'Atua como Analista de Estratégia do J.A.R.V.I.S.: cruza factos bi-temporais do Memory Vault, avalia trade-offs e regista compromissos estruturados.',
         accentColor: 'rose',
         allowedTools: ['search_memories', 'save_memory', 'lookup_ast_symbol'],
+      },
+      {
+        id: 'room-sidecar',
+        callsign: 'SIDECAR-HOST-05',
+        name: 'Controlo Direto Sidecar',
+        roleTitle: 'Operador da Máquina Local · Processos & Hotkeys',
+        description:
+          'Interação direta com o SO onde corre o Sidecar: janelas ativas, processos CPU/RAM, hotkeys e diagnósticos.',
+        systemPrompt:
+          'Atua como Operador Direto da Máquina Sidecar do J.A.R.V.I.S.: usa sidecar_host_control e get_system_telemetry para inspecionar processos, janelas ativas, portas e executar comandos governados na máquina anfitriã.',
+        accentColor: 'violet',
+        allowedTools: [
+          'sidecar_host_control',
+          'get_system_telemetry',
+          'request_shell_approval',
+          'get_git_status',
+        ],
       },
     ],
     messages: [
@@ -759,6 +899,8 @@ function buildInitialSeed(): JarvisStoreData {
         id: 'skill-01',
         name: 'Auditor AST & Testes (SCOUT-01)',
         slug: 'repo-test-auditor',
+        category: 'ENGINEERING',
+        origin: 'BUILTIN',
         description: 'Analisa símbolos :Lstart-end, acoplamento Git Co-Change e executa verificações determinísticas.',
         enabled: true,
         systemInstruction: 'Prioriza evidência empírica de testes e raio de impacto AST antes de sugerir refatorações.',
@@ -770,6 +912,8 @@ function buildInitialSeed(): JarvisStoreData {
         id: 'skill-02',
         name: 'Curador Bi-Temporal 4-Way RRF',
         slug: 'hipporag-curator',
+        category: 'MEMORY',
+        origin: 'BUILTIN',
         description: 'Extrai factos duradouros com superação automática de contradições e curva Ebbinghaus.',
         enabled: true,
         systemInstruction: 'Guarda apenas factos de elevado valor semântico com redação AI-Defence.',
@@ -781,17 +925,21 @@ function buildInitialSeed(): JarvisStoreData {
         id: 'skill-03',
         name: 'Sentinela Windows & Linux Sidecar',
         slug: 'os-sentinel',
-        description: 'Diagnostica carga de CPU, pressão de RAM, espaço NVMe e radar de portas TCP locais.',
+        category: 'DEVOPS',
+        origin: 'BUILTIN',
+        description: 'Diagnostica carga de CPU, pressão de RAM, espaço NVMe, processos e atalhos da máquina Sidecar.',
         enabled: true,
-        systemInstruction: 'Cruza métricas reais do sistema operativo e alerta quando RAM > 85%.',
-        allowedTools: ['get_system_telemetry', 'request_shell_approval'],
+        systemInstruction: 'Cruza métricas reais do sistema operativo e interage com a máquina anfitriã via Sidecar.',
+        allowedTools: ['sidecar_host_control', 'get_system_telemetry', 'request_shell_approval'],
         quickCommand: '/diag-os',
-        version: '2.1.0',
+        version: '3.2.0',
       },
       {
         id: 'skill-04',
         name: 'Comandante Enxame Swarm 48x',
         slug: 'swarm-commander',
+        category: 'ENGINEERING',
+        origin: 'BUILTIN',
         description: 'Despacha 48 subagentes assimétricos (UI, API, TESTS, DOCS) com CoW Sandboxes e Dual Verify Gates.',
         enabled: true,
         systemInstruction: 'Exige sempre 96/96 Verify Gates antes de promover alterações para MERGED.',
@@ -800,6 +948,7 @@ function buildInitialSeed(): JarvisStoreData {
         version: '3.0.0',
       },
     ],
+    plugins: seedPlugins,
     channels: [
       {
         id: 'chan-telegram',
@@ -1106,10 +1255,23 @@ function ensureV3Migration(state: JarvisStoreData, seed: JarvisStoreData): Jarvi
     if (legacyExample) migratedMemories.push(legacyExample);
   }
 
+  const existingRooms = state.rooms && state.rooms.length > 0 ? [...state.rooms] : [...seed.rooms];
+  if (!existingRooms.some((r) => r.id === 'room-sidecar')) {
+    const sidecarSeedRoom = seed.rooms.find((r) => r.id === 'room-sidecar');
+    if (sidecarSeedRoom) existingRooms.push(sidecarSeedRoom);
+  }
+
   return {
     ...seed,
     ...state,
     settings: { ...seed.settings, ...(state.settings ?? {}) },
+    projects:
+      state.projects && state.projects.length > 0 ? state.projects : seed.projects,
+    activeProjectId: state.activeProjectId || seed.activeProjectId || 'proj-jarvis-core',
+    rooms: existingRooms,
+    plugins:
+      state.plugins && state.plugins.length > 0 ? state.plugins : seed.plugins,
+    sidecarCommandQueue: state.sidecarCommandQueue ?? [],
     memories: migratedMemories,
     swarmRuns: state.swarmRuns && state.swarmRuns.length > 0 ? state.swarmRuns : seed.swarmRuns,
     sandboxes: state.sandboxes ?? seed.sandboxes,

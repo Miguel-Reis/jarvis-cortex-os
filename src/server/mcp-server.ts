@@ -550,17 +550,45 @@ export async function readMcpResourceUri(
   return { ok, mimeType: outMime, text: outText, error: errMsg };
 }
 
-export async function handleMcpJsonRpc(body: {
-  jsonrpc?: string;
-  id?: string | number | null;
-  method?: string;
-  params?: Record<string, unknown>;
-}): Promise<Record<string, unknown>> {
+export async function handleMcpJsonRpc(
+  body: {
+    jsonrpc?: string;
+    id?: string | number | null;
+    method?: string;
+    params?: Record<string, unknown>;
+  },
+  activePort = 3000
+): Promise<Record<string, unknown>> {
   const rpcId = body?.id ?? 1;
   const method = String(body?.method || 'initialize');
   const params = body?.params || {};
 
   try {
+    if (method === 'ping') {
+      return {
+        jsonrpc: '2.0',
+        id: rpcId,
+        result: {
+          pong: true,
+          protocolVersion: '2025-06-18',
+          timestamp: new Date().toISOString(),
+        },
+      };
+    }
+
+    if (method === 'gateway/heartbeat') {
+      const targetId =
+        typeof params.serverId === 'string' && params.serverId.trim()
+          ? params.serverId.trim()
+          : undefined;
+      const hb = await runMcpServersHeartbeat(activePort, targetId);
+      return {
+        jsonrpc: '2.0',
+        id: rpcId,
+        result: hb,
+      };
+    }
+
     if (method === 'initialize') {
       return {
         jsonrpc: '2.0',
@@ -772,8 +800,10 @@ export async function probeExternalMcpServer(
   let healthStatus: McpCustomServer['healthStatus'] = 'OFFLINE';
   let discoveredTools = [...srv.discoveredTools];
   let lastError: string | undefined;
+  let lastRpcMethod = srv.lastRpcMethod || 'JSON-RPC 2.0 ping';
 
   if (srv.transport === 'HTTP_STREAMABLE') {
+    lastRpcMethod = 'JSON-RPC 2.0 ping + tools/list';
     let targetUrl = (srv.endpointUrl || '').trim();
     if (targetUrl.includes(':3000/api/mcp') && activePort !== 3000) {
       targetUrl = targetUrl.replace(':3000/api/mcp', `:${activePort}/api/mcp`);
@@ -784,19 +814,32 @@ export async function probeExternalMcpServer(
       lastError = 'URL bloqueado pelo filtro de segurança SSRF.';
     } else {
       try {
+        // Send JSON-RPC 2.0 ping heartbeat followed by tools/list discovery
+        const pingRes = await fetch(targetUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+          body: JSON.stringify({
+            jsonrpc: '2.0',
+            id: Date.now(),
+            method: 'ping',
+            params: {},
+          }),
+          signal: AbortSignal.timeout(1800),
+        });
+
         const initRes = await fetch(targetUrl, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
           body: JSON.stringify({
             jsonrpc: '2.0',
-            id: 1,
+            id: Date.now() + 1,
             method: 'tools/list',
             params: {},
           }),
           signal: AbortSignal.timeout(2500),
         });
 
-        if (initRes.ok) {
+        if (initRes.ok || pingRes.ok) {
           const data = (await initRes.json().catch(() => ({}))) as {
             result?: { tools?: { name?: string }[] };
           };
@@ -821,6 +864,7 @@ export async function probeExternalMcpServer(
       }
     }
   } else if (srv.transport === 'SSE') {
+    lastRpcMethod = 'SSE Handshake GET';
     const targetUrl = (srv.endpointUrl || '').trim();
     if (isBlockedSsrfUrl(targetUrl)) {
       healthStatus = 'OFFLINE';
@@ -853,6 +897,7 @@ export async function probeExternalMcpServer(
     }
   } else {
     // STDIO transport (already AUTHORIZED by Authority Gate)
+    lastRpcMethod = 'stdio execFile Probe';
     const rawBin = (srv.command || '').trim().split(/\s+/)[0] || '';
     const safeBinMatch = /^[a-zA-Z0-9._-]+$/.test(rawBin);
     if (!safeBinMatch) {
@@ -871,14 +916,23 @@ export async function probeExternalMcpServer(
     }
   }
 
-  const latencyMs = Number(Math.max(0.25, performance.now() - t0).toFixed(2));
+  const latencyMs = Number(Math.max(0.18, performance.now() - t0).toFixed(2));
   let updatedSrv: McpCustomServer | null = null;
 
   db.update((draft) => {
     const target = (draft.mcpServers || []).find((s) => s.id === serverId);
     if (target) {
+      const prevHist = Array.isArray(target.latencyHistory)
+        ? target.latencyHistory.filter((v) => Number.isFinite(v) && v >= 0)
+        : target.lastLatencyMs > 0
+          ? [target.lastLatencyMs]
+          : [];
       target.healthStatus = healthStatus;
       target.lastLatencyMs = latencyMs;
+      target.latencyHistory = [...prevHist, latencyMs].slice(-18);
+      target.probeCount = (target.probeCount || prevHist.length || 0) + 1;
+      target.errorCount = (target.errorCount || 0) + (healthStatus === 'ONLINE' ? 0 : 1);
+      target.lastRpcMethod = lastRpcMethod;
       target.discoveredTools = discoveredTools;
       target.lastCheckedAt = nowIso;
       target.lastError = lastError;
@@ -887,6 +941,26 @@ export async function probeExternalMcpServer(
   });
 
   return updatedSrv;
+}
+
+export async function runMcpServersHeartbeat(activePort = 3000, serverId?: string) {
+  const t0 = performance.now();
+  const allServers = db.getState().mcpServers || [];
+  const targets = serverId
+    ? allServers.filter((s) => s.id === serverId)
+    : allServers.filter((s) => s.enabled);
+
+  const probed = await Promise.all(
+    targets.map((srv) => probeExternalMcpServer(srv.id, activePort))
+  );
+  const overview = getMcpGatewayOverview();
+
+  return {
+    heartbeatAt: new Date().toISOString(),
+    roundTripMs: Number((performance.now() - t0).toFixed(2)),
+    probedCount: probed.filter(Boolean).length,
+    overview,
+  };
 }
 
 export async function probeAllMcpGatewayItems(activePort = 3000) {
