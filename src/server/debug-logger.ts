@@ -25,6 +25,10 @@ export type DebugSubsystem =
   | 'BRAIN:8765'
   | 'MCP'
   | 'AI-ENGINE'
+  | 'STUDIO-LOG'
+  | 'VOICE-STT'
+  | 'VOICE-TTS'
+  | 'LIVE-WS'
   | 'FATAL';
 
 export interface DebugLogEntry {
@@ -130,6 +134,9 @@ function colorForSubsystem(sub: DebugSubsystem): string {
     case 'HTTP':
     case 'SSE':
     case 'MCP':
+    case 'LIVE-WS':
+    case 'VOICE-STT':
+    case 'VOICE-TTS':
       return ANSI.cyan;
     case 'SWARM':
     case 'SCOUT-AST':

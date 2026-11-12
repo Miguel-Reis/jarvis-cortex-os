@@ -1,6 +1,8 @@
 import type { LanguageCode } from '../shared/types';
 
 export type NavSectionId =
+  | 'studio'
+  | 'llm'
   | 'brief'
   | 'brain'
   | 'chat'
@@ -19,6 +21,8 @@ const TRANSLATIONS: Record<LanguageCode, Record<string, string>> = {
     nav_group_command: 'Comando & Cognição',
     nav_group_engineering: 'Engenharia & Enxame',
     nav_group_ecosystem: 'Ecossistema & Máquina',
+    nav_studio: 'Estúdio de Projetos',
+    nav_llm: 'Motores LLM & Custos',
     nav_brief: 'Briefing & Q-18',
     nav_brain: 'Cérebro Jarvis',
     nav_chat: 'Salas de Agentes',
@@ -33,8 +37,8 @@ const TRANSLATIONS: Record<LanguageCode, Record<string, string>> = {
     nav_authority: 'Autoridade & Definições',
     focus_mode_btn: 'Modo Foco',
     focus_mode_on: 'Foco Ativo',
-    focus_mode_toast_on: 'Modo Foco ativado — navegação condensada aos módulos críticos.',
-    focus_mode_toast_off: 'Modo Foco desativado — todos os 12 módulos visíveis.',
+    focus_mode_toast_on: 'Modo Foco ativado — espaço de trabalho focado na conversa e Goals.',
+    focus_mode_toast_off: 'Modo Foco desativado — todos os módulos visíveis.',
     cmd_palette_btn: 'Comandos',
     setup_banner_title:
       'Bem-vindo ao J.A.R.V.I.S. Cortex OS v3.0 — conclua a calibração inicial de autonomia, idioma e voz Mark-VII.',
@@ -49,6 +53,8 @@ const TRANSLATIONS: Record<LanguageCode, Record<string, string>> = {
     nav_group_command: 'Command & Cognition',
     nav_group_engineering: 'Engineering & Swarm',
     nav_group_ecosystem: 'Ecosystem & Host',
+    nav_studio: 'Project Studio',
+    nav_llm: 'LLM Engines & Cost',
     nav_brief: 'Brief & Q-18',
     nav_brain: 'Jarvis Brain',
     nav_chat: 'Agent Rooms',
@@ -63,8 +69,8 @@ const TRANSLATIONS: Record<LanguageCode, Record<string, string>> = {
     nav_authority: 'Authority & Settings',
     focus_mode_btn: 'Focus Mode',
     focus_mode_on: 'Focus On',
-    focus_mode_toast_on: 'Focus Mode enabled — sidebar condensed to mission-critical modules.',
-    focus_mode_toast_off: 'Focus Mode disabled — all 12 modules visible.',
+    focus_mode_toast_on: 'Focus Mode enabled — workspace focused on conversation and Goals.',
+    focus_mode_toast_off: 'Focus Mode disabled — all modules visible.',
     cmd_palette_btn: 'Commands',
     setup_banner_title:
       'Welcome to J.A.R.V.I.S. Cortex OS v3.0 — complete initial calibration for autonomy, language, and Mark-VII voice.',

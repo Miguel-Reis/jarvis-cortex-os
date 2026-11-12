@@ -8,6 +8,7 @@ import {
   computeArchitecturalDrift,
   computeBinaryQuantization128,
   computeEbbinghausRetention,
+  computeGoalProgressFromSubtasks,
   computeHippoRagPPR,
   computeMcpLatencyStats,
   computeProjectProactiveFrequency,
@@ -17,11 +18,22 @@ import {
   computeViewStepCompletion,
   detectContradictedMemories,
   detectPromptInjection,
+  decodePcm16Base64ToFloat32,
+  downsampleFloat32Buffer,
+  encodeFloat32ToPcm16Base64,
+  estimateMonthlyLlmCostEur,
   evaluateProjectProactivity,
+  extractDeterministicPlanFromPrompt,
+  extractPcm16FromWavOrRawBase64,
+  filterProjectActivityLogs,
   findShortestGraphPath,
   formatDebugPayloadPreview,
+  GEMINI_VOICE_CATALOG,
   getVisibleSidebarIds,
   hammingSimilarity128,
+  isLocalOpenAiCompatibleEndpoint,
+  normalizeGeminiModelId,
+  normalizeGeminiVoiceName,
   rankQ18Actions,
   redactAiDefenceSecrets,
   routeJevS1,
@@ -729,3 +741,179 @@ test('classifyHttpLogLevel maps HTTP status codes and slow latencies to DEBUG/WA
   assert.equal(classifyHttpLogLevel(200, 3500), 'WARN');
   assert.equal(classifyHttpLogLevel(500, 20), 'ERROR');
 });
+
+test('filterProjectActivityLogs strictly isolates right-panel logs per chatId or per projectId', () => {
+  const logs = [
+    {
+      id: 'log-1',
+      projectId: 'proj-web',
+      chatId: 'chat-a',
+      timestamp: '2026-11-12T08:00:00Z',
+      actor: 'JARVIS',
+      kind: 'GOAL_CREATED' as const,
+      status: 'SUCCESS' as const,
+      summary: 'Goal criado no Chat A',
+    },
+    {
+      id: 'log-2',
+      projectId: 'proj-web',
+      chatId: 'chat-b',
+      timestamp: '2026-11-12T08:01:00Z',
+      actor: 'STUDIO-UI-01',
+      kind: 'AGENT_SPAWNED' as const,
+      status: 'SUCCESS' as const,
+      summary: 'Sub-agente criado no Chat B',
+    },
+    {
+      id: 'log-3',
+      projectId: 'proj-app',
+      chatId: 'chat-c',
+      timestamp: '2026-11-12T08:02:00Z',
+      actor: 'JARVIS',
+      kind: 'SCREEN_VISION' as const,
+      status: 'SUCCESS' as const,
+      summary: 'Ecrã analisado noutro projeto',
+    },
+  ];
+
+  const chatAScoped = filterProjectActivityLogs(logs, 'proj-web', 'chat-a', 'CHAT');
+  assert.equal(chatAScoped.length, 1);
+  assert.equal(chatAScoped[0].id, 'log-1');
+
+  const projWebScoped = filterProjectActivityLogs(logs, 'proj-web', 'chat-a', 'PROJECT');
+  assert.equal(projWebScoped.length, 2);
+
+  const projAppScoped = filterProjectActivityLogs(logs, 'proj-app', 'chat-c', 'CHAT');
+  assert.equal(projAppScoped.length, 1);
+  assert.equal(projAppScoped[0].id, 'log-3');
+});
+
+test('computeGoalProgressFromSubtasks & extractDeterministicPlanFromPrompt generate Goals and Sub-Agents from idea prompts', () => {
+  const progHalf = computeGoalProgressFromSubtasks([
+    { id: 's1', title: 'Landing page', done: true },
+    { id: 's2', title: 'Stripe checkout', done: false },
+  ]);
+  assert.equal(progHalf.progress, 50);
+  assert.equal(progHalf.status, 'ACTIVE');
+
+  const progFull = computeGoalProgressFromSubtasks([
+    { id: 's1', title: 'Landing page', done: true },
+    { id: 's2', title: 'Stripe checkout', done: true },
+  ]);
+  assert.equal(progFull.progress, 100);
+  assert.equal(progFull.status, 'COMPLETED');
+
+  const plan = extractDeterministicPlanFromPrompt({
+    prompt: 'Quero criar um website SaaS moderno com login, base de dados e pagamentos Stripe',
+    existingGoals: [],
+    existingRooms: [],
+    skills: [
+      {
+        id: 'sk-1',
+        name: 'Auditor AST',
+        slug: 'repo-test-auditor',
+        description: 'AST & testes',
+        enabled: true,
+        systemInstruction: '',
+        allowedTools: [],
+        quickCommand: '/audit',
+        version: '3.0.0',
+      },
+    ],
+  });
+
+  assert.equal(plan.isPlanningIntent, true);
+  assert.ok(plan.goalsToCreate.length >= 1);
+  assert.ok(plan.goalsToCreate[0].subtasks.length >= 2);
+  assert.equal(plan.subagentsToSpawn.length, 1);
+  assert.ok(plan.skillsToActivate.includes('repo-test-auditor'));
+});
+
+test('normalizeGeminiModelId, isLocalOpenAiCompatibleEndpoint & estimateMonthlyLlmCostEur compute safe models and Token Diet ROI', () => {
+  assert.equal(normalizeGeminiModelId('gemini-1.5-flash'), 'gemini-3.8-flash');
+  assert.equal(normalizeGeminiModelId('gemini-2.0-flash'), 'gemini-3.8-flash');
+  assert.equal(normalizeGeminiModelId('gemini-2.5-flash'), 'gemini-3.8-flash');
+  assert.equal(normalizeGeminiModelId(''), 'gemini-3.8-flash');
+  assert.equal(normalizeGeminiModelId('gemini-3.1-flash-lite'), 'gemini-3.1-flash-lite');
+  assert.equal(normalizeGeminiModelId('gemini-3.8-flash'), 'gemini-3.8-flash');
+
+  assert.equal(isLocalOpenAiCompatibleEndpoint('http://127.0.0.1:1234/v1'), true);
+  assert.equal(isLocalOpenAiCompatibleEndpoint('http://localhost:8000/v1'), true);
+  assert.equal(isLocalOpenAiCompatibleEndpoint('https://openrouter.ai/api/v1'), false);
+
+  const withDiet = estimateMonthlyLlmCostEur({ promptsPerDay: 50, tokenDietEnabled: true });
+  const withoutDiet = estimateMonthlyLlmCostEur({ promptsPerDay: 50, tokenDietEnabled: false });
+  assert.equal(withDiet.localModesEur, 0);
+  assert.equal(withDiet.geminiFreeTierEur, 0);
+  assert.equal(withDiet.antigravityMcpIncrementalEur, 0);
+  assert.equal(withDiet.withinGeminiFreeTierQuota, true);
+  assert.ok(withDiet.monthlyTokensSavedByDiet > 0);
+  assert.ok(withDiet.geminiFlashPaidEur < withoutDiet.geminiFlashPaidEur);
+  assert.ok(withDiet.openRouterCloudEur < withoutDiet.openRouterCloudEur);
+});
+
+test('Gemini Voice Catalog, normalizeGeminiVoiceName, 48kHz->16kHz downsampler & 16-bit LE PCM/WAV codecs preserve audio fidelity', () => {
+  assert.equal(GEMINI_VOICE_CATALOG.length, 5);
+  assert.deepEqual(
+    GEMINI_VOICE_CATALOG.map((v) => v.id),
+    ['Charon', 'Zephyr', 'Kore', 'Fenrir', 'Puck']
+  );
+
+  assert.equal(normalizeGeminiVoiceName('zephyr'), 'Zephyr');
+  assert.equal(normalizeGeminiVoiceName('FENRIR'), 'Fenrir');
+  assert.equal(normalizeGeminiVoiceName('kore'), 'Kore');
+  assert.equal(normalizeGeminiVoiceName('puck'), 'Puck');
+  assert.equal(normalizeGeminiVoiceName('invalid-voice'), 'Charon');
+  assert.equal(normalizeGeminiVoiceName(''), 'Charon');
+
+  // Downsample 48kHz -> 16kHz (exact 3:1 reduction)
+  const input48k = new Float32Array(480);
+  for (let i = 0; i < input48k.length; i++) {
+    input48k[i] = Math.sin((2 * Math.PI * i) / 48);
+  }
+  const down16k = downsampleFloat32Buffer(input48k, 48000, 16000);
+  assert.equal(down16k.length, 160);
+
+  // Encode Float32 -> Base64 PCM16 LE -> Decode Float32 round-trip
+  const orig = new Float32Array([-1, -0.5, 0, 0.5, 1]);
+  const b64 = encodeFloat32ToPcm16Base64(orig);
+  assert.ok(b64.length > 0);
+  const decoded = decodePcm16Base64ToFloat32(b64);
+  assert.equal(decoded.length, 5);
+  assert.ok(Math.abs(decoded[0] - -1) < 0.001);
+  assert.ok(Math.abs(decoded[1] - -0.5) < 0.001);
+  assert.equal(decoded[2], 0);
+  assert.ok(Math.abs(decoded[3] - 0.5) < 0.001);
+  assert.ok(Math.abs(decoded[4] - 1) < 0.001);
+
+  // Build synthetic 44-byte RIFF WAV header + 4 samples of 16-bit LE PCM at 24000 Hz
+  const wavBuf = Buffer.alloc(44 + 8);
+  wavBuf.write('RIFF', 0, 'ascii');
+  wavBuf.writeUInt32LE(36 + 8, 4);
+  wavBuf.write('WAVE', 8, 'ascii');
+  wavBuf.write('fmt ', 12, 'ascii');
+  wavBuf.writeUInt32LE(16, 16);
+  wavBuf.writeUInt16LE(1, 20); // PCM
+  wavBuf.writeUInt16LE(1, 22); // Mono
+  wavBuf.writeUInt32LE(24000, 24); // SampleRate
+  wavBuf.writeUInt32LE(48000, 28); // ByteRate
+  wavBuf.writeUInt16LE(2, 32); // BlockAlign
+  wavBuf.writeUInt16LE(16, 34); // BitsPerSample
+  wavBuf.write('data', 36, 'ascii');
+  wavBuf.writeUInt32LE(8, 40);
+  wavBuf.writeInt16LE(0, 44);
+  wavBuf.writeInt16LE(16384, 46);
+  wavBuf.writeInt16LE(-16384, 48);
+  wavBuf.writeInt16LE(32767, 50);
+
+  const parsedWav = extractPcm16FromWavOrRawBase64(wavBuf.toString('base64'));
+  assert.equal(parsedWav.wasWav, true);
+  assert.equal(parsedWav.sampleRate, 24000);
+  assert.equal(parsedWav.samples.length, 4);
+  assert.ok(Math.abs(parsedWav.samples[1] - 0.5) < 0.001);
+  assert.ok(Math.abs(parsedWav.samples[2] - -0.5) < 0.001);
+  assert.ok(Math.abs(parsedWav.samples[3] - 1.0) < 0.001);
+});
+
+
+

@@ -19,13 +19,13 @@ import {
 import { apiJson } from '../../lib/api';
 import { markViiAudio } from '../../lib/audio-dsp';
 import { useToast } from '../ToastContext';
+import { LLMSettingsView } from './LLMSettingsView';
 import type {
   AppSettings,
   AutonomyLevel,
   BrainLiveStatus,
   JarvisStoreData,
   LanguageCode,
-  ModelProviderType,
   PersonalityMode,
 } from '../../shared/types';
 
@@ -68,30 +68,6 @@ export const AuthoritySettingsView: React.FC<AuthoritySettingsViewProps> = ({
   // Profile local draft inputs
   const [operatorDraft, setOperatorDraft] = useState(store.settings.operatorName);
   const [orgDraft, setOrgDraft] = useState(store.settings.organizationName);
-
-  // Providers local draft inputs & live connection test
-  const [geminiModelDraft, setGeminiModelDraft] = useState(
-    store.settings.preferredGeminiModel || 'gemini-2.5-flash'
-  );
-  const [ollamaUrlDraft, setOllamaUrlDraft] = useState(
-    store.settings.ollamaEndpoint || 'http://127.0.0.1:11434'
-  );
-  const [ollamaModelDraft, setOllamaModelDraft] = useState(
-    store.settings.ollamaModel || 'qwen2.5-coder:7b'
-  );
-  const [openRouterUrlDraft, setOpenRouterUrlDraft] = useState(
-    store.settings.openRouterEndpoint || 'https://openrouter.ai/api/v1'
-  );
-  const [openRouterModelDraft, setOpenRouterModelDraft] = useState(
-    store.settings.openRouterModel || 'meta-llama/llama-3.3-70b-instruct'
-  );
-  const [testingProvider, setTestingProvider] = useState(false);
-  const [providerTestResult, setProviderTestResult] = useState<{
-    ok: boolean;
-    provider: ModelProviderType;
-    latencyMs: number;
-    detail: string;
-  } | null>(null);
 
   // Brain & Always-Approved Allow-List
   const [brainUrlDraft, setBrainUrlDraft] = useState(
@@ -159,41 +135,6 @@ export const AuthoritySettingsView: React.FC<AuthoritySettingsViewProps> = ({
       detail: `Score de risco: ${res.scan.riskScore}/100`,
       tone: res.scan.blocked ? 'success' : 'info',
     });
-  };
-
-  const handleTestProvider = async () => {
-    setTestingProvider(true);
-    try {
-      const res = await apiJson<{
-        ok: boolean;
-        provider: ModelProviderType;
-        latencyMs: number;
-        detail: string;
-      }>('/api/settings/test-provider', {
-        method: 'POST',
-        body: JSON.stringify({
-          provider: store.settings.modelProvider,
-          ollamaEndpoint: ollamaUrlDraft,
-          ollamaModel: ollamaModelDraft,
-          openRouterEndpoint: openRouterUrlDraft,
-          openRouterModel: openRouterModelDraft,
-        }),
-      });
-      setProviderTestResult(res);
-      pushToast({
-        title: res.ok ? `Ligação ${res.provider} verificada` : `Aviso no motor ${res.provider}`,
-        detail: `${res.detail} (${res.latencyMs}ms)`,
-        tone: res.ok ? 'success' : 'warning',
-      });
-    } catch (err) {
-      pushToast({
-        title: 'Erro ao testar fornecedor IA',
-        detail: (err as Error).message,
-        tone: 'error',
-      });
-    } finally {
-      setTestingProvider(false);
-    }
   };
 
   const handleAddApprovedCommand = async (e: React.FormEvent) => {
@@ -647,152 +588,17 @@ export const AuthoritySettingsView: React.FC<AuthoritySettingsViewProps> = ({
         </div>
       )}
 
-      {/* TAB 2: AI Providers & Live Connection Tester */}
+      {/* TAB 2: Unified LLM Providers, Cost/Benefit & Live Connection Tester */}
       {activeTab === 'providers' && (
-        <section className="jarvis-surface border border-slate-800/80 rounded-xl p-6 space-y-5">
-          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-            <div>
-              <h2 className="text-base font-semibold text-slate-100 font-display">
-                Motores de Inteligência & Conectores Server-Side
-              </h2>
-              <p className="text-xs text-slate-400 mt-0.5 font-mono">
-                Persistência: {storageEngine} · Gemini .env:{' '}
-                {geminiAvailable ? 'Detetada' : 'Ausente (Fallback Nativo)'} · OpenRouter .env:{' '}
-                {openRouterAvailable ? 'Detetada' : 'Ausente'}
-              </p>
-            </div>
-
-            <button
-              type="button"
-              disabled={testingProvider}
-              onClick={handleTestProvider}
-              className="inline-flex items-center gap-2 px-4 py-2 text-xs font-semibold rounded-lg bg-cyan-500 text-slate-950 hover:bg-cyan-400 disabled:opacity-50 shrink-0"
-            >
-              <RefreshCw className={`w-3.5 h-3.5 ${testingProvider ? 'animate-spin' : ''}`} />
-              {testingProvider ? 'A testar motor...' : 'Testar Ligação Atual'}
-            </button>
-          </div>
-
-          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
-            {(
-              [
-                {
-                  id: 'GEMINI_STUDIO',
-                  title: 'Gemini Server SDK',
-                  meta: geminiAvailable ? 'Chave .env ativa' : 'Usa fallback local se sem chave',
-                },
-                {
-                  id: 'LOCAL_DETERMINISTIC',
-                  title: 'Nativo Determinístico',
-                  meta: '0 GB VRAM · <2ms · 100% Offline',
-                },
-                {
-                  id: 'OLLAMA_LOCAL',
-                  title: 'Ollama Local HTTP',
-                  meta: ollamaUrlDraft,
-                },
-                {
-                  id: 'OPENROUTER_COMPAT',
-                  title: 'OpenRouter / OpenAI',
-                  meta: openRouterAvailable ? 'OPENROUTER_API_KEY ativa' : 'Configurar via .env',
-                },
-              ] as { id: ModelProviderType; title: string; meta: string }[]
-            ).map((p) => {
-              const active = store.settings.modelProvider === p.id;
-              return (
-                <button
-                  key={p.id}
-                  type="button"
-                  onClick={() => handleUpdateSettings({ modelProvider: p.id })}
-                  className={`p-4 rounded-xl border text-left transition-colors ${
-                    active
-                      ? 'bg-[#141b25] border-cyan-500/60 text-slate-100'
-                      : 'bg-[#07090e] border-slate-800 text-slate-300 hover:border-slate-700'
-                  }`}
-                >
-                  <p className="text-sm font-semibold">{p.title}</p>
-                  <p className="text-[11px] font-mono text-slate-400 mt-1 truncate">{p.meta}</p>
-                </button>
-              );
-            })}
-          </div>
-
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-4 pt-2 border-t border-slate-800/80">
-            <div>
-              <label className="block text-xs text-slate-400 mb-1">Modelo Gemini Preferido</label>
-              <input
-                type="text"
-                value={geminiModelDraft}
-                onChange={(e) => setGeminiModelDraft(e.target.value)}
-                onBlur={() =>
-                  handleUpdateSettings({ preferredGeminiModel: geminiModelDraft.trim() })
-                }
-                className="w-full px-3 py-2 text-xs font-mono bg-[#07090e] border border-slate-800 rounded-lg text-slate-200"
-              />
-            </div>
-
-            <div>
-              <label className="block text-xs text-slate-400 mb-1">Endpoint Ollama Local</label>
-              <input
-                type="text"
-                value={ollamaUrlDraft}
-                onChange={(e) => setOllamaUrlDraft(e.target.value)}
-                onBlur={() => handleUpdateSettings({ ollamaEndpoint: ollamaUrlDraft.trim() })}
-                className="w-full px-3 py-2 text-xs font-mono bg-[#07090e] border border-slate-800 rounded-lg text-slate-200"
-              />
-            </div>
-
-            <div>
-              <label className="block text-xs text-slate-400 mb-1">Modelo Ollama</label>
-              <input
-                type="text"
-                value={ollamaModelDraft}
-                onChange={(e) => setOllamaModelDraft(e.target.value)}
-                onBlur={() => handleUpdateSettings({ ollamaModel: ollamaModelDraft.trim() })}
-                className="w-full px-3 py-2 text-xs font-mono bg-[#07090e] border border-slate-800 rounded-lg text-slate-200"
-              />
-            </div>
-
-            <div className="md:col-span-2">
-              <label className="block text-xs text-slate-400 mb-1">
-                Endpoint OpenAI / OpenRouter Compatível (chave lida apenas de .env no servidor)
-              </label>
-              <input
-                type="text"
-                value={openRouterUrlDraft}
-                onChange={(e) => setOpenRouterUrlDraft(e.target.value)}
-                onBlur={() =>
-                  handleUpdateSettings({ openRouterEndpoint: openRouterUrlDraft.trim() })
-                }
-                className="w-full px-3 py-2 text-xs font-mono bg-[#07090e] border border-slate-800 rounded-lg text-slate-200"
-              />
-            </div>
-
-            <div>
-              <label className="block text-xs text-slate-400 mb-1">Modelo OpenRouter</label>
-              <input
-                type="text"
-                value={openRouterModelDraft}
-                onChange={(e) => setOpenRouterModelDraft(e.target.value)}
-                onBlur={() =>
-                  handleUpdateSettings({ openRouterModel: openRouterModelDraft.trim() })
-                }
-                className="w-full px-3 py-2 text-xs font-mono bg-[#07090e] border border-slate-800 rounded-lg text-slate-200"
-              />
-            </div>
-          </div>
-
-          {providerTestResult && (
-            <div className="p-3.5 rounded-xl bg-[#07090e] border border-slate-800 text-xs font-mono flex flex-wrap items-center justify-between gap-2">
-              <span className={providerTestResult.ok ? 'text-emerald-400' : 'text-amber-300'}>
-                [{providerTestResult.provider}] {providerTestResult.detail}
-              </span>
-              <span className="text-slate-400 tabular-nums">
-                Latência: {providerTestResult.latencyMs}ms
-              </span>
-            </div>
-          )}
-        </section>
+        <LLMSettingsView
+          store={store}
+          geminiAvailable={geminiAvailable}
+          openRouterAvailable={openRouterAvailable}
+          brain8765={brain8765}
+          storageEngine={storageEngine}
+          onRefreshBootstrap={onRefreshBootstrap}
+          embedded={true}
+        />
       )}
 
       {/* TAB 3: Brain :8765 Bridge & Always-Approved Commands Allow-List */}

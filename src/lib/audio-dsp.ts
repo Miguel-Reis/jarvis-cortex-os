@@ -1,9 +1,14 @@
-import type { LanguageCode } from '../shared/types';
+import {
+  decodePcm16Base64ToFloat32,
+  extractPcm16FromWavOrRawBase64,
+} from '../shared/cortex-math';
+import type { GeminiVoiceName, LanguageCode } from '../shared/types';
 
 /**
- * Skywalker Sound Mark-VII Helmet Acoustic DSP & Wake-Word Engine
- * - 320Hz–3800Hz Bandpass + 18.5ms Titanium Visor Comb Delay + Soft Saturation
- * - Real-time 60 FPS FFT / envelope energy sampler for Pebble Mark-VII Orb
+ * Skywalker Sound Mark-VII Helmet Acoustic DSP, 24kHz Gemini Live Stream Player & Wake-Word Engine
+ * - Gapless 24kHz 16-bit LE PCM playback (`nextStartTime` scheduling) + instant barge-in interruption
+ * - Optional 320Hz–3800Hz Bandpass + 18.5ms Titanium Visor Comb Delay on real Gemini voices
+ * - Real-time 60 FPS FFT / envelope energy sampler for Mark-VII Orb & Studio Live Co-Pilot
  * - Web Speech API continuous Wake-Word listener ("Hey Jarvis", "Ó Jarvis", "Jarvis")
  */
 
@@ -43,7 +48,12 @@ type SpeechRecognitionConstructor = new () => SpeechRecognitionLike;
 class MarkViiAudioEngine {
   private ctx: AudioContext | null = null;
   private analyser: AnalyserNode | null = null;
+  private cleanInputGain: GainNode | null = null;
+  private dspInputNode: BiquadFilterNode | null = null;
   private freqBins: Uint8Array<ArrayBuffer> | null = null;
+  private activeSources = new Set<AudioBufferSourceNode>();
+  private nextStartTime = 0;
+  private micLevel = 0;
   private speaking = false;
   private speechStartAt = 0;
 
@@ -55,11 +65,48 @@ class MarkViiAudioEngine {
     if (!AudioCtx) return null;
 
     if (!this.ctx) {
-      this.ctx = new AudioCtx();
+      try {
+        this.ctx = new AudioCtx({ sampleRate: 24000 });
+      } catch {
+        this.ctx = new AudioCtx();
+      }
+
       this.analyser = this.ctx.createAnalyser();
       this.analyser.fftSize = 128;
-      this.analyser.smoothingTimeConstant = 0.78;
+      this.analyser.smoothingTimeConstant = 0.76;
       this.freqBins = new Uint8Array(new ArrayBuffer(this.analyser.frequencyBinCount));
+
+      // Clean natural voice bus -> Analyser -> Destination
+      this.cleanInputGain = this.ctx.createGain();
+      this.cleanInputGain.gain.value = 1.0;
+      this.cleanInputGain.connect(this.analyser);
+
+      // Skywalker Sound Mark-VII Helmet DSP bus (320-3800Hz bandpass + 18.5ms titanium comb delay)
+      const highpass = this.ctx.createBiquadFilter();
+      highpass.type = 'highpass';
+      highpass.frequency.value = 300;
+
+      const lowpass = this.ctx.createBiquadFilter();
+      lowpass.type = 'lowpass';
+      lowpass.frequency.value = 4100;
+
+      const combDelay = this.ctx.createDelay(0.1);
+      combDelay.delayTime.value = 0.0185;
+      const combFeedback = this.ctx.createGain();
+      combFeedback.gain.value = 0.24;
+      const combWet = this.ctx.createGain();
+      combWet.gain.value = 0.28;
+
+      highpass.connect(lowpass);
+      lowpass.connect(this.analyser);
+      lowpass.connect(combDelay);
+      combDelay.connect(combFeedback);
+      combFeedback.connect(combDelay);
+      combDelay.connect(combWet);
+      combWet.connect(this.analyser);
+
+      this.dspInputNode = highpass;
+      this.analyser.connect(this.ctx.destination);
     }
 
     if (this.ctx.state === 'suspended') {
@@ -68,13 +115,108 @@ class MarkViiAudioEngine {
     return this.ctx;
   }
 
+  public setMicInputLevel(rms: number): void {
+    this.micLevel = Math.max(0, Math.min(1, rms));
+  }
+
   /**
-   * Synthesizes the signature Skywalker Sound Mark-VII helmet telemetry chime
-   * routed through a 320–3800Hz bandpass + 18.5ms comb resonance filter.
+   * Immediately stops all scheduled PCM/WAV playback buffers (used on Live barge-in interruption or disconnect).
+   */
+  public interruptPlayback(): void {
+    for (const src of this.activeSources) {
+      try {
+        src.onended = null;
+        src.stop();
+        src.disconnect();
+      } catch {
+        // Ignore already stopped source
+      }
+    }
+    this.activeSources.clear();
+    this.nextStartTime = 0;
+    this.speaking = false;
+    if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
+      try {
+        window.speechSynthesis.cancel();
+      } catch {
+        // Ignore cancel error
+      }
+    }
+  }
+
+  /**
+   * Schedules Float32 mono audio samples gaplessly on the WebAudio graph (`nextStartTime`),
+   * routing either cleanly or through the Mark-VII helmet DSP bus while driving real 60 FPS FFT.
+   */
+  public scheduleFloat32Samples(
+    samples: Float32Array,
+    sampleRate = 24000,
+    dspEnabled = false
+  ): number {
+    if (!samples.length) return 0;
+    const ctx = this.ensureContext();
+    if (!ctx || !this.cleanInputGain || !this.dspInputNode) return 0;
+
+    const audioBuffer = ctx.createBuffer(1, samples.length, sampleRate);
+    audioBuffer.getChannelData(0).set(samples);
+
+    const source = ctx.createBufferSource();
+    source.buffer = audioBuffer;
+    source.connect(dspEnabled ? this.dspInputNode : this.cleanInputGain);
+
+    const now = ctx.currentTime;
+    if (this.nextStartTime < now + 0.015) {
+      this.nextStartTime = now + 0.02;
+    }
+
+    const startAt = this.nextStartTime;
+    this.nextStartTime += audioBuffer.duration;
+
+    this.activeSources.add(source);
+    this.speaking = true;
+    this.speechStartAt = performance.now();
+
+    source.onended = () => {
+      this.activeSources.delete(source);
+      if (this.activeSources.size === 0) {
+        this.speaking = false;
+      }
+    };
+
+    source.start(startAt);
+    return audioBuffer.duration;
+  }
+
+  /**
+   * Enqueues a raw 16-bit LE PCM base64 chunk (24kHz from `gemini-3.8-live`) for gapless playback.
+   */
+  public enqueuePcmChunk(
+    base64Pcm: string,
+    sampleRate = 24000,
+    dspEnabled = false
+  ): number {
+    const samples = decodePcm16Base64ToFloat32(base64Pcm);
+    return this.scheduleFloat32Samples(samples, sampleRate, dspEnabled);
+  }
+
+  /**
+   * Plays a complete unary WAV or raw PCM base64 clip (e.g. `gemini-3.8-flash-lite-tts` voice preview).
+   */
+  public playWavOrPcmBase64(base64Audio: string, dspEnabled = false): number {
+    this.interruptPlayback();
+    if (dspEnabled) {
+      this.playMarkViiChime(true);
+    }
+    const { samples, sampleRate } = extractPcm16FromWavOrRawBase64(base64Audio, 24000);
+    return this.scheduleFloat32Samples(samples, sampleRate, dspEnabled);
+  }
+
+  /**
+   * Synthesizes the signature Skywalker Sound Mark-VII helmet telemetry chime.
    */
   public playMarkViiChime(dspEnabled = true): void {
     const ctx = this.ensureContext();
-    if (!ctx || !this.analyser) return;
+    if (!ctx || !this.cleanInputGain || !this.dspInputNode) return;
 
     const now = ctx.currentTime;
     const oscA = ctx.createOscillator();
@@ -89,50 +231,21 @@ class MarkViiAudioEngine {
     oscB.frequency.exponentialRampToValueAtTime(1560, now + 0.18);
 
     envGain.gain.setValueAtTime(0.0001, now);
-    envGain.gain.exponentialRampToValueAtTime(0.11, now + 0.025);
-    envGain.gain.exponentialRampToValueAtTime(0.0001, now + 0.28);
+    envGain.gain.exponentialRampToValueAtTime(0.1, now + 0.025);
+    envGain.gain.exponentialRampToValueAtTime(0.0001, now + 0.26);
 
     oscA.connect(envGain);
     oscB.connect(envGain);
-
-    if (dspEnabled) {
-      const highpass = ctx.createBiquadFilter();
-      highpass.type = 'highpass';
-      highpass.frequency.value = 320;
-
-      const lowpass = ctx.createBiquadFilter();
-      lowpass.type = 'lowpass';
-      lowpass.frequency.value = 3800;
-
-      // 18.5ms metallic faceplate comb delay
-      const combDelay = ctx.createDelay(0.1);
-      combDelay.delayTime.value = 0.0185;
-      const combFeedback = ctx.createGain();
-      combFeedback.gain.value = 0.34;
-
-      envGain.connect(highpass);
-      highpass.connect(lowpass);
-
-      lowpass.connect(this.analyser);
-      lowpass.connect(combDelay);
-      combDelay.connect(combFeedback);
-      combFeedback.connect(combDelay);
-      combFeedback.connect(this.analyser);
-    } else {
-      envGain.connect(this.analyser);
-    }
-
-    this.analyser.connect(ctx.destination);
+    envGain.connect(dspEnabled ? this.dspInputNode : this.cleanInputGain);
 
     oscA.start(now);
     oscB.start(now);
-    oscA.stop(now + 0.3);
-    oscB.stop(now + 0.3);
+    oscA.stop(now + 0.28);
+    oscB.stop(now + 0.28);
   }
 
   /**
-   * Speaks text via Web Speech API accompanied by Mark-VII DSP helmet acoustics
-   * and drives the 60 FPS energy envelope while speaking.
+   * Local zero-dependency Web Speech API fallback when offline or in LOCAL_DETERMINISTIC mode.
    */
   public speakWithMarkVII(text: string, lang: LanguageCode = 'pt-PT', dspEnabled = true): void {
     if (typeof window === 'undefined') return;
@@ -191,9 +304,77 @@ class MarkViiAudioEngine {
   }
 
   /**
-   * Samples live FFT bins + synthetic speech cadence at 60 FPS for the Pebble Orb.
+   * Requests a real server-side voice preview (`gemini-3.8-flash-lite-tts`) for the chosen
+   * `GeminiVoiceName` (`Charon`, `Zephyr`, `Kore`, `Fenrir`, `Puck`), falling back gracefully
+   * to local Web Speech synthesis if `GEMINI_API_KEY` is absent or offline.
    */
-  public sampleEnergy(now = performance.now()): { average: number; isSpeaking: boolean } {
+  public async previewGeminiOrLocalVoice(params: {
+    voiceName: GeminiVoiceName;
+    lang: LanguageCode;
+    dspEnabled: boolean;
+    customText?: string;
+  }): Promise<{ ok: boolean; detail: string; usedCloudVoice: boolean }> {
+    try {
+      const resp = await fetch('/api/voice/preview', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          voiceName: params.voiceName,
+          language: params.lang,
+          customText: params.customText,
+        }),
+      });
+      const data = (await resp.json()) as {
+        ok?: boolean;
+        audioBase64?: string;
+        sampleText?: string;
+        detail?: string;
+      };
+
+      if (data.ok && data.audioBase64) {
+        this.playWavOrPcmBase64(data.audioBase64, params.dspEnabled);
+        return {
+          ok: true,
+          detail: data.detail || `Voz ${params.voiceName} reproduzida.`,
+          usedCloudVoice: true,
+        };
+      }
+
+      const fallbackSample =
+        data.sampleText ||
+        (params.lang === 'pt-PT'
+          ? `Amostra local da voz ${params.voiceName} calibrada.`
+          : `Local preview for ${params.voiceName} calibrated.`);
+      this.speakWithMarkVII(fallbackSample, params.lang, params.dspEnabled);
+      return {
+        ok: true,
+        detail: data.detail || 'Reproduzido com síntese local (modo offline).',
+        usedCloudVoice: false,
+      };
+    } catch {
+      this.speakWithMarkVII(
+        params.lang === 'pt-PT'
+          ? 'Sistemas acústicos Mark Sete calibrados, Comandante.'
+          : 'Mark Seven acoustic systems calibrated, Commander.',
+        params.lang,
+        params.dspEnabled
+      );
+      return {
+        ok: false,
+        detail: 'Sem ligação TTS — a usar síntese local.',
+        usedCloudVoice: false,
+      };
+    }
+  }
+
+  /**
+   * Samples live FFT bins (real Gemini 24kHz voice + mic RMS) + synthetic speech fallback at 60 FPS.
+   */
+  public sampleEnergy(now = performance.now()): {
+    average: number;
+    isSpeaking: boolean;
+    micEnergy: number;
+  } {
     let fftAvg = 0;
     if (this.analyser && this.freqBins) {
       this.analyser.getByteFrequencyData(this.freqBins);
@@ -202,6 +383,15 @@ class MarkViiAudioEngine {
         sum += this.freqBins[i];
       }
       fftAvg = sum / (this.freqBins.length * 255);
+    }
+
+    const activePcmPlayback = this.activeSources.size > 0;
+    if (activePcmPlayback) {
+      return {
+        average: Math.min(1, Math.max(0.18, fftAvg * 2.1)),
+        isSpeaking: true,
+        micEnergy: this.micLevel,
+      };
     }
 
     const synthSpeaking =
@@ -219,14 +409,16 @@ class MarkViiAudioEngine {
       return {
         average: Math.min(1, cadence),
         isSpeaking: true,
+        micEnergy: this.micLevel,
       };
     }
 
-    // Subtle idle breathing pulse + any residual chime FFT energy
     const idlePulse = 0.05 + 0.035 * (0.5 + 0.5 * Math.sin(now * 0.0024));
+    const combined = Math.max(idlePulse, fftAvg * 1.6, this.micLevel * 1.4);
     return {
-      average: Math.min(1, Math.max(idlePulse, fftAvg)),
-      isSpeaking: fftAvg > 0.08,
+      average: Math.min(1, combined),
+      isSpeaking: fftAvg > 0.06,
+      micEnergy: this.micLevel,
     };
   }
 }
@@ -260,8 +452,8 @@ export function createWakeWordController(
     if (!Ctor) {
       onHeardPreview?.(
         lang === 'pt-PT'
-          ? 'Web Speech API indisponível neste navegador — utilize o campo rápido.'
-          : 'Web Speech API unavailable in this browser — use quick input.'
+          ? 'Web Speech API indisponível neste navegador — utiliza o Modo Conversa Live ou o campo rápido.'
+          : 'Web Speech API unavailable in this browser — use Live Voice Mode or quick input.'
       );
       return;
     }

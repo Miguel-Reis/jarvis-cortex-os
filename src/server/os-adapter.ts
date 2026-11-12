@@ -9,6 +9,7 @@ import { detectPromptInjection } from '../shared/cortex-math.ts';
 import type {
   OSTelemetry,
   PortRadarEntry,
+  ScreenCaptureSnapshot,
   SidecarHostCommandRecord,
   SidecarHostSnapshot,
   SidecarProcessEntry,
@@ -777,3 +778,214 @@ export async function dispatchSidecarHostCommand(params: {
 
   return record;
 }
+
+function escapeXml(str: string): string {
+  return str
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+export async function captureSidecarDesktopScreen(
+  deviceId = 'dev-local-host',
+  activeServerPort = 3000
+): Promise<ScreenCaptureSnapshot> {
+  const t0 = performance.now();
+  const nowIso = new Date().toISOString();
+  const [hostSnap, telemetry] = await Promise.all([
+    collectSidecarHostSnapshot(deviceId),
+    collectOSTelemetry(activeServerPort),
+  ]);
+  const topWin = hostSnap.activeWindows[0]?.title || `Ambiente de Trabalho (${hostSnap.hostname})`;
+
+  // 1. Native Windows Desktop Capture via PowerShell System.Drawing
+  if (process.platform === 'win32') {
+    const psScript = [
+      'Add-Type -AssemblyName System.Windows.Forms,System.Drawing;',
+      '$b = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds;',
+      '$src = New-Object System.Drawing.Bitmap($b.Width, $b.Height);',
+      '$g = [System.Drawing.Graphics]::FromImage($src);',
+      '$g.CopyFromScreen($b.Location, [System.Drawing.Point]::Empty, $b.Size);',
+      '$g.Dispose();',
+      '$targetW = [Math]::Min(1280, $b.Width);',
+      '$targetH = [int]([Math]::Round($b.Height * ($targetW / [double]$b.Width)));',
+      '$dst = New-Object System.Drawing.Bitmap($src, $targetW, $targetH);',
+      '$src.Dispose();',
+      '$ms = New-Object System.IO.MemoryStream;',
+      '$dst.Save($ms, [System.Drawing.Imaging.ImageFormat]::Jpeg);',
+      '$dst.Dispose();',
+      '$b64 = [Convert]::ToBase64String($ms.ToArray());',
+      '$ms.Dispose();',
+      'Write-Output ("{""w"":" + $targetW + ",""h"":" + $targetH + ",""b64"":""" + $b64 + """}");',
+    ].join(' ');
+    try {
+      const { stdout } = await execFileAsync('powershell.exe', ['-NoProfile', '-Command', psScript], {
+        timeout: 4500,
+        maxBuffer: 8 * 1024 * 1024,
+      });
+      const parsed = JSON.parse(stdout.trim()) as { w: number; h: number; b64: string };
+      if (parsed.b64) {
+        debugLog('INFO', 'SIDECAR', `Captured Windows primary screen (${parsed.w}x${parsed.h})`, {
+          durationMs: performance.now() - t0,
+        });
+        return {
+          id: `scr-win-${Date.now()}`,
+          source: 'SIDECAR_NATIVE',
+          capturedAt: nowIso,
+          width: parsed.w,
+          height: parsed.h,
+          mimeType: 'image/jpeg',
+          dataBase64: parsed.b64,
+          activeWindowTitle: topWin,
+          hostname: hostSnap.hostname,
+        };
+      }
+    } catch (err) {
+      debugLog('WARN', 'SIDECAR', `Windows screen capture fallback: ${(err as Error).message}`);
+    }
+  }
+
+  // 2. Native macOS Desktop Capture via screencapture
+  if (process.platform === 'darwin') {
+    const tmpFile = path.join(os.tmpdir(), `jarvis-screen-${Date.now()}.jpg`);
+    try {
+      await execFileAsync('screencapture', ['-x', '-C', '-t', 'jpg', tmpFile], { timeout: 3500 });
+      if (fs.existsSync(tmpFile)) {
+        const b64 = fs.readFileSync(tmpFile).toString('base64');
+        fs.unlinkSync(tmpFile);
+        debugLog('INFO', 'SIDECAR', 'Captured macOS desktop via screencapture', {
+          durationMs: performance.now() - t0,
+        });
+        return {
+          id: `scr-mac-${Date.now()}`,
+          source: 'SIDECAR_NATIVE',
+          capturedAt: nowIso,
+          width: 1280,
+          height: 800,
+          mimeType: 'image/jpeg',
+          dataBase64: b64,
+          activeWindowTitle: topWin,
+          hostname: hostSnap.hostname,
+        };
+      }
+    } catch {
+      try {
+        if (fs.existsSync(tmpFile)) fs.unlinkSync(tmpFile);
+      } catch {
+        // ignore cleanup error
+      }
+    }
+  }
+
+  // 3. Native Linux X11 Capture when DISPLAY is present
+  if (process.platform === 'linux' && process.env.DISPLAY) {
+    const tmpFile = path.join(os.tmpdir(), `jarvis-screen-${Date.now()}.jpg`);
+    try {
+      await execFileAsync('scrot', ['-q', '75', tmpFile], { timeout: 3000 });
+      if (fs.existsSync(tmpFile)) {
+        const b64 = fs.readFileSync(tmpFile).toString('base64');
+        fs.unlinkSync(tmpFile);
+        debugLog('INFO', 'SIDECAR', 'Captured Linux X11 desktop via scrot', {
+          durationMs: performance.now() - t0,
+        });
+        return {
+          id: `scr-x11-${Date.now()}`,
+          source: 'SIDECAR_NATIVE',
+          capturedAt: nowIso,
+          width: 1280,
+          height: 720,
+          mimeType: 'image/jpeg',
+          dataBase64: b64,
+          activeWindowTitle: topWin,
+          hostname: hostSnap.hostname,
+        };
+      }
+    } catch {
+      try {
+        if (fs.existsSync(tmpFile)) fs.unlinkSync(tmpFile);
+      } catch {
+        // ignore
+      }
+    }
+  }
+
+  // 4. Headless / Container Host Live Visual Telemetry Frame (SVG)
+  const winRows = hostSnap.activeWindows
+    .slice(0, 4)
+    .map(
+      (w, idx) =>
+        `<text x="44" y="${214 + idx * 28}" fill="#cbd5e1" font-family="monospace" font-size="14">• [${escapeXml(
+          w.process || 'proc'
+        )}] ${escapeXml((w.title || '').slice(0, 68))}</text>`
+    )
+    .join('');
+
+  const procRows = hostSnap.topProcesses
+    .slice(0, 4)
+    .map(
+      (p, idx) =>
+        `<text x="44" y="${374 + idx * 26}" fill="#94a3b8" font-family="monospace" font-size="13">PID ${
+          p.pid
+        } · ${escapeXml(p.name.slice(0, 26))} — CPU ${p.cpuPercent}% · RAM ${p.memPercent}%</text>`
+    )
+    .join('');
+
+  const openPortsText = telemetry.ports
+    .filter((p) => p.open)
+    .map((p) => `:${p.port} (${p.service})`)
+    .join(' · ');
+
+  const svgMarkup = `<svg xmlns="http://www.w3.org/2000/svg" width="960" height="540" viewBox="0 0 960 540">
+    <rect width="960" height="540" fill="#0b0d12"/>
+    <rect x="20" y="20" width="920" height="500" rx="14" fill="#121620" stroke="#262c3a" stroke-width="1.5"/>
+    <circle cx="48" cy="52" r="6" fill="#34d399"/>
+    <text x="66" y="57" fill="#f1f5f9" font-family="sans-serif" font-size="16" font-weight="600">SIDECAR HOST LIVE SNAPSHOT · ${escapeXml(
+      hostSnap.hostname
+    )} (${escapeXml(telemetry.platform)}/${escapeXml(telemetry.arch)})</text>
+    <text x="912" y="57" text-anchor="end" fill="#94a3b8" font-family="monospace" font-size="13">${escapeXml(
+      nowIso.slice(11, 19)
+    )} UTC</text>
+    <line x1="20" y1="78" x2="940" y2="78" stroke="#222836" stroke-width="1"/>
+    <rect x="40" y="98" width="275" height="68" rx="10" fill="#171c28" stroke="#262e40"/>
+    <text x="56" y="122" fill="#94a3b8" font-family="sans-serif" font-size="12">CPU &amp; NÚCLEOS</text>
+    <text x="56" y="149" fill="#e59a54" font-family="monospace" font-size="20" font-weight="700">${
+      telemetry.cpuUsagePercent
+    }% · ${telemetry.cpuCores} cores</text>
+    <rect x="332" y="98" width="275" height="68" rx="10" fill="#171c28" stroke="#262e40"/>
+    <text x="348" y="122" fill="#94a3b8" font-family="sans-serif" font-size="12">MEMÓRIA FÍSICA</text>
+    <text x="348" y="149" fill="#6e8efb" font-family="monospace" font-size="20" font-weight="700">${
+      telemetry.ramUsedGb
+    } / ${telemetry.ramTotalGb} GB (${telemetry.ramPercent}%)</text>
+    <rect x="624" y="98" width="296" height="68" rx="10" fill="#171c28" stroke="#262e40"/>
+    <text x="640" y="122" fill="#94a3b8" font-family="sans-serif" font-size="12">DISCO NVME</text>
+    <text x="640" y="149" fill="#34d399" font-family="monospace" font-size="20" font-weight="700">${
+      telemetry.diskUsedGb
+    } / ${telemetry.diskTotalGb} GB (${telemetry.diskPercent}%)</text>
+    <text x="44" y="190" fill="#e2e8f0" font-family="sans-serif" font-size="13" font-weight="600">JANELAS ATIVAS DETETADAS PELO SIDECAR</text>
+    ${winRows}
+    <text x="44" y="348" fill="#e2e8f0" font-family="sans-serif" font-size="13" font-weight="600">PROCESSOS EM EXECUÇÃO (TOP CPU/RAM)</text>
+    ${procRows}
+    <rect x="40" y="468" width="880" height="34" rx="8" fill="#0e121a" stroke="#202634"/>
+    <text x="54" y="490" fill="#94a3b8" font-family="monospace" font-size="12">Portas Ativas: ${escapeXml(
+      openPortsText.slice(0, 95)
+    )}</text>
+  </svg>`;
+
+  debugLog('INFO', 'SIDECAR', `Generated live Sidecar host visual frame for ${hostSnap.hostname}`, {
+    durationMs: performance.now() - t0,
+  });
+
+  return {
+    id: `scr-host-${Date.now()}`,
+    source: 'SIDECAR_NATIVE',
+    capturedAt: nowIso,
+    width: 960,
+    height: 540,
+    mimeType: 'image/svg+xml',
+    dataBase64: Buffer.from(svgMarkup, 'utf-8').toString('base64'),
+    activeWindowTitle: topWin,
+    hostname: hostSnap.hostname,
+  };
+}
+

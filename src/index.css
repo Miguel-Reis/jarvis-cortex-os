@@ -11,8 +11,8 @@
   html,
   body {
     font-family: var(--font-sans);
-    background-color: #04070d;
-    color: #f1f5f9;
+    background-color: #0b0d11;
+    color: #eceef4;
     -webkit-font-smoothing: antialiased;
   }
 
@@ -21,7 +21,7 @@
   h3,
   .font-display {
     font-family: var(--font-display);
-    letter-spacing: -0.01em;
+    letter-spacing: -0.015em;
     text-wrap: balance;
   }
 
@@ -38,95 +38,72 @@
 }
 
 /* ============================================================================
-   Stark HUD Tactical Surface & Precision Grid System (Obsidian + Amber-Cyan)
+   Modern Dark Studio Surface System (Claude Projects × Antigravity Aesthetic)
    ============================================================================ */
-.jarvis-canvas-bg {
-  background-color: #04070d;
-  background-image:
-    radial-gradient(ellipse 68% 380px at 18% -90px, rgba(34, 211, 238, 0.085), transparent 70%),
-    radial-gradient(ellipse 52% 320px at 86% -80px, rgba(245, 158, 11, 0.065), transparent 68%),
-    linear-gradient(to right, rgba(34, 211, 238, 0.032) 1px, transparent 1px),
-    linear-gradient(to bottom, rgba(34, 211, 238, 0.032) 1px, transparent 1px);
-  background-size:
-    100% 100%,
-    100% 100%,
-    28px 28px,
-    28px 28px;
+.jarvis-canvas-bg,
+.studio-canvas {
+  background-color: #0b0d11;
+  background-image: radial-gradient(
+    ellipse 75% 360px at 50% -140px,
+    rgba(229, 154, 84, 0.045),
+    transparent 70%
+  );
 }
 
+.studio-sidebar,
 .hud-rail {
-  background: linear-gradient(180deg, #060a12 0%, #04070d 100%);
-  border-right: 1px solid rgba(34, 211, 238, 0.14);
+  background-color: #10131a;
+  border-right: 1px solid rgba(255, 255, 255, 0.065);
 }
 
+.studio-inspector {
+  background-color: #10131a;
+  border-left: 1px solid rgba(255, 255, 255, 0.065);
+}
+
+.studio-card,
 .jarvis-surface,
 .hud-panel {
-  position: relative;
-  background: linear-gradient(180deg, rgba(10, 16, 26, 0.94) 0%, rgba(7, 11, 19, 0.97) 100%);
-  border: 1px solid rgba(56, 189, 248, 0.14);
-  box-shadow: 0 1px 0 0 rgba(34, 211, 238, 0.06) inset;
+  background-color: #141821;
+  border: 1px solid rgba(255, 255, 255, 0.075);
 }
 
 .hud-panel-amber {
+  background-color: #161922;
+  border: 1px solid rgba(229, 154, 84, 0.28);
+}
+
+.hud-corner-frame {
   position: relative;
-  background: linear-gradient(165deg, rgba(18, 16, 14, 0.95) 0%, rgba(8, 12, 20, 0.98) 62%);
-  border: 1px solid rgba(245, 158, 11, 0.36);
-  box-shadow: 0 1px 0 0 rgba(251, 191, 36, 0.1) inset;
 }
 
-/* Subtle Stark Reticle Corner Ticks (No heavy drop-shadows or thick left stripes) */
-.hud-corner-frame::before,
-.hud-corner-frame::after {
-  content: '';
-  position: absolute;
-  width: 9px;
-  height: 9px;
-  pointer-events: none;
-  z-index: 2;
+.jarvis-subpanel,
+.studio-subcard {
+  background-color: #0e1117;
+  border: 1px solid rgba(255, 255, 255, 0.06);
 }
 
-.hud-corner-frame::before {
-  top: -1px;
-  left: -1px;
-  border-top: 1.5px solid rgba(34, 211, 238, 0.72);
-  border-left: 1.5px solid rgba(34, 211, 238, 0.72);
-  border-top-left-radius: 2px;
-}
-
-.hud-corner-frame::after {
-  bottom: -1px;
-  right: -1px;
-  border-bottom: 1.5px solid rgba(245, 158, 11, 0.72);
-  border-right: 1.5px solid rgba(245, 158, 11, 0.72);
-  border-bottom-right-radius: 2px;
-}
-
-.jarvis-subpanel {
-  background-color: #050810;
-  border: 1px solid rgba(30, 41, 59, 0.85);
-}
-
-/* Calibrated Stark HUD scrollbars */
+/* Subtle Dark Studio Scrollbars */
 ::-webkit-scrollbar {
   width: 6px;
   height: 6px;
 }
 
 ::-webkit-scrollbar-track {
-  background: #04070d;
+  background: transparent;
 }
 
 ::-webkit-scrollbar-thumb {
-  background: rgba(56, 189, 248, 0.22);
-  border-radius: 2px;
+  background: rgba(148, 163, 184, 0.18);
+  border-radius: 3px;
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background: rgba(245, 158, 11, 0.65);
+  background: rgba(229, 154, 84, 0.45);
 }
 
 /* ============================================================================
-   Modo Foco (Sessão Noturna): Warm Stark Amber Low-Blue-Light Tactical Mode
+   Modo Foco (Sessão Noturna): Warm Studio Low-Blue-Light Mode
    ============================================================================ */
 html[data-focus-mode='true'] {
   --color-cyan-200: #f6ddb2;
@@ -146,47 +123,28 @@ html[data-focus-mode='true'] {
   --color-slate-800: #191614;
   --color-slate-900: #0d0b0a;
   --color-slate-950: #050403;
-
-  --color-emerald-300: #95d5b2;
-  --color-emerald-400: #74c69d;
-  --color-emerald-500: #52b788;
-  --color-amber-300: #f3c98b;
-  --color-amber-400: #e5ab5b;
-  --color-amber-500: #d4943a;
 }
 
 html[data-focus-mode='true'],
 html[data-focus-mode='true'] body,
-html[data-focus-mode='true'] .jarvis-canvas-bg {
-  background-color: #020305;
-  background-image:
-    linear-gradient(to right, rgba(212, 148, 58, 0.025) 1px, transparent 1px),
-    linear-gradient(to bottom, rgba(212, 148, 58, 0.025) 1px, transparent 1px);
-  background-size: 28px 28px;
-  color: #e5ddd1;
+html[data-focus-mode='true'] .jarvis-canvas-bg,
+html[data-focus-mode='true'] .studio-canvas {
+  background-color: #090807;
+  background-image: none;
+  color: #e6dfd5;
 }
 
+html[data-focus-mode='true'] .studio-card,
 html[data-focus-mode='true'] .jarvis-surface,
 html[data-focus-mode='true'] .hud-panel,
 html[data-focus-mode='true'] .hud-panel-amber {
-  background: #070605;
-  border-color: rgba(212, 148, 58, 0.22);
-  box-shadow: none;
+  background-color: #110f0d;
+  border-color: rgba(229, 154, 84, 0.18);
 }
 
+html[data-focus-mode='true'] .studio-sidebar,
+html[data-focus-mode='true'] .studio-inspector,
 html[data-focus-mode='true'] .hud-rail {
-  background: #040302;
-  border-right-color: rgba(212, 148, 58, 0.2);
-}
-
-html[data-focus-mode='true'] ::-webkit-scrollbar-track {
-  background: #020305;
-}
-
-html[data-focus-mode='true'] ::-webkit-scrollbar-thumb {
-  background: rgba(168, 152, 130, 0.18);
-}
-
-html[data-focus-mode='true'] ::-webkit-scrollbar-thumb:hover {
-  background: rgba(212, 148, 58, 0.5);
+  background-color: #0c0b09;
+  border-color: rgba(229, 154, 84, 0.15);
 }

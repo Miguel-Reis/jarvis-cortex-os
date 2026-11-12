@@ -1,5 +1,6 @@
 import express from 'express';
 import fs from 'node:fs';
+import http from 'node:http';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import dns from 'node:dns';
@@ -9,10 +10,15 @@ dns.setDefaultResultOrder('ipv4first');
 import {
   compressFactTelegraphic,
   computeBinaryQuantization128,
+  computeGoalProgressFromSubtasks,
   computeHippoRagPPR,
   computeSimHash128,
   detectPromptInjection,
+  filterProjectActivityLogs,
   findShortestGraphPath,
+  GEMINI_VOICE_CATALOG,
+  normalizeGeminiModelId,
+  normalizeGeminiVoiceName,
   rankQ18Actions,
   redactAiDefenceSecrets,
   routeJevS1,
@@ -32,6 +38,9 @@ import {
 } from './src/shared/skills-plugins-catalog.ts';
 import type {
   ChannelPlatform,
+  ChatThread,
+  GoalItem,
+  GoalSubtask,
   McpCustomServer,
   McpLibraryCategory,
   McpRegistryResourceItem,
@@ -41,6 +50,7 @@ import type {
   MemoryTier,
   PluginItem,
   PluginLifecycleHook,
+  ProjectIdeaCategory,
   ProjectWorkspace,
   Room,
   SwarmLane,
@@ -48,6 +58,7 @@ import type {
 } from './src/shared/types.ts';
 import { db } from './src/server/db.ts';
 import {
+  captureSidecarDesktopScreen,
   collectOSTelemetry,
   collectSidecarHostSnapshot,
   dispatchSidecarHostCommand,
@@ -59,11 +70,18 @@ import {
   verifyTodayContractItem,
 } from './src/server/os-adapter.ts';
 import {
+  analyzeLiveScreenFrame,
   generateWorkflowFromNaturalLanguage,
+  registerStudioActivityBroadcaster,
   runAgentChatTurn,
   synthesizeBriefText,
   testModelProviderConnection,
 } from './src/server/gemini-engine.ts';
+import {
+  attachGeminiLiveWebSocketServer,
+  synthesizeVoicePreviewServerSide,
+  transcribeAudioServerSide,
+} from './src/server/voice-live-bridge.ts';
 import {
   registerWorkflowBroadcaster,
   runWorkflowById,
@@ -139,11 +157,21 @@ function resolvePort(): number {
     const parsed = Number(process.argv[portFlagIdx + 1]);
     if (Number.isFinite(parsed) && parsed > 0) return parsed;
   }
-  return Number(process.env.PORT) || 3000;
+  const envPort = Number(process.env.PORT || process.env.npm_config_port);
+  if (Number.isFinite(envPort) && envPort > 0) return envPort;
+  return 3000;
+}
+
+function resolveHost(): string {
+  const hostFlagIdx = process.argv.indexOf('--host');
+  if (hostFlagIdx >= 0 && process.argv[hostFlagIdx + 1]) {
+    return String(process.argv[hostFlagIdx + 1]).trim() || '0.0.0.0';
+  }
+  return (process.env.HOST || process.env.npm_config_host || '0.0.0.0').trim() || '0.0.0.0';
 }
 
 const PORT = resolvePort();
-const HOST = process.env.HOST || '0.0.0.0';
+const HOST = resolveHost();
 
 process.on('uncaughtException', (err) => {
   debugLog('ERROR', 'FATAL', `Uncaught Exception: ${err.message}`, {
@@ -183,12 +211,7 @@ async function startServer() {
 
   registerWorkflowBroadcaster(broadcastSse);
   registerSwarmOrbitBroadcaster(broadcastSse);
-  startOrRefreshHeartbeatDaemon(PORT);
-
-  // Pre-warm SCOUT-01 AST index asynchronously
-  buildScoutWorkspaceIndex().catch((err) => {
-    debugLog('WARN', 'SCOUT-AST', `Initial AST pre-warm warning: ${(err as Error).message}`);
-  });
+  registerStudioActivityBroadcaster(broadcastSse);
 
   // ==========================================================================
   // Health & Unified Bootstrap State
@@ -238,6 +261,7 @@ async function startServer() {
   });
 
   app.get('/api/bootstrap', async (_req, res) => {
+    loadDotEnvIfPresent();
     const state = db.getState();
     const rankedCandidates = rankQ18Actions(state.candidates);
     const activeMemories = state.memories.filter((m) => !m.supersededBy && !m.validUntil);
@@ -280,6 +304,9 @@ async function startServer() {
       techStack,
       gitBranch,
       description,
+      ideaCategory,
+      ideaBrief,
+      activeSkillIds,
       proactiveEnabled,
       proactiveIntervalSec,
       assignedAgentIds,
@@ -291,24 +318,56 @@ async function startServer() {
       return;
     }
 
+    const validCategories: ProjectIdeaCategory[] = [
+      'WEBSITE',
+      'APP',
+      'AUTOMATION',
+      'RESEARCH',
+      'SYSTEM',
+      'CUSTOM',
+    ];
+    const resolvedCategory: ProjectIdeaCategory = validCategories.includes(ideaCategory)
+      ? ideaCategory
+      : 'CUSTOM';
+
+    const defaultStackByCat: Record<ProjectIdeaCategory, string> = {
+      WEBSITE: 'React · TypeScript · Tailwind CSS',
+      APP: 'React Native / Mobile · TypeScript · Offline-First',
+      AUTOMATION: 'Node.js · Python · Workflows & MCP',
+      RESEARCH: 'HippoRAG · Análise & Documentação',
+      SYSTEM: 'TypeScript · SQLite WAL · Sidecar',
+      CUSTOM: 'TypeScript · Node.js',
+    };
+
     const slug = cleanName
       .toLowerCase()
       .replace(/[^a-z0-9]+/g, '-')
       .replace(/(^-|-$)/g, '');
     const nowIso = new Date().toISOString();
     const id = `proj-${Date.now()}`;
+    const defaultChatId = `chat-${Date.now() + 1}`;
+    const cleanDesc = String(
+      ideaBrief || description || 'Nova ideia criada no Estúdio J.A.R.V.I.S.'
+    ).trim();
+
     const newProj: ProjectWorkspace = {
       id,
       name: cleanName,
       slug: slug || id,
       rootPath: String(rootPath || '.').trim() || '.',
-      techStack: String(techStack || 'TypeScript · Node.js').trim(),
+      techStack: String(techStack || defaultStackByCat[resolvedCategory]).trim(),
       gitBranch: String(gitBranch || 'main').trim() || 'main',
-      description: String(description || 'Projeto registado na carteira multi-projeto do Jarvis.').trim(),
+      description: cleanDesc,
+      ideaCategory: resolvedCategory,
+      ideaBrief: cleanDesc,
+      activeSkillIds: Array.isArray(activeSkillIds)
+        ? activeSkillIds.map(String)
+        : ['skill-ast-refactor', 'skill-hippo-curator'],
+      defaultChatId,
       status: 'ACTIVE',
       proactiveEnabled: proactiveEnabled !== false,
       proactiveIntervalSec: Math.max(30, Number(proactiveIntervalSec) || 90),
-      healthScore: 95,
+      healthScore: 96,
       openTasksCount: 1,
       assignedAgentIds: Array.isArray(assignedAgentIds)
         ? assignedAgentIds.map(String)
@@ -317,10 +376,46 @@ async function startServer() {
       proactiveInsights: [],
     };
 
+    const initialChat: ChatThread = {
+      id: defaultChatId,
+      projectId: id,
+      title: 'Planeamento Principal',
+      createdAt: nowIso,
+      updatedAt: nowIso,
+      primaryAgentId: 'room-exec',
+      participatingAgentIds: newProj.assignedAgentIds,
+      screenAutoSendEnabled: true,
+    };
+
     db.update((draft) => {
       if (!draft.projects) draft.projects = [];
+      if (!draft.chatThreads) draft.chatThreads = [];
       draft.projects.unshift(newProj);
+      draft.chatThreads.unshift(initialChat);
       draft.activeProjectId = newProj.id;
+      draft.activeChatId = initialChat.id;
+      draft.messages.push({
+        id: `msg-welcome-${id}`,
+        roomId: 'room-exec',
+        chatId: initialChat.id,
+        projectId: id,
+        agentName: 'Jarvis',
+        role: 'assistant',
+        content: `Projeto **${newProj.name}** criado! Descreve o que queres construir ou alcançar nesta ideia — vou definir automaticamente os **Goals**, recrutar **Sub-Agentes** especialistas e ativar as **Skills** necessárias enquanto conversamos.`,
+        createdAt: nowIso,
+        engineUsed: 'JARVIS_STUDIO_ORCHESTRATOR',
+      });
+    });
+
+    db.appendActivityLog({
+      projectId: id,
+      chatId: defaultChatId,
+      actor: 'Jarvis',
+      kind: 'THOUGHT',
+      status: 'SUCCESS',
+      summary: `Espaço de projeto "${newProj.name}" inicializado (${resolvedCategory})`,
+      detail: cleanDesc,
+      durationMs: 2,
     });
 
     if (newProj.proactiveEnabled) {
@@ -331,8 +426,10 @@ async function startServer() {
     broadcastSse('state_updated', { section: 'projects' });
     res.json({
       project: (db.getState().projects || []).find((p) => p.id === id) || newProj,
+      chatThread: initialChat,
       projects: db.getState().projects,
       activeProjectId: db.getState().activeProjectId,
+      activeChatId: db.getState().activeChatId,
     });
   });
 
@@ -376,11 +473,35 @@ async function startServer() {
 
   app.post('/api/projects/:id/activate', (req, res) => {
     let found: ProjectWorkspace | undefined;
+    let resolvedChatId: string | undefined;
     db.update((draft) => {
       const target = (draft.projects || []).find((p) => p.id === req.params.id);
       if (target) {
         draft.activeProjectId = target.id;
         if (target.status === 'STANDBY') target.status = 'ACTIVE';
+        const projChats = (draft.chatThreads || []).filter((c) => c.projectId === target.id);
+        if (projChats.length > 0) {
+          const preferred =
+            projChats.find((c) => c.id === target.defaultChatId) || projChats[0];
+          draft.activeChatId = preferred.id;
+          resolvedChatId = preferred.id;
+        } else {
+          const fallbackChat: ChatThread = {
+            id: `chat-${target.id}-main`,
+            projectId: target.id,
+            title: 'Planeamento Principal',
+            createdAt: new Date().toISOString(),
+            updatedAt: new Date().toISOString(),
+            primaryAgentId: 'room-exec',
+            participatingAgentIds: target.assignedAgentIds || ['room-exec'],
+            screenAutoSendEnabled: true,
+          };
+          if (!draft.chatThreads) draft.chatThreads = [];
+          draft.chatThreads.push(fallbackChat);
+          target.defaultChatId = fallbackChat.id;
+          draft.activeChatId = fallbackChat.id;
+          resolvedChatId = fallbackChat.id;
+        }
         found = { ...target };
       }
     });
@@ -389,7 +510,7 @@ async function startServer() {
       return;
     }
     broadcastSse('state_updated', { section: 'projects' });
-    res.json({ project: found, activeProjectId: found.id });
+    res.json({ project: found, activeProjectId: found.id, activeChatId: resolvedChatId });
   });
 
   app.patch('/api/projects/:id', async (req, res) => {
@@ -404,6 +525,11 @@ async function startServer() {
       if (typeof body.rootPath === 'string' && body.rootPath.trim()) target.rootPath = body.rootPath.trim();
       if (typeof body.techStack === 'string') target.techStack = body.techStack.trim();
       if (typeof body.description === 'string') target.description = body.description.trim();
+      if (typeof body.ideaBrief === 'string') target.ideaBrief = body.ideaBrief.trim();
+      if (body.ideaCategory) target.ideaCategory = body.ideaCategory;
+      if (Array.isArray(body.activeSkillIds)) {
+        target.activeSkillIds = body.activeSkillIds.map(String);
+      }
       if (body.status && ['ACTIVE', 'STANDBY', 'AUDITING'].includes(body.status)) {
         target.status = body.status;
       }
@@ -453,8 +579,16 @@ async function startServer() {
       const target = (draft.projects || []).find((p) => p.id === req.params.id);
       if (target) removed = target.name;
       draft.projects = (draft.projects || []).filter((p) => p.id !== req.params.id);
+      draft.chatThreads = (draft.chatThreads || []).filter((c) => c.projectId !== req.params.id);
+      draft.projectActivityLogs = (draft.projectActivityLogs || []).filter(
+        (l) => l.projectId !== req.params.id
+      );
       if (draft.activeProjectId === req.params.id && draft.projects[0]) {
         draft.activeProjectId = draft.projects[0].id;
+        const nextChat = (draft.chatThreads || []).find(
+          (c) => c.projectId === draft.activeProjectId
+        );
+        if (nextChat) draft.activeChatId = nextChat.id;
       }
     });
     if (!removed) {
@@ -462,7 +596,155 @@ async function startServer() {
       return;
     }
     broadcastSse('state_updated', { section: 'projects' });
-    res.json({ ok: true, projects: db.getState().projects, activeProjectId: db.getState().activeProjectId });
+    res.json({
+      ok: true,
+      projects: db.getState().projects,
+      activeProjectId: db.getState().activeProjectId,
+      activeChatId: db.getState().activeChatId,
+    });
+  });
+
+  // Chat Threads inside Idea Projects
+  app.post('/api/chats', (req, res) => {
+    const state = db.getState();
+    const projectId = String(req.body?.projectId || state.activeProjectId || 'proj-website-studio');
+    const proj = (state.projects || []).find((p) => p.id === projectId) || (state.projects || [])[0];
+    if (!proj) {
+      res.status(404).json({ error: 'Projeto não encontrado.' });
+      return;
+    }
+
+    const cleanTitle = String(req.body?.title || '').trim() || 'Nova Conversa';
+    const primaryAgentId = String(req.body?.primaryAgentId || 'room-exec');
+    const nowIso = new Date().toISOString();
+    const chat: ChatThread = {
+      id: `chat-${Date.now()}-${Math.random().toString(36).slice(2, 5)}`,
+      projectId: proj.id,
+      title: cleanTitle,
+      createdAt: nowIso,
+      updatedAt: nowIso,
+      primaryAgentId,
+      participatingAgentIds: Array.from(
+        new Set([primaryAgentId, ...(proj.assignedAgentIds || ['room-exec'])])
+      ),
+      screenAutoSendEnabled: true,
+    };
+
+    const agentRoom = state.rooms.find((r) => r.id === primaryAgentId) || state.rooms[0];
+
+    db.update((draft) => {
+      if (!draft.chatThreads) draft.chatThreads = [];
+      draft.chatThreads.unshift(chat);
+      draft.activeProjectId = proj.id;
+      draft.activeChatId = chat.id;
+      draft.messages.push({
+        id: `msg-welcome-${chat.id}`,
+        roomId: agentRoom.id,
+        chatId: chat.id,
+        projectId: proj.id,
+        agentName: agentRoom.name,
+        role: 'assistant',
+        content: `Nova conversa iniciada em **${proj.name}**. Os Goals e Sub-Agentes deste projeto estão disponíveis, e os logs de execução à direita ficam isolados para esta conversa.`,
+        createdAt: nowIso,
+        engineUsed: 'JARVIS_STUDIO_ORCHESTRATOR',
+      });
+    });
+
+    db.appendActivityLog({
+      projectId: proj.id,
+      chatId: chat.id,
+      actor: agentRoom.name,
+      kind: 'THOUGHT',
+      status: 'SUCCESS',
+      summary: `Conversa "${chat.title}" iniciada em ${proj.name}`,
+      durationMs: 1,
+    });
+
+    broadcastSse('state_updated', { section: 'chats' });
+    res.json({
+      chat,
+      chatThreads: db.getState().chatThreads,
+      activeChatId: chat.id,
+      activeProjectId: proj.id,
+    });
+  });
+
+  app.post('/api/chats/:id/activate', (req, res) => {
+    let found: ChatThread | null = null;
+    db.update((draft) => {
+      const target = (draft.chatThreads || []).find((c) => c.id === req.params.id);
+      if (target) {
+        draft.activeChatId = target.id;
+        draft.activeProjectId = target.projectId;
+        found = { ...target };
+      }
+    });
+    if (!found) {
+      res.status(404).json({ error: 'Conversa não encontrada.' });
+      return;
+    }
+    broadcastSse('state_updated', { section: 'chats' });
+    res.json({ chat: found, activeChatId: (found as ChatThread).id });
+  });
+
+  app.patch('/api/chats/:id', (req, res) => {
+    const body = req.body || {};
+    let updated: ChatThread | null = null;
+    db.update((draft) => {
+      const target = (draft.chatThreads || []).find((c) => c.id === req.params.id);
+      if (!target) return;
+      if (typeof body.title === 'string' && body.title.trim()) {
+        target.title = body.title.trim();
+      }
+      if (typeof body.primaryAgentId === 'string' && body.primaryAgentId.trim()) {
+        target.primaryAgentId = body.primaryAgentId.trim();
+      }
+      if (typeof body.screenAutoSendEnabled === 'boolean') {
+        target.screenAutoSendEnabled = body.screenAutoSendEnabled;
+      }
+      target.updatedAt = new Date().toISOString();
+      updated = { ...target };
+    });
+    if (!updated) {
+      res.status(404).json({ error: 'Conversa não encontrada.' });
+      return;
+    }
+    broadcastSse('state_updated', { section: 'chats' });
+    res.json({ chat: updated, chatThreads: db.getState().chatThreads });
+  });
+
+  app.delete('/api/chats/:id', (req, res) => {
+    const state = db.getState();
+    const target = (state.chatThreads || []).find((c) => c.id === req.params.id);
+    if (!target) {
+      res.status(404).json({ error: 'Conversa não encontrada.' });
+      return;
+    }
+    const siblingCount = (state.chatThreads || []).filter(
+      (c) => c.projectId === target.projectId
+    ).length;
+    if (siblingCount <= 1) {
+      res.status(400).json({ error: 'Mantém pelo menos uma conversa ativa no projeto.' });
+      return;
+    }
+
+    db.update((draft) => {
+      draft.chatThreads = (draft.chatThreads || []).filter((c) => c.id !== req.params.id);
+      draft.messages = draft.messages.filter((m) => m.chatId !== req.params.id);
+      draft.projectActivityLogs = (draft.projectActivityLogs || []).filter(
+        (l) => l.chatId !== req.params.id
+      );
+      if (draft.activeChatId === req.params.id) {
+        const next = (draft.chatThreads || []).find((c) => c.projectId === target.projectId);
+        if (next) draft.activeChatId = next.id;
+      }
+    });
+    broadcastSse('state_updated', { section: 'chats' });
+    res.json({
+      ok: true,
+      chatThreads: db.getState().chatThreads,
+      activeChatId: db.getState().activeChatId,
+    });
   });
 
   app.post('/api/projects/proactive-scan', async (req, res) => {
@@ -531,45 +813,138 @@ async function startServer() {
   });
 
   app.post('/api/goals', (req, res) => {
-    const { title, category, targetMetric, deadline } = req.body || {};
+    const {
+      title,
+      category,
+      targetMetric,
+      deadline,
+      projectId,
+      chatId,
+      assignedAgentId,
+      subtasks,
+    } = req.body || {};
     if (!title || !String(title).trim()) {
       res.status(400).json({ error: 'Título do objetivo é obrigatório.' });
       return;
     }
-    const goal = {
+    const state = db.getState();
+    const resolvedProjId = String(projectId || state.activeProjectId || 'proj-website-studio');
+    const resolvedChatId = String(chatId || state.activeChatId || 'chat-web-main');
+    const parsedSubtasks: GoalSubtask[] | undefined = Array.isArray(subtasks)
+      ? subtasks
+          .map((s: unknown, idx: number) => {
+            if (typeof s === 'string') {
+              return { id: `st-${Date.now()}-${idx}`, title: s.trim(), done: false };
+            }
+            const obj = s as Partial<GoalSubtask>;
+            return {
+              id: obj.id || `st-${Date.now()}-${idx}`,
+              title: String(obj.title || '').trim(),
+              done: Boolean(obj.done),
+            };
+          })
+          .filter((st) => st.title.length > 0)
+      : undefined;
+
+    const initialProg =
+      parsedSubtasks && parsedSubtasks.length > 0
+        ? computeGoalProgressFromSubtasks(parsedSubtasks, 0).progress
+        : 10;
+
+    const goal: GoalItem = {
       id: `goal-${Date.now()}`,
       title: String(title).trim(),
-      category: String(category || 'Estratégia').trim(),
-      progress: 10,
+      category: String(category || 'Planeamento').trim(),
+      progress: initialProg,
       targetMetric: String(targetMetric || 'Meta verificável').trim(),
       deadline: String(deadline || '2026-12-31'),
-      status: 'ACTIVE' as const,
+      status: initialProg >= 100 ? 'COMPLETED' : 'ACTIVE',
+      projectId: resolvedProjId,
+      chatId: resolvedChatId,
+      assignedAgentId: assignedAgentId ? String(assignedAgentId) : undefined,
+      subtasks: parsedSubtasks,
+      createdBy: 'OPERATOR',
+      updatedAt: new Date().toISOString(),
     };
     db.update((draft) => {
       draft.goals.unshift(goal);
     });
+    db.appendActivityLog({
+      projectId: resolvedProjId,
+      chatId: resolvedChatId,
+      actor: state.settings.operatorName || 'Operador',
+      kind: 'GOAL_CREATED',
+      status: 'SUCCESS',
+      summary: `Goal adicionado: "${goal.title}"`,
+      detail: goal.targetMetric,
+      durationMs: 1,
+      relatedGoalId: goal.id,
+    });
+    broadcastSse('state_updated', { section: 'goals' });
     res.json({ goal });
   });
 
   app.patch('/api/goals/:id', (req, res) => {
-    const { progress, status } = req.body || {};
-    let updated = null;
+    const { title, progress, status, subtasks, assignedAgentId } = req.body || {};
+    let updated: GoalItem | null = null;
     db.update((draft) => {
       const g = draft.goals.find((x) => x.id === req.params.id);
       if (g) {
-        if (typeof progress === 'number') {
+        if (typeof title === 'string' && title.trim()) {
+          g.title = title.trim();
+        }
+        if (Array.isArray(subtasks)) {
+          g.subtasks = subtasks.map((st: GoalSubtask, idx: number) => ({
+            id: st.id || `st-${Date.now()}-${idx}`,
+            title: String(st.title || '').trim(),
+            done: Boolean(st.done),
+          }));
+          g.progress = computeGoalProgressFromSubtasks(g.subtasks, g.progress).progress;
+          g.status = g.progress >= 100 ? 'COMPLETED' : g.status === 'COMPLETED' ? 'ACTIVE' : g.status;
+        } else if (typeof progress === 'number') {
           g.progress = Math.max(0, Math.min(100, progress));
           if (g.progress === 100) g.status = 'COMPLETED';
         }
-        if (status) g.status = status;
-        updated = g;
+        if (status && ['ACTIVE', 'COMPLETED', 'AT_RISK'].includes(status)) {
+          g.status = status;
+        }
+        if (assignedAgentId !== undefined) {
+          g.assignedAgentId = assignedAgentId ? String(assignedAgentId) : undefined;
+        }
+        g.updatedAt = new Date().toISOString();
+        updated = { ...g };
       }
     });
     if (!updated) {
       res.status(404).json({ error: 'Objetivo não encontrado.' });
       return;
     }
+    const gObj = updated as GoalItem;
+    db.appendActivityLog({
+      projectId: gObj.projectId || db.getState().activeProjectId || 'proj-website-studio',
+      chatId: gObj.chatId || db.getState().activeChatId || 'chat-web-main',
+      actor: db.getState().settings.operatorName || 'Operador',
+      kind: 'GOAL_UPDATED',
+      status: 'SUCCESS',
+      summary: `Goal atualizado: "${gObj.title}" (${gObj.progress}%)`,
+      durationMs: 1,
+      relatedGoalId: gObj.id,
+    });
+    broadcastSse('state_updated', { section: 'goals' });
     res.json({ goal: updated });
+  });
+
+  app.delete('/api/goals/:id', (req, res) => {
+    const existed = db.getState().goals.some((g) => g.id === req.params.id);
+    if (!existed) {
+      res.status(404).json({ error: 'Goal não encontrado.' });
+      return;
+    }
+    db.update((draft) => {
+      draft.goals = draft.goals.filter((g) => g.id !== req.params.id);
+    });
+    broadcastSse('state_updated', { section: 'goals' });
+    res.json({ ok: true, goals: db.getState().goals });
   });
 
   app.post('/api/contracts', (req, res) => {
@@ -728,29 +1103,183 @@ async function startServer() {
   });
 
   // ==========================================================================
-  // 2. Multimodal Agentic Chat & Specialist Rooms
+  // 2. Multimodal Agentic Chat, Activity Logs, Screen Vision & Specialist Rooms
   // ==========================================================================
   app.post('/api/chat/send', async (req, res) => {
-    const { roomId, content, attachments } = req.body || {};
-    if (!content?.trim() && (!Array.isArray(attachments) || attachments.length === 0)) {
+    const { roomId, chatId, projectId, content, attachments, screenFrame } = req.body || {};
+    if (
+      !content?.trim() &&
+      (!Array.isArray(attachments) || attachments.length === 0) &&
+      !screenFrame?.dataBase64
+    ) {
       res.status(400).json({ error: 'Mensagem vazia.' });
       return;
     }
     const result = await runAgentChatTurn({
-      roomId: String(roomId || 'room-exec'),
+      roomId: roomId ? String(roomId) : undefined,
+      chatId: chatId ? String(chatId) : undefined,
+      projectId: projectId ? String(projectId) : undefined,
       userText: String(content || ''),
       attachments: Array.isArray(attachments) ? attachments : [],
+      screenFrame:
+        screenFrame && typeof screenFrame === 'object' && screenFrame.dataBase64
+          ? {
+              mimeType: String(screenFrame.mimeType || 'image/jpeg'),
+              dataBase64: String(screenFrame.dataBase64),
+              width: Number(screenFrame.width) || 1280,
+              height: Number(screenFrame.height) || 720,
+              source:
+                screenFrame.source === 'SIDECAR_NATIVE' ? 'SIDECAR_NATIVE' : 'BROWSER_STREAM',
+              activeWindowTitle: screenFrame.activeWindowTitle
+                ? String(screenFrame.activeWindowTitle)
+                : undefined,
+            }
+          : undefined,
       activePort: PORT,
     });
-    broadcastSse('chat_message', { roomId, assistantMessage: result.assistantMessage });
+    broadcastSse('chat_message', {
+      roomId: result.assistantMessage.roomId,
+      chatId: result.assistantMessage.chatId,
+      projectId: result.assistantMessage.projectId,
+      assistantMessage: result.assistantMessage,
+    });
+    broadcastSse('state_updated', { section: 'studio_turn' });
     res.json(result);
   });
 
   app.delete('/api/chat/:roomId/clear', (req, res) => {
+    const chatId = req.query.chatId ? String(req.query.chatId) : undefined;
     db.update((draft) => {
-      draft.messages = draft.messages.filter((m) => m.roomId !== req.params.roomId);
+      if (chatId) {
+        draft.messages = draft.messages.filter((m) => m.chatId !== chatId);
+      } else {
+        draft.messages = draft.messages.filter((m) => m.roomId !== req.params.roomId);
+      }
     });
+    broadcastSse('state_updated', { section: 'chats' });
     res.json({ ok: true });
+  });
+
+  app.get('/api/activity-logs', (req, res) => {
+    const state = db.getState();
+    const projectId = req.query.projectId
+      ? String(req.query.projectId)
+      : state.activeProjectId;
+    const chatId = req.query.chatId ? String(req.query.chatId) : state.activeChatId;
+    const scope: 'CHAT' | 'PROJECT' = req.query.scope === 'PROJECT' ? 'PROJECT' : 'CHAT';
+    const logs = filterProjectActivityLogs(state.projectActivityLogs || [], {
+      projectId,
+      chatId,
+      scope,
+    });
+    res.json({ logs, count: logs.length });
+  });
+
+  app.delete('/api/activity-logs', (req, res) => {
+    const projectId = req.query.projectId ? String(req.query.projectId) : undefined;
+    const chatId = req.query.chatId ? String(req.query.chatId) : undefined;
+    const scope: 'CHAT' | 'PROJECT' = req.query.scope === 'PROJECT' ? 'PROJECT' : 'CHAT';
+
+    db.update((draft) => {
+      const current = draft.projectActivityLogs || [];
+      if (scope === 'CHAT' && chatId) {
+        draft.projectActivityLogs = current.filter((l) => l.chatId !== chatId);
+      } else if (projectId) {
+        draft.projectActivityLogs = current.filter((l) => l.projectId !== projectId);
+      } else {
+        draft.projectActivityLogs = [];
+      }
+    });
+    broadcastSse('state_updated', { section: 'activity_logs' });
+    res.json({ ok: true, logs: db.getState().projectActivityLogs || [] });
+  });
+
+  app.post('/api/screen/sidecar-capture', async (req, res) => {
+    const deviceId = String(req.body?.deviceId || 'dev-local-host');
+    const projectId = String(
+      req.body?.projectId || db.getState().activeProjectId || 'proj-website-studio'
+    );
+    const chatId = String(
+      req.body?.chatId || db.getState().activeChatId || 'chat-web-main'
+    );
+
+    const snapshot = await captureSidecarDesktopScreen(deviceId, PORT);
+    db.update((draft) => {
+      draft.latestScreenSnapshot = snapshot;
+    });
+
+    const logEntry = db.appendActivityLog({
+      projectId,
+      chatId,
+      actor: 'Sidecar Desktop',
+      kind: 'SCREEN_VISION',
+      status: 'SUCCESS',
+      summary: `Captura nativa Sidecar (${snapshot.width}×${snapshot.height})`,
+      detail: `Janela ativa: ${snapshot.activeWindowTitle || snapshot.hostname}`,
+      durationMs: 12,
+    });
+
+    broadcastSse('activity_log', logEntry);
+    broadcastSse('state_updated', { section: 'screen' });
+    res.json({ snapshot });
+  });
+
+  app.post('/api/screen/analyze', async (req, res) => {
+    const { projectId, chatId, prompt, screenFrame, postToChat } = req.body || {};
+    const result = await analyzeLiveScreenFrame({
+      projectId: projectId ? String(projectId) : undefined,
+      chatId: chatId ? String(chatId) : undefined,
+      prompt: prompt ? String(prompt) : undefined,
+      screenFrame:
+        screenFrame && typeof screenFrame === 'object' && screenFrame.dataBase64
+          ? {
+              mimeType: String(screenFrame.mimeType || 'image/jpeg'),
+              dataBase64: String(screenFrame.dataBase64),
+              width: Number(screenFrame.width) || 1280,
+              height: Number(screenFrame.height) || 720,
+              source:
+                screenFrame.source === 'SIDECAR_NATIVE' ? 'SIDECAR_NATIVE' : 'BROWSER_STREAM',
+              activeWindowTitle: screenFrame.activeWindowTitle
+                ? String(screenFrame.activeWindowTitle)
+                : undefined,
+            }
+          : undefined,
+      activePort: PORT,
+    });
+
+    if (postToChat) {
+      const state = db.getState();
+      const targetProjId = String(projectId || state.activeProjectId || 'proj-website-studio');
+      const targetChatId = String(chatId || state.activeChatId || 'chat-web-main');
+      db.update((draft) => {
+        draft.messages.push({
+          id: `msg-screen-${Date.now()}`,
+          roomId: 'room-exec',
+          chatId: targetChatId,
+          projectId: targetProjId,
+          agentName: 'Visão Jarvis',
+          role: 'assistant',
+          content: `**Observação em Tempo Real do Teu Ecrã**:\n\n${result.analysis}`,
+          createdAt: new Date().toISOString(),
+          engineUsed: result.engineUsed,
+          screenIncluded: true,
+          studioEvents: [
+            {
+              type: 'SCREEN',
+              id: result.snapshot.id,
+              title:
+                result.snapshot.source === 'BROWSER_STREAM'
+                  ? 'Análise de Ecrã em Direto'
+                  : 'Análise de Ecrã via Sidecar',
+              subtitle: `${result.snapshot.width}×${result.snapshot.height}`,
+            },
+          ],
+        });
+      });
+    }
+
+    broadcastSse('state_updated', { section: 'screen' });
+    res.json(result);
   });
 
   app.post('/api/rooms', (req, res) => {
@@ -768,23 +1297,23 @@ async function startServer() {
     const validColors = ['cyan', 'amber', 'emerald', 'rose', 'violet'] as const;
     const accentColor = validColors.includes(body.accentColor)
       ? body.accentColor
-      : tpl?.accentColor || 'cyan';
+      : tpl?.accentColor || 'amber';
 
     const room: Room = {
       id: `room-custom-${Date.now()}`,
       name,
       callsign: String(body.callsign || tpl?.callsign || `AGENT-${Math.floor(10 + Math.random() * 89)}`).trim(),
-      roleTitle: String(body.roleTitle || tpl?.roleTitle || 'Agente Especialista Personalizado').trim(),
-      description: String(body.description || tpl?.description || 'Agente recrutado pelo Operador.').trim(),
+      roleTitle: String(body.roleTitle || tpl?.roleTitle || 'Sub-Agente Especialista').trim(),
+      description: String(body.description || tpl?.description || 'Sub-agente recrutado para o projeto.').trim(),
       systemPrompt: String(
         body.systemPrompt ||
           tpl?.systemPrompt ||
-          `Atua como ${name} no J.A.R.V.I.S. Cortex OS em Português de Portugal (PT-PT).`
+          `Atua como ${name} no J.A.R.V.I.S. Studio em Português de Portugal (PT-PT).`
       ).trim(),
       accentColor,
       allowedTools: Array.isArray(body.allowedTools)
         ? body.allowedTools.map(String)
-        : tpl?.allowedTools || ['search_memories', 'lookup_ast_symbol'],
+        : tpl?.allowedTools || ['upsert_project_goal', 'search_memories', 'lookup_ast_symbol'],
       projectId: body.projectId ? String(body.projectId) : undefined,
       modelOverride: body.modelOverride ? String(body.modelOverride).trim() : undefined,
       isCustom: true,
@@ -793,15 +1322,37 @@ async function startServer() {
     const nowIso = new Date().toISOString();
     db.update((draft) => {
       draft.rooms.push(room);
+      if (room.projectId) {
+        const proj = (draft.projects || []).find((p) => p.id === room.projectId);
+        if (proj && !proj.assignedAgentIds.includes(room.id)) {
+          proj.assignedAgentIds.push(room.id);
+        }
+      }
       draft.messages.push({
         id: `msg-welcome-${room.id}`,
         roomId: room.id,
+        projectId: room.projectId,
+        agentName: room.name,
         role: 'assistant',
-        content: `Agente **${room.name}** (\`${room.callsign}\`) operacional e integrado na frota. Ferramentas autorizadas: \`${room.allowedTools.join(', ')}\`.`,
+        content: `Sub-agente **${room.name}** (\`${room.callsign}\`) operacional e integrado no projeto. Ferramentas autorizadas: \`${room.allowedTools.join(', ')}\`.`,
         createdAt: nowIso,
         engineUsed: 'AGENT_RECRUITMENT_GATE',
       });
     });
+
+    if (room.projectId) {
+      db.appendActivityLog({
+        projectId: room.projectId,
+        chatId: body.chatId ? String(body.chatId) : db.getState().activeChatId || 'chat-web-main',
+        actor: db.getState().settings.operatorName || 'Operador',
+        kind: 'AGENT_SPAWNED',
+        status: 'SUCCESS',
+        summary: `Sub-agente adicionado: "${room.name}" (${room.callsign})`,
+        detail: room.roleTitle,
+        durationMs: 2,
+        relatedAgentId: room.id,
+      });
+    }
 
     db.appendAudit('OPERATOR', 'ORBIT', 'AGENT_RECRUITED', `${room.name} (${room.callsign})`, 'VERIFIED');
     broadcastSse('state_updated', { section: 'rooms' });
@@ -2552,7 +3103,13 @@ async function startServer() {
   });
 
   app.patch('/api/settings', (req, res) => {
-    const updates = req.body || {};
+    const updates = { ...(req.body || {}) };
+    if (typeof updates.preferredGeminiModel === 'string') {
+      updates.preferredGeminiModel = normalizeGeminiModelId(updates.preferredGeminiModel);
+    }
+    if (typeof updates.preferredVoiceName === 'string') {
+      updates.preferredVoiceName = normalizeGeminiVoiceName(updates.preferredVoiceName);
+    }
     db.update((draft) => {
       draft.settings = {
         ...draft.settings,
@@ -2561,10 +3118,59 @@ async function startServer() {
     });
     startOrRefreshHeartbeatDaemon(PORT);
     db.appendAudit('OPERATOR', 'SYSTEM', 'SETTINGS_UPDATED', 'Preferências do sistema atualizadas.', 'VERIFIED');
+    broadcastSse('state_updated', { section: 'settings' });
     res.json({ settings: db.getState().settings });
   });
 
+  app.get('/api/voice/catalog', (_req, res) => {
+    loadDotEnvIfPresent();
+    const state = db.getState();
+    res.json({
+      voices: GEMINI_VOICE_CATALOG,
+      preferredVoiceName: normalizeGeminiVoiceName(state.settings.preferredVoiceName),
+      voiceDspEnabled: Boolean(state.settings.voiceDspEnabled),
+      liveVoiceScreenSync: state.settings.liveVoiceScreenSync !== false,
+      geminiConfigured: Boolean(process.env.GEMINI_API_KEY?.trim()),
+      models: {
+        liveConversation: 'gemini-3.8-live',
+        audioTranscribe: 'gemini-3.5-transcribe',
+        voicePreview: 'gemini-3.8-flash-lite-tts',
+      },
+    });
+  });
+
+  app.post('/api/voice/preview', async (req, res) => {
+    loadDotEnvIfPresent();
+    const result = await synthesizeVoicePreviewServerSide({
+      voiceName: req.body?.voiceName ? String(req.body.voiceName) : undefined,
+      language: req.body?.language,
+      customText: req.body?.customText ? String(req.body.customText) : undefined,
+    });
+    res.json(result);
+  });
+
+  app.post('/api/audio/transcribe', async (req, res) => {
+    loadDotEnvIfPresent();
+    const audioBase64 = String(req.body?.audioBase64 || '');
+    if (!audioBase64.trim()) {
+      res.status(400).json({ ok: false, transcript: '', error: 'Áudio em falta.' });
+      return;
+    }
+    const result = await transcribeAudioServerSide({
+      audioBase64,
+      mimeType: req.body?.mimeType ? String(req.body.mimeType) : 'audio/webm',
+      language: req.body?.language,
+      projectId: req.body?.projectId ? String(req.body.projectId) : undefined,
+      chatId: req.body?.chatId ? String(req.body.chatId) : undefined,
+    });
+    if (result.ok && result.transcript) {
+      broadcastSse('state_updated', { section: 'audio_transcribe' });
+    }
+    res.json(result);
+  });
+
   app.post('/api/settings/test-provider', async (req, res) => {
+    loadDotEnvIfPresent();
     const result = await testModelProviderConnection(req.body || {});
     res.json(result);
   });
@@ -2589,19 +3195,35 @@ async function startServer() {
   });
 
   // ==========================================================================
-  // Vite Middleware (Dev) or Static Bundle (Production)
+  // Vite Middleware (Dev) or Static Bundle (Production) + Fast Port 3000 Bind
   // ==========================================================================
-  const isProd = process.env.NODE_ENV === 'production' && fs.existsSync(path.join(__dirname, 'dist', 'index.html'));
+  const httpServer = http.createServer(app);
+  attachGeminiLiveWebSocketServer({
+    httpServer,
+    activePort: PORT,
+    broadcastSse,
+  });
+  const isProd =
+    process.env.NODE_ENV === 'production' &&
+    fs.existsSync(path.join(__dirname, 'dist', 'index.html'));
+
   if (!isProd) {
-    const { createServer: createViteServer } = await import('vite');
-    const vite = await createViteServer({
-      server: {
-        middlewareMode: true,
-        hmr: process.env.DISABLE_HMR !== 'true',
-      },
-      appType: 'spa',
+    const vitePromise = import('vite').then(({ createServer: createViteServer }) =>
+      createViteServer({
+        server: {
+          middlewareMode: true,
+          allowedHosts: true,
+          hmr: false,
+        },
+        appType: 'spa',
+      })
+    );
+
+    app.use((req, res, next) => {
+      vitePromise
+        .then((vite) => vite.middlewares(req, res, next))
+        .catch((err) => next(err));
     });
-    app.use(vite.middlewares);
   } else {
     const distPath = path.join(__dirname, 'dist');
     app.use(express.static(distPath));
@@ -2610,7 +3232,7 @@ async function startServer() {
     });
   }
 
-  app.listen(PORT, HOST, () => {
+  httpServer.listen(PORT, HOST, () => {
     printStartupDebugBanner({
       port: PORT,
       host: HOST,
@@ -2622,7 +3244,18 @@ async function startServer() {
     console.log(
       `[J.A.R.V.I.S. Cortex OS v3.0] Listening on http://${HOST}:${PORT} (${db.getEngineName()} + MCP 2026)`
     );
+
+    // Defer background AST indexing and heartbeat daemon until after HTTP port 3000 is serving requests
+    setTimeout(() => {
+      startOrRefreshHeartbeatDaemon(PORT);
+      buildScoutWorkspaceIndex().catch((err) => {
+        debugLog('WARN', 'SCOUT-AST', `Initial AST pre-warm warning: ${(err as Error).message}`);
+      });
+    }, 1500);
   });
 }
 
-startServer();
+startServer().catch((err) => {
+  console.error('[FATAL] Failed to start server:', err);
+  process.exit(1);
+});

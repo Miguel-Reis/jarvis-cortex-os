@@ -35,17 +35,19 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({
   }, [open]);
 
   const navItems: { id: NavSectionId; label: string; hint: string }[] = [
-    { id: 'brief', label: 'Ir para Brief & Comando Executivo', hint: 'Q-18 · Proatividade · Contratos' },
-    { id: 'brain', label: 'Ir para Cérebro do J.A.R.V.I.S.', hint: 'Nativo v7.2 · Ponte :8765 · JEV-S1 · Ebbinghaus' },
-    { id: 'workspace', label: 'Ir para Projetos, AST & Terminal', hint: 'Multi-Projeto · Co-Change · Git' },
-    { id: 'chat', label: 'Ir para Agentes & Salas Táticas', hint: 'Recrutar Agentes · Multimodal · ReAct' },
-    { id: 'swarm', label: 'Ir para Enxame Swarm 48x & Escritório 3D', hint: 'SCOUT-01 · CoW Sandboxes · Verify Gates' },
-    { id: 'orbit', label: 'Ir para Orbit Agent OS', hint: 'DOTS · Self-Learn · Quota 5h & ROI' },
-    { id: 'workflows', label: 'Ir para Workflows & Automação Cron', hint: 'DAG · Heartbeat' },
-    { id: 'memory', label: 'Ir para Memory Vault & Grafo HippoRAG 2', hint: '4-Way RRF · 128-Bit BQ · Provenance' },
+    { id: 'studio', label: 'Ir para Estúdio de Ideias & Projetos', hint: 'Conversas · Goals · Sub-Agentes · Ecrã em Direto' },
+    { id: 'llm', label: 'Ir para Motores LLM, Custos & Conectividade', hint: 'Gemini · OpenRouter · Antigravity MCP · Ollama · Local' },
     { id: 'mcp', label: 'Ir para Gateway Nativo MCP 2026', hint: '18 Tools · 6 Recursos · Biblioteca Standard' },
     { id: 'skills', label: 'Ir para Skills, Biblioteca & Plugins', hint: 'Skills Standard · Hooks · Canais' },
     { id: 'devices', label: 'Ir para Máquina & Desktop Sidecar', hint: 'Controlo Direto · Janelas · Processos · Hotkeys' },
+    { id: 'brain', label: 'Ir para Cérebro do J.A.R.V.I.S.', hint: 'Nativo v7.2 · Ponte :8765 · JEV-S1 · Ebbinghaus' },
+    { id: 'memory', label: 'Ir para Memory Vault & Grafo HippoRAG 2', hint: '4-Way RRF · 128-Bit BQ · Provenance' },
+    { id: 'workflows', label: 'Ir para Workflows & Automação Cron', hint: 'DAG · Heartbeat' },
+    { id: 'swarm', label: 'Ir para Enxame Swarm 48x & Escritório 3D', hint: 'SCOUT-01 · CoW Sandboxes · Verify Gates' },
+    { id: 'orbit', label: 'Ir para Orbit Agent OS', hint: 'DOTS · Self-Learn · Quota 5h & ROI' },
+    { id: 'brief', label: 'Ir para Brief & Comando Executivo', hint: 'Q-18 · Proatividade · Contratos' },
+    { id: 'workspace', label: 'Ir para Projetos, AST & Terminal', hint: 'Multi-Projeto · Co-Change · Git' },
+    { id: 'chat', label: 'Ir para Agentes & Salas Táticas', hint: 'Recrutar Agentes · Multimodal · ReAct' },
     { id: 'authority', label: 'Ir para Definições, IA & Autoridade', hint: 'Motores IA · Allow-List · Canary · Backup' },
   ];
 
@@ -103,23 +105,23 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({
       onClick={onClose}
     >
       <div
-        className="w-full max-w-2xl jarvis-surface border border-slate-800 rounded-xl shadow-2xl overflow-hidden"
+        className="w-full max-w-2xl studio-card rounded-xl shadow-2xl overflow-hidden"
         onClick={(e) => e.stopPropagation()}
       >
-        <form onSubmit={handleDirectSubmit} className="flex items-center gap-3 px-4 py-3.5 border-b border-slate-800">
-          <Search className="w-4 h-4 text-cyan-400 shrink-0" />
+        <form onSubmit={handleDirectSubmit} className="flex items-center gap-3 px-4 py-3.5 border-b border-white/8">
+          <Search className="w-4 h-4 text-[#e59a54] shrink-0" />
           <input
             ref={inputRef}
             type="text"
             value={query}
             onChange={(e) => setQuery(e.target.value)}
-            placeholder="Alternar projeto, abrir Cérebro Jarvis, chamar agente ou enviar diretiva..."
+            placeholder="Alternar projeto, criar conversa, abrir Gateway MCP ou enviar diretiva..."
             className="flex-1 bg-transparent text-sm text-slate-100 placeholder:text-slate-500 focus:outline-none"
           />
           {query.trim() && (
             <button
               type="submit"
-              className="px-2.5 py-1 text-xs font-medium bg-cyan-500 text-slate-950 rounded-md hover:bg-cyan-400 transition-colors whitespace-nowrap shrink-0"
+              className="px-2.5 py-1 text-xs font-medium bg-[#e59a54] text-slate-950 rounded-md hover:bg-[#eba868] transition-colors whitespace-nowrap shrink-0"
             >
               Enviar ao Jarvis
             </button>

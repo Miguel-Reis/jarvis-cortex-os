@@ -1,23 +1,38 @@
-import { FunctionDeclaration, GoogleGenAI, Type } from '@google/genai';
+import { FunctionDeclaration, GoogleGenAI, ThinkingLevel, Type } from '@google/genai';
 import {
   buildDeterministicWorkflowFromPrompt,
+  computeGoalProgressFromSubtasks,
   detectPromptInjection,
+  extractDeterministicPlanFromPrompt,
+  isLocalOpenAiCompatibleEndpoint,
+  normalizeGeminiModelId,
   rankQ18Actions,
   routeJevS1,
   searchMemories4WayRRF,
 } from '../shared/cortex-math.ts';
+import { STANDARD_SKILLS_LIBRARY } from '../shared/skills-plugins-catalog.ts';
 import type {
   AttachmentItem,
   ChatMessage,
+  GoalItem,
+  GoalSubtask,
   JevRouteDecision,
   LanguageCode,
   MemoryCategory,
   PersonalityMode,
+  ProjectActivityLogEntry,
+  Room,
+  ScreenCaptureSnapshot,
+  SkillItem,
+  StudioInlineEvent,
   ToolCallRecord,
   WorkflowNode,
 } from '../shared/types.ts';
 import { db } from './db.ts';
+import { debugLog } from './debug-logger.ts';
+import { handleMcpJsonRpc } from './mcp-server.ts';
 import {
+  captureSidecarDesktopScreen,
   collectOSTelemetry,
   collectSidecarHostSnapshot,
   dispatchSidecarHostCommand,
@@ -34,16 +49,52 @@ import {
   lookupWorkspaceSymbols,
   storeBiTemporalMemory,
 } from './swarm-orbit-engine.ts';
-import { debugLog } from './debug-logger.ts';
 
 const roomDeltaHashes = new Map<string, string>();
+let studioActivityBroadcaster: ((event: string, payload: unknown) => void) | null = null;
 
-function getGeminiClient(): GoogleGenAI | null {
+export function registerStudioActivityBroadcaster(
+  fn: (event: string, payload: unknown) => void
+): void {
+  studioActivityBroadcaster = fn;
+}
+
+export function emitStudioActivity(
+  entry: Omit<ProjectActivityLogEntry, 'id' | 'timestamp'>
+): ProjectActivityLogEntry {
+  const saved = db.appendActivityLog(entry);
+  studioActivityBroadcaster?.('activity_log', saved);
+  return saved;
+}
+
+export interface StudioExecutionContext {
+  projectId: string;
+  chatId: string;
+  actor: string;
+  studioEventsOut: StudioInlineEvent[];
+}
+
+export interface IncomingScreenFrame {
+  mimeType: string;
+  dataBase64: string;
+  width?: number;
+  height?: number;
+  source?: 'BROWSER_STREAM' | 'SIDECAR_NATIVE';
+  activeWindowTitle?: string;
+}
+
+const RASTER_VISION_MIMES = new Set(['image/jpeg', 'image/png', 'image/webp']);
+
+export function getGeminiClient(
+  apiVersion: 'v1beta' | 'v1alpha' | 'v1' = 'v1beta'
+): GoogleGenAI | null {
   const apiKey = process.env.GEMINI_API_KEY?.trim();
   if (!apiKey) return null;
   return new GoogleGenAI({
     apiKey,
+    apiVersion,
     httpOptions: {
+      apiVersion,
       headers: {
         'User-Agent': 'aistudio-build',
       },
@@ -51,29 +102,164 @@ function getGeminiClient(): GoogleGenAI | null {
   });
 }
 
-function getPersonalityDirective(mode: PersonalityMode, lang: LanguageCode): string {
+export function getPersonalityDirective(mode: PersonalityMode, lang: LanguageModeAlias): string {
   const isPt = lang === 'pt-PT';
   const baseLang = isPt
-    ? 'Responde SEMPRE em Português de Portugal (PT-PT) natural, claro e preciso.'
+    ? 'Responde SEMPRE em Português de Portugal (PT-PT) natural, claro e articulado.'
     : 'Always respond in crisp, clear English (EN-US).';
 
   switch (mode) {
     case 'TACTICAL_ENGINEER':
-      return `${baseLang} Adota o perfil TACTICAL_ENGINEER: profundo rigor técnico, foco em código, AST, testes e telemetria real.`;
+      return `${baseLang} Adota rigor técnico profundo, estrutura modular, atenção a arquitetura, código, testes e dados reais.`;
     case 'WAR_ROOM_CONCISE':
-      return `${baseLang} Adota o perfil WAR_ROOM_CONCISE: respostas ultra-diretas em tópicos curtos orientados a ação imediata.`;
+      return `${baseLang} Sê direto, estruturado em pontos claros e orientado à próxima ação concreta.`;
     case 'GUARDIAN_DEFENSE':
-      return `${baseLang} Adota o perfil GUARDIAN_DEFENSE: vigilância máxima de cibersegurança, validação de fronteiras de confiança e zero risco.`;
+      return `${baseLang} Prioriza segurança, privacidade, validação de entradas e fronteiras de confiança.`;
     case 'STARK_EXECUTIVE':
     default:
-      return `${baseLang} Adota o perfil STARK_EXECUTIVE: calmo, articulado, proativo e orientado a decisões de alto impacto.`;
+      return `${baseLang} Atua como parceiro estratégico de estúdio (estilo Claude Projects & Antigravity): calmo, colaborativo, proativo a estruturar ideias em Goals e sub-agentes.`;
   }
 }
 
-const AGENT_TOOL_DECLARATIONS: FunctionDeclaration[] = [
+type LanguageModeAlias = LanguageCode;
+
+const STUDIO_CORE_TOOL_NAMES = new Set([
+  'upsert_project_goal',
+  'spawn_project_subagent',
+  'activate_antigravity_skill',
+  'call_mcp_gateway_tool',
+  'capture_and_inspect_sidecar_screen',
+]);
+
+export const AGENT_TOOL_DECLARATIONS: FunctionDeclaration[] = [
+  {
+    name: 'upsert_project_goal',
+    description:
+      'Create a new structured Goal or update an existing Goal in the active Idea Project, including actionable subtasks and progress.',
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        title: {
+          type: Type.STRING,
+          description: 'Clear, outcome-oriented title for the project Goal.',
+        },
+        category: {
+          type: Type.STRING,
+          description: 'Short category label such as Produto & UI, Backend & API, Mobile, Automação.',
+        },
+        targetMetric: {
+          type: Type.STRING,
+          description: 'Concrete definition of done or measurable target.',
+        },
+        progress: {
+          type: Type.NUMBER,
+          description: 'Optional completion percentage from 0 to 100.',
+        },
+        status: {
+          type: Type.STRING,
+          description: 'One of ACTIVE, COMPLETED, AT_RISK.',
+        },
+        subtasks: {
+          type: Type.ARRAY,
+          items: { type: Type.STRING },
+          description: 'List of 2 to 5 concrete checkable subtasks for this Goal.',
+        },
+        assignedAgentId: {
+          type: Type.STRING,
+          description: 'Optional Room/Sub-Agent ID responsible for this Goal.',
+        },
+      },
+      required: ['title'],
+    },
+  },
+  {
+    name: 'spawn_project_subagent',
+    description:
+      'Create and recruit a specialized Sub-Agent to help build, design, research, or test the current Idea Project.',
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        name: {
+          type: Type.STRING,
+          description: 'Human-readable name of the Sub-Agent (e.g. Arquiteto Backend & Stripe).',
+        },
+        callsign: {
+          type: Type.STRING,
+          description: 'Short code callsign (e.g. API-CORE-03, DESIGN-UX-02).',
+        },
+        roleTitle: {
+          type: Type.STRING,
+          description: 'Concise specialist role description.',
+        },
+        description: {
+          type: Type.STRING,
+          description: 'How this Sub-Agent helps the project.',
+        },
+        accentColor: {
+          type: Type.STRING,
+          description: 'One of amber, cyan, emerald, violet, rose.',
+        },
+        allowedTools: {
+          type: Type.ARRAY,
+          items: { type: Type.STRING },
+          description: 'List of tool names authorized for this Sub-Agent.',
+        },
+      },
+      required: ['name', 'roleTitle'],
+    },
+  },
+  {
+    name: 'activate_antigravity_skill',
+    description:
+      'Activate an Antigravity-style specialized Skill for the active Idea Project (from installed skills or the standard library).',
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        skillSlugOrQuery: {
+          type: Type.STRING,
+          description: 'Skill slug or keyword (e.g. ast-blast-refactor, sidecar-machine-ops, zerotrust-sec-auditor).',
+        },
+      },
+      required: ['skillSlugOrQuery'],
+    },
+  },
+  {
+    name: 'call_mcp_gateway_tool',
+    description:
+      'Invoke an MCP 2026 Gateway tool (e.g. search_brain, store_fact, swarm_scout, swarm_symbol_lookup, orbit_mission_control).',
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        toolName: {
+          type: Type.STRING,
+          description: 'Exact MCP tool name registered in the Gateway.',
+        },
+        argsJson: {
+          type: Type.STRING,
+          description: 'Optional JSON-encoded object of tool arguments.',
+        },
+      },
+      required: ['toolName'],
+    },
+  },
+  {
+    name: 'capture_and_inspect_sidecar_screen',
+    description:
+      'Capture a live screenshot and window/process state from the user Desktop Sidecar to see what is currently on screen.',
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        focusPrompt: {
+          type: Type.STRING,
+          description: 'Optional aspect of the user screen to focus on.',
+        },
+      },
+    },
+  },
   {
     name: 'search_memories',
-    description: 'Search long-term bi-temporal facts in the Memory Vault using 4-Way Weighted RRF + Ebbinghaus retention.',
+    description:
+      'Search long-term bi-temporal facts in the Memory Vault using 4-Way Weighted RRF + Ebbinghaus retention.',
     parameters: {
       type: Type.OBJECT,
       properties: {
@@ -84,7 +270,8 @@ const AGENT_TOOL_DECLARATIONS: FunctionDeclaration[] = [
   },
   {
     name: 'save_memory',
-    description: 'Persist a bi-temporal fact, preference, decision, or commitment with automatic contradiction superseding.',
+    description:
+      'Persist a bi-temporal fact, preference, decision, or commitment with automatic contradiction superseding.',
     parameters: {
       type: Type.OBJECT,
       properties: {
@@ -100,7 +287,8 @@ const AGENT_TOOL_DECLARATIONS: FunctionDeclaration[] = [
   },
   {
     name: 'dispatch_swarm_48x',
-    description: 'Launch an Asymmetric Swarm (24x or 48x tasks across UI, API, TESTS, DOCS) with CoW Sandbox and Dual Verify Gates.',
+    description:
+      'Launch an Asymmetric Swarm (24x or 48x tasks across UI, API, TESTS, DOCS) with CoW Sandbox and Dual Verify Gates.',
     parameters: {
       type: Type.OBJECT,
       properties: {
@@ -186,13 +374,15 @@ const AGENT_TOOL_DECLARATIONS: FunctionDeclaration[] = [
   },
   {
     name: 'sidecar_host_control',
-    description: 'Interact directly with the host machine running the Sidecar: inspect active windows & top CPU/RAM processes, trigger global hotkeys, or dispatch governed host commands.',
+    description:
+      'Interact directly with the host machine running the Sidecar: inspect active windows & top CPU/RAM processes, trigger global hotkeys, or dispatch governed host commands.',
     parameters: {
       type: Type.OBJECT,
       properties: {
         action: {
           type: Type.STRING,
-          description: 'One of SNAPSHOT (windows & processes), HOTKEY (trigger shortcut), or EXEC (governed host command).',
+          description:
+            'One of SNAPSHOT (windows & processes), HOTKEY (trigger shortcut), or EXEC (governed host command).',
         },
         target: {
           type: Type.STRING,
@@ -204,13 +394,479 @@ const AGENT_TOOL_DECLARATIONS: FunctionDeclaration[] = [
   },
 ];
 
-async function executeAgentTool(
+export async function executeAgentTool(
   name: string,
   args: Record<string, unknown>,
-  activePort = 3000
+  activePort = 3000,
+  studioCtx?: StudioExecutionContext
 ): Promise<{ record: ToolCallRecord; rawResult: Record<string, unknown> }> {
   const t0 = Date.now();
   const id = `tc-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+  const nowIso = new Date().toISOString();
+
+  if (name === 'upsert_project_goal') {
+    const cleanTitle = String(args.title || '').trim() || 'Objetivo do Projeto';
+    const category = String(args.category || 'Planeamento').trim();
+    const targetMetric = String(
+      args.targetMetric || 'Critérios funcionais validados no projeto'
+    ).trim();
+    const rawSubtasks = Array.isArray(args.subtasks)
+      ? args.subtasks.map((s) => String(s).trim()).filter(Boolean)
+      : [];
+    const targetProjectId =
+      studioCtx?.projectId || db.getState().activeProjectId || 'proj-website-studio';
+    const targetChatId = studioCtx?.chatId || db.getState().activeChatId || 'chat-web-main';
+
+    let savedGoal: GoalItem | null = null;
+    let wasCreated = false;
+
+    db.update((draft) => {
+      const existing = draft.goals.find(
+        (g) =>
+          (g.projectId || targetProjectId) === targetProjectId &&
+          g.title.toLowerCase() === cleanTitle.toLowerCase()
+      );
+
+      if (existing) {
+        if (args.category) existing.category = category;
+        if (args.targetMetric) existing.targetMetric = targetMetric;
+        if (rawSubtasks.length > 0) {
+          const existingMap = new Map(
+            (existing.subtasks || []).map((st) => [st.title.toLowerCase(), st.done])
+          );
+          existing.subtasks = rawSubtasks.map((stTitle, idx) => ({
+            id: `st-${Date.now()}-${idx}`,
+            title: stTitle,
+            done: existingMap.get(stTitle.toLowerCase()) ?? false,
+          }));
+        }
+        if (typeof args.progress === 'number') {
+          existing.progress = Math.max(0, Math.min(100, Math.round(args.progress)));
+        } else if (existing.subtasks && existing.subtasks.length > 0) {
+          existing.progress = computeGoalProgressFromSubtasks(
+            existing.subtasks,
+            existing.progress
+          ).progress;
+        }
+        if (args.status && ['ACTIVE', 'COMPLETED', 'AT_RISK'].includes(String(args.status))) {
+          existing.status = String(args.status) as GoalItem['status'];
+        } else if (existing.progress >= 100) {
+          existing.status = 'COMPLETED';
+        }
+        if (args.assignedAgentId) {
+          existing.assignedAgentId = String(args.assignedAgentId);
+        }
+        existing.updatedAt = nowIso;
+        savedGoal = { ...existing };
+      } else {
+        wasCreated = true;
+        const subtasks: GoalSubtask[] = rawSubtasks.map((stTitle, idx) => ({
+          id: `st-${Date.now()}-${idx}`,
+          title: stTitle,
+          done: false,
+        }));
+        const computedProg =
+          typeof args.progress === 'number'
+            ? Math.max(0, Math.min(100, Math.round(args.progress)))
+            : subtasks.length > 0
+              ? 0
+              : 10;
+        const created: GoalItem = {
+          id: `goal-${Date.now()}-${Math.random().toString(36).slice(2, 5)}`,
+          title: cleanTitle,
+          category,
+          progress: computedProg,
+          targetMetric,
+          deadline: '2026-12-31',
+          status: computedProg >= 100 ? 'COMPLETED' : 'ACTIVE',
+          projectId: targetProjectId,
+          chatId: targetChatId,
+          assignedAgentId: args.assignedAgentId ? String(args.assignedAgentId) : undefined,
+          subtasks: subtasks.length > 0 ? subtasks : undefined,
+          createdBy: 'JARVIS_AUTO',
+          updatedAt: nowIso,
+        };
+        draft.goals.unshift(created);
+        savedGoal = { ...created };
+      }
+    });
+
+    const durationMs = Math.max(1, Date.now() - t0);
+    const goalObj = savedGoal!;
+    const subCount = goalObj.subtasks?.length ?? 0;
+    const summaryText = wasCreated
+      ? `Goal definido: "${goalObj.title}"${subCount > 0 ? ` (${subCount} sub-tarefas)` : ''}`
+      : `Goal atualizado: "${goalObj.title}" (${goalObj.progress}%)`;
+
+    if (studioCtx) {
+      emitStudioActivity({
+        projectId: studioCtx.projectId,
+        chatId: studioCtx.chatId,
+        actor: studioCtx.actor,
+        kind: wasCreated ? 'GOAL_CREATED' : 'GOAL_UPDATED',
+        status: 'SUCCESS',
+        summary: summaryText,
+        detail: `${goalObj.category} · Meta: ${goalObj.targetMetric}`,
+        durationMs,
+        relatedGoalId: goalObj.id,
+      });
+      studioCtx.studioEventsOut.push({
+        type: 'GOAL',
+        id: goalObj.id,
+        title: goalObj.title,
+        subtitle: `${wasCreated ? 'Novo Goal definido' : 'Goal atualizado'} · ${
+          subCount > 0 ? `${subCount} etapas · ` : ''
+        }${goalObj.progress}%`,
+      });
+    }
+
+    return {
+      record: {
+        id,
+        name,
+        args,
+        status: 'SUCCESS',
+        outputSummary: summaryText,
+        durationMs,
+      },
+      rawResult: { created: wasCreated, goal: goalObj },
+    };
+  }
+
+  if (name === 'spawn_project_subagent') {
+    const agentName = String(args.name || 'Especialista do Projeto').trim();
+    const roleTitle = String(args.roleTitle || 'Sub-Agente Especialista').trim();
+    const callsign = String(
+      args.callsign ||
+        `STUDIO-${agentName
+          .toUpperCase()
+          .replace(/[^A-Z0-9]/g, '')
+          .slice(0, 6) || 'AG'}-${Math.floor(10 + Math.random() * 89)}`
+    ).trim();
+    const description = String(
+      args.description || `Sub-agente criado pelo Jarvis para apoiar ${roleTitle}.`
+    ).trim();
+    const validColors = ['cyan', 'amber', 'emerald', 'rose', 'violet'] as const;
+    const rawColor = String(args.accentColor || 'amber') as Room['accentColor'];
+    const accentColor = validColors.includes(rawColor) ? rawColor : 'amber';
+    const allowedTools = Array.isArray(args.allowedTools)
+      ? args.allowedTools.map(String)
+      : [
+          'upsert_project_goal',
+          'activate_antigravity_skill',
+          'call_mcp_gateway_tool',
+          'search_memories',
+          'list_workspace_files',
+        ];
+
+    const targetProjectId =
+      studioCtx?.projectId || db.getState().activeProjectId || 'proj-website-studio';
+    const targetChatId = studioCtx?.chatId || db.getState().activeChatId || 'chat-web-main';
+
+    let subagent: Room | null = null;
+    let alreadyExisted = false;
+
+    db.update((draft) => {
+      const existing = draft.rooms.find(
+        (r) =>
+          r.projectId === targetProjectId &&
+          r.name.toLowerCase() === agentName.toLowerCase()
+      );
+      if (existing) {
+        alreadyExisted = true;
+        subagent = { ...existing };
+      } else {
+        const created: Room = {
+          id: `room-sub-${Date.now()}-${Math.random().toString(36).slice(2, 5)}`,
+          name: agentName,
+          callsign,
+          roleTitle,
+          description,
+          systemPrompt: `Atua como ${agentName} (${roleTitle}) no J.A.R.V.I.S. Project Studio em Português de Portugal (PT-PT). Colabora diretamente nos Goals do projeto, usa ferramentas reais e sê conciso e estruturado.`,
+          accentColor,
+          allowedTools,
+          projectId: targetProjectId,
+          createdByJarvis: true,
+          isCustom: true,
+        };
+        draft.rooms.push(created);
+        subagent = { ...created };
+      }
+
+      const proj = (draft.projects || []).find((p) => p.id === targetProjectId);
+      if (proj && subagent && !proj.assignedAgentIds.includes(subagent.id)) {
+        proj.assignedAgentIds.push(subagent.id);
+      }
+      const chat = (draft.chatThreads || []).find((c) => c.id === targetChatId);
+      if (chat && subagent) {
+        if (!chat.participatingAgentIds) chat.participatingAgentIds = ['room-exec'];
+        if (!chat.participatingAgentIds.includes(subagent.id)) {
+          chat.participatingAgentIds.push(subagent.id);
+        }
+      }
+    });
+
+    const durationMs = Math.max(1, Date.now() - t0);
+    const agentObj = subagent!;
+    const summaryText = alreadyExisted
+      ? `Sub-agente "${agentObj.name}" (${agentObj.callsign}) alocado à conversa`
+      : `Sub-agente criado: "${agentObj.name}" (${agentObj.callsign})`;
+
+    if (studioCtx) {
+      emitStudioActivity({
+        projectId: studioCtx.projectId,
+        chatId: studioCtx.chatId,
+        actor: studioCtx.actor,
+        kind: alreadyExisted ? 'AGENT_DELEGATED' : 'AGENT_SPAWNED',
+        status: 'SUCCESS',
+        summary: summaryText,
+        detail: `${agentObj.roleTitle} · Ferramentas: ${agentObj.allowedTools.slice(0, 4).join(', ')}`,
+        durationMs,
+        relatedAgentId: agentObj.id,
+      });
+      studioCtx.studioEventsOut.push({
+        type: 'AGENT',
+        id: agentObj.id,
+        title: `${agentObj.name} (${agentObj.callsign || 'SUB-AGENT'})`,
+        subtitle: agentObj.roleTitle,
+      });
+    }
+
+    return {
+      record: {
+        id,
+        name,
+        args,
+        status: 'SUCCESS',
+        outputSummary: summaryText,
+        durationMs,
+      },
+      rawResult: { subagent: agentObj, alreadyExisted },
+    };
+  }
+
+  if (name === 'activate_antigravity_skill') {
+    const query = String(args.skillSlugOrQuery || '').toLowerCase().trim();
+    const targetProjectId =
+      studioCtx?.projectId || db.getState().activeProjectId || 'proj-website-studio';
+
+    let activatedSkill: SkillItem | null = null;
+    db.update((draft) => {
+      let match = draft.skills.find(
+        (s) =>
+          s.slug.toLowerCase() === query ||
+          s.id.toLowerCase() === query ||
+          s.name.toLowerCase().includes(query)
+      );
+
+      if (!match) {
+        const tpl = STANDARD_SKILLS_LIBRARY.find(
+          (t) =>
+            t.slug.toLowerCase() === query ||
+            t.name.toLowerCase().includes(query) ||
+            t.category.toLowerCase().includes(query)
+        );
+        if (tpl) {
+          match = {
+            id: `skill-${tpl.slug}`,
+            name: tpl.name,
+            slug: tpl.slug,
+            category: tpl.category,
+            description: tpl.description,
+            enabled: true,
+            systemInstruction: tpl.systemInstruction,
+            allowedTools: tpl.allowedTools,
+            quickCommand: tpl.quickCommand,
+            version: tpl.version,
+            origin: 'LIBRARY',
+          };
+          draft.skills.push(match);
+        } else if (draft.skills[0]) {
+          match = draft.skills[0];
+        }
+      }
+
+      if (match) {
+        match.enabled = true;
+        activatedSkill = { ...match };
+        const proj = (draft.projects || []).find((p) => p.id === targetProjectId);
+        if (proj) {
+          if (!proj.activeSkillIds) proj.activeSkillIds = [];
+          if (!proj.activeSkillIds.includes(match.id)) {
+            proj.activeSkillIds.push(match.id);
+          }
+        }
+      }
+    });
+
+    const durationMs = Math.max(1, Date.now() - t0);
+    if (!activatedSkill) {
+      return {
+        record: {
+          id,
+          name,
+          args,
+          status: 'ERROR',
+          outputSummary: `Skill "${query}" não encontrada na biblioteca.`,
+          durationMs,
+        },
+        rawResult: { error: 'Skill not found' },
+      };
+    }
+
+    const skObj: SkillItem = activatedSkill;
+    const summaryText = `Skill Antigravity ativa: "${skObj.name}" (${skObj.quickCommand})`;
+    if (studioCtx) {
+      emitStudioActivity({
+        projectId: studioCtx.projectId,
+        chatId: studioCtx.chatId,
+        actor: studioCtx.actor,
+        kind: 'SKILL_ACTIVATED',
+        status: 'SUCCESS',
+        summary: summaryText,
+        detail: skObj.description,
+        durationMs,
+        relatedSkillSlug: skObj.slug,
+      });
+      studioCtx.studioEventsOut.push({
+        type: 'SKILL',
+        id: skObj.id,
+        title: skObj.name,
+        subtitle: `Skill Antigravity ativa (${skObj.quickCommand})`,
+      });
+    }
+
+    return {
+      record: {
+        id,
+        name,
+        args,
+        status: 'SUCCESS',
+        outputSummary: summaryText,
+        durationMs,
+      },
+      rawResult: { skill: skObj },
+    };
+  }
+
+  if (name === 'call_mcp_gateway_tool') {
+    const toolName = String(args.toolName || 'search_brain').trim();
+    let parsedArgs: Record<string, unknown> = {};
+    if (typeof args.argsJson === 'string' && args.argsJson.trim()) {
+      try {
+        parsedArgs = JSON.parse(args.argsJson) as Record<string, unknown>;
+      } catch {
+        parsedArgs = { query: args.argsJson };
+      }
+    } else if (args.arguments && typeof args.arguments === 'object') {
+      parsedArgs = args.arguments as Record<string, unknown>;
+    }
+
+    const rpcRes = await handleMcpJsonRpc(
+      {
+        jsonrpc: '2.0',
+        id: Date.now(),
+        method: 'tools/call',
+        params: { name: toolName, arguments: parsedArgs },
+      },
+      activePort
+    );
+
+    const durationMs = Math.max(1, Date.now() - t0);
+    const isErr = Boolean((rpcRes.result as { isError?: boolean } | undefined)?.isError || rpcRes.error);
+    const summaryText = `MCP Gateway -> ${toolName} (${isErr ? 'aviso' : 'concluído'} em ${durationMs}ms)`;
+
+    if (studioCtx) {
+      emitStudioActivity({
+        projectId: studioCtx.projectId,
+        chatId: studioCtx.chatId,
+        actor: studioCtx.actor,
+        kind: 'MCP_TOOL',
+        status: isErr ? 'WARNING' : 'SUCCESS',
+        summary: summaryText,
+        detail: JSON.stringify(parsedArgs).slice(0, 140),
+        durationMs,
+      });
+      studioCtx.studioEventsOut.push({
+        type: 'MCP',
+        id: `mcp-${Date.now()}`,
+        title: `MCP · ${toolName}`,
+        subtitle: `Executado via Gateway MCP 2026 (${durationMs}ms)`,
+      });
+    }
+
+    return {
+      record: {
+        id,
+        name: `mcp:${toolName}`,
+        args: parsedArgs,
+        status: isErr ? 'ERROR' : 'SUCCESS',
+        outputSummary: summaryText,
+        durationMs,
+        mcpServerName: 'jarvis-cortex-antigravity-mcp',
+      },
+      rawResult: rpcRes,
+    };
+  }
+
+  if (name === 'capture_and_inspect_sidecar_screen') {
+    const snap = await captureSidecarDesktopScreen('dev-local-host', activePort);
+    const hostSnap = await collectSidecarHostSnapshot('dev-local-host');
+    const summaryText = `Ecrã Sidecar capturado (${snap.width}x${snap.height}) · Janela: "${
+      snap.activeWindowTitle || hostSnap.hostname
+    }"`;
+    snap.visionSummary = summaryText;
+
+    db.update((draft) => {
+      draft.latestScreenSnapshot = snap;
+    });
+
+    const durationMs = Math.max(1, Date.now() - t0);
+    if (studioCtx) {
+      emitStudioActivity({
+        projectId: studioCtx.projectId,
+        chatId: studioCtx.chatId,
+        actor: studioCtx.actor,
+        kind: 'SCREEN_VISION',
+        status: 'SUCCESS',
+        summary: summaryText,
+        detail: `Processos visíveis: ${hostSnap.topProcesses
+          .slice(0, 3)
+          .map((p) => `${p.name} (${p.cpuPercent}% CPU)`)
+          .join(', ')}`,
+        durationMs,
+      });
+      studioCtx.studioEventsOut.push({
+        type: 'SCREEN',
+        id: snap.id,
+        title: 'Captura de Ecrã Sidecar em Tempo Real',
+        subtitle: `${snap.activeWindowTitle || snap.hostname} · ${snap.width}×${snap.height}`,
+      });
+    }
+
+    return {
+      record: {
+        id,
+        name,
+        args,
+        status: 'SUCCESS',
+        outputSummary: summaryText,
+        durationMs,
+      },
+      rawResult: {
+        capturedAt: snap.capturedAt,
+        width: snap.width,
+        height: snap.height,
+        activeWindowTitle: snap.activeWindowTitle,
+        hostname: snap.hostname,
+        activeWindows: hostSnap.activeWindows.slice(0, 6),
+        topProcesses: hostSnap.topProcesses.slice(0, 5),
+      },
+    };
+  }
+
+  // Standard operational tools
+  let stdRes: { record: ToolCallRecord; rawResult: Record<string, unknown> } | null = null;
 
   if (name === 'search_memories') {
     const q = String(args.query || '').trim();
@@ -226,13 +882,13 @@ async function executeAgentTool(
         }
       });
     }
-    return {
+    stdRes = {
       record: {
         id,
         name,
         args,
         status: 'SUCCESS',
-        outputSummary: `4-Way RRF recuperou ${rankedHits.length} memórias bi-temporais ativas${q ? ` para "${q}"` : ''}.`,
+        outputSummary: `4-Way RRF recuperou ${rankedHits.length} memórias relevantes${q ? ` para "${q}"` : ''}.`,
         durationMs: Math.max(1, Date.now() - t0),
       },
       rawResult: {
@@ -245,10 +901,8 @@ async function executeAgentTool(
         })),
       },
     };
-  }
-
-  if (name === 'save_memory') {
-    const topic = String(args.topic || 'Nota Operacional').trim();
+  } else if (name === 'save_memory') {
+    const topic = String(args.topic || 'Nota do Projeto').trim();
     const content = String(args.content || '').trim();
     const rawCat = String(args.category || 'FACT').toUpperCase();
     const validCats = ['FACT', 'ENTITY', 'PREFERENCE', 'DECISION', 'COMMITMENT'] as const;
@@ -259,95 +913,92 @@ async function executeAgentTool(
       content,
       category,
       provenance: 'CONFIRMED',
-      tags: ['agent-saved', 'bitemporal'],
-      sourceUri: 'chat://agent-tool',
+      tags: ['studio-saved', 'bitemporal'],
+      sourceUri: 'chat://studio-agent',
     });
 
     db.appendAudit('CHAT_AGENT', 'MEMORY', 'MEMORY_SAVED_BITEMPORAL', topic, 'VERIFIED');
-    return {
+    stdRes = {
       record: {
         id,
         name,
         args,
         status: 'SUCCESS',
-        outputSummary: `Memória "${stored.memory.topic}" gravada (BQ128 ${stored.memory.bq128Hex?.slice(0, 10)}…${stored.supersededIds.length > 0 ? ` · superou ${stored.supersededIds.length} versão anterior` : ''}).`,
+        outputSummary: `Memória guardada: "${stored.memory.topic}"`,
         durationMs: Math.max(1, Date.now() - t0),
       },
       rawResult: { saved: stored.memory, supersededIds: stored.supersededIds },
     };
-  }
-
-  if (name === 'dispatch_swarm_48x') {
-    const objective = String(args.objective || 'Execução Swarm via Chat Agêntico');
+  } else if (name === 'dispatch_swarm_48x') {
+    const objective = String(args.objective || 'Execução Swarm via Estúdio');
     const scale: 24 | 48 = Number(args.scale) === 24 ? 24 : 48;
     const run = await launchAsymmetricSwarm({ objective, scale });
-    return {
+    stdRes = {
       record: {
         id,
         name,
         args,
         status: 'SUCCESS',
-        outputSummary: `Swarm ${run.scale}x concluído -> ${run.verifyGatesPassed}/${run.verifyGatesTotal} Verify Gates · Ruflo EMA ${run.rufloConvergence}.`,
+        outputSummary: `Swarm ${run.scale}x concluído -> ${run.verifyGatesPassed}/${run.verifyGatesTotal} Verify Gates.`,
         durationMs: Math.max(1, Date.now() - t0),
       },
-      rawResult: { swarmRun: { id: run.id, scale: run.scale, status: run.status, verifyGatesPassed: run.verifyGatesPassed } },
+      rawResult: {
+        swarmRun: {
+          id: run.id,
+          scale: run.scale,
+          status: run.status,
+          verifyGatesPassed: run.verifyGatesPassed,
+        },
+      },
     };
-  }
-
-  if (name === 'lookup_ast_symbol') {
+  } else if (name === 'lookup_ast_symbol') {
     const q = String(args.query || '');
     const symbols = await lookupWorkspaceSymbols(q, 10);
-    return {
+    stdRes = {
       record: {
         id,
         name,
         args,
         status: 'SUCCESS',
-        outputSummary: `SCOUT-01 encontrou ${symbols.length} símbolo(s) AST (:Lstart-end)${q ? ` para "${q}"` : ''}.`,
+        outputSummary: `SCOUT-01 localizou ${symbols.length} símbolo(s) AST${q ? ` para "${q}"` : ''}.`,
         durationMs: Math.max(1, Date.now() - t0),
       },
       rawResult: { symbols },
     };
-  }
-
-  if (name === 'get_system_telemetry') {
+  } else if (name === 'get_system_telemetry') {
     const tel = await collectOSTelemetry(activePort);
     const openPorts = tel.ports.filter((p) => p.open).map((p) => p.port);
-    return {
+    stdRes = {
       record: {
         id,
         name,
         args,
         status: 'SUCCESS',
-        outputSummary: `${tel.platform}/${tel.arch} · CPU ${tel.cpuUsagePercent}% · RAM ${tel.ramUsedGb}/${tel.ramTotalGb} GB (${tel.ramPercent}%) · Portas abertas: ${openPorts.join(', ')}`,
+        outputSummary: `${tel.platform}/${tel.arch} · CPU ${tel.cpuUsagePercent}% · RAM ${tel.ramUsedGb}/${tel.ramTotalGb} GB · Portas: ${openPorts.join(', ')}`,
         durationMs: Math.max(1, Date.now() - t0),
       },
       rawResult: { telemetry: tel },
     };
-  }
-
-  if (name === 'list_workspace_files') {
+  } else if (name === 'list_workspace_files') {
     const filter = String(args.filter || '').toLowerCase().trim();
     const files = listWorkspaceFiles(100).filter(
       (f) => !filter || f.path.toLowerCase().includes(filter)
     );
-    return {
+    stdRes = {
       record: {
         id,
         name,
         args,
         status: 'SUCCESS',
-        outputSummary: `${files.length} entradas listadas no workspace.`,
+        outputSummary: `${files.length} ficheiros inspecionados no workspace.`,
         durationMs: Math.max(1, Date.now() - t0),
       },
       rawResult: { files: files.slice(0, 50) },
     };
-  }
-
-  if (name === 'read_workspace_file') {
+  } else if (name === 'read_workspace_file') {
     const filePath = String(args.filePath || 'package.json');
     const res = readSafeWorkspaceFile(filePath);
-    return {
+    stdRes = {
       record: {
         id,
         name,
@@ -360,30 +1011,26 @@ async function executeAgentTool(
       },
       rawResult: res.ok ? { filePath, content: res.content.slice(0, 5000) } : { error: res.error },
     };
-  }
-
-  if (name === 'get_git_status') {
+  } else if (name === 'get_git_status') {
     const git = await getGitOverview();
-    return {
+    stdRes = {
       record: {
         id,
         name,
         args,
         status: 'SUCCESS',
-        outputSummary: `Branch ${git.branch} · ${git.statusLines.length} ficheiros modificados · ${git.recentCommits.length} commits recentes.`,
+        outputSummary: `Branch ${git.branch} · ${git.statusLines.length} ficheiros modificados.`,
         durationMs: Math.max(1, Date.now() - t0),
       },
       rawResult: git,
     };
-  }
-
-  if (name === 'trigger_workflow') {
+  } else if (name === 'trigger_workflow') {
     const q = String(args.workflowQuery || '').toLowerCase();
     const wf = db
       .getState()
       .workflows.find((w) => w.id.toLowerCase() === q || w.name.toLowerCase().includes(q));
     if (!wf) {
-      return {
+      stdRes = {
         record: {
           id,
           name,
@@ -392,28 +1039,29 @@ async function executeAgentTool(
           outputSummary: `Nenhum workflow correspondente a "${q}".`,
           durationMs: Math.max(1, Date.now() - t0),
         },
-        rawResult: { availableWorkflows: db.getState().workflows.map((w) => ({ id: w.id, name: w.name })) },
+        rawResult: {
+          availableWorkflows: db.getState().workflows.map((w) => ({ id: w.id, name: w.name })),
+        },
+      };
+    } else {
+      const { runWorkflowById } = await import('./workflow-runner.ts');
+      const run = await runWorkflowById(wf.id, 'AGENT');
+      stdRes = {
+        record: {
+          id,
+          name,
+          args,
+          status: run?.status === 'WAITING_APPROVAL' ? 'PENDING_APPROVAL' : 'SUCCESS',
+          outputSummary: `Workflow "${wf.name}" executado -> ${run?.status} (${run?.totalDurationMs}ms).`,
+          durationMs: Math.max(1, Date.now() - t0),
+        },
+        rawResult: { run },
       };
     }
-    const { runWorkflowById } = await import('./workflow-runner.ts');
-    const run = await runWorkflowById(wf.id, 'AGENT');
-    return {
-      record: {
-        id,
-        name,
-        args,
-        status: run?.status === 'WAITING_APPROVAL' ? 'PENDING_APPROVAL' : 'SUCCESS',
-        outputSummary: `Workflow "${wf.name}" executado -> ${run?.status} (${run?.totalDurationMs}ms).`,
-        durationMs: Math.max(1, Date.now() - t0),
-      },
-      rawResult: { run },
-    };
-  }
-
-  if (name === 'request_shell_approval') {
+  } else if (name === 'request_shell_approval') {
     const cmd = String(args.command || 'git status --short');
     const execRes = await executeGovernedCommand(cmd, 'CHAT_AGENT');
-    return {
+    stdRes = {
       record: {
         id,
         name,
@@ -429,14 +1077,12 @@ async function executeAgentTool(
       },
       rawResult: execRes,
     };
-  }
-
-  if (name === 'sidecar_host_control') {
+  } else if (name === 'sidecar_host_control') {
     const action = String(args.action || 'SNAPSHOT').toUpperCase();
     const target = String(args.target || '').trim();
     if (action === 'HOTKEY') {
       const rec = await triggerSidecarHotkey(target || 'Alt+Space');
-      return {
+      stdRes = {
         record: {
           id,
           name,
@@ -447,33 +1093,53 @@ async function executeAgentTool(
         },
         rawResult: { commandRecord: rec },
       };
-    }
-    if (action === 'EXEC' && target) {
+    } else if (action === 'EXEC' && target) {
       const rec = await dispatchSidecarHostCommand({ command: target, kind: 'HOST_EXEC' });
-      return {
+      stdRes = {
         record: {
           id,
           name,
           args,
-          status: rec.status === 'PENDING_APPROVAL' ? 'PENDING_APPROVAL' : rec.status === 'BLOCKED' ? 'ERROR' : 'SUCCESS',
+          status:
+            rec.status === 'PENDING_APPROVAL'
+              ? 'PENDING_APPROVAL'
+              : rec.status === 'BLOCKED'
+                ? 'ERROR'
+                : 'SUCCESS',
           outputSummary: rec.output.slice(0, 240),
           durationMs: rec.durationMs,
         },
         rawResult: { commandRecord: rec },
       };
+    } else {
+      const snap = await collectSidecarHostSnapshot();
+      stdRes = {
+        record: {
+          id,
+          name,
+          args,
+          status: 'SUCCESS',
+          outputSummary: `Sidecar ${snap.hostname} · ${snap.activeWindows.length} janela(s) ativas · Top: ${snap.topProcesses[0]?.name || 'node'}.`,
+          durationMs: Math.max(1, Date.now() - t0),
+        },
+        rawResult: { snapshot: snap },
+      };
     }
-    const snap = await collectSidecarHostSnapshot();
-    return {
-      record: {
-        id,
-        name,
-        args,
-        status: 'SUCCESS',
-        outputSummary: `Host ${snap.hostname} (${snap.platform}/${snap.arch}) · ${snap.activeWindows.length} janela(s) · Top proc: ${snap.topProcesses[0]?.name || 'node'} (${snap.topProcesses[0]?.cpuPercent ?? 0}% CPU).`,
-        durationMs: Math.max(1, Date.now() - t0),
-      },
-      rawResult: { snapshot: snap },
-    };
+  }
+
+  if (stdRes) {
+    if (studioCtx) {
+      emitStudioActivity({
+        projectId: studioCtx.projectId,
+        chatId: studioCtx.chatId,
+        actor: studioCtx.actor,
+        kind: 'SYSTEM_STEP',
+        status: stdRes.record.status === 'ERROR' ? 'ERROR' : 'SUCCESS',
+        summary: `${name}: ${stdRes.record.outputSummary}`,
+        durationMs: stdRes.record.durationMs,
+      });
+    }
+    return stdRes;
   }
 
   return {
@@ -490,47 +1156,193 @@ async function executeAgentTool(
 }
 
 /**
- * Intelligent Local Deterministic ReAct Fallback when GEMINI_API_KEY is absent/offline
+ * Intelligent Local Deterministic Studio & ReAct Fallback when GEMINI_API_KEY is absent/offline
  * or when operator selects LOCAL_DETERMINISTIC provider.
  */
-async function runDeterministicReActTurn(
-  userText: string,
-  attachments: AttachmentItem[],
-  activePort: number,
-  jevDecision: JevRouteDecision
-): Promise<{ reply: string; toolCalls: ToolCallRecord[]; engineUsed: string }> {
+async function runDeterministicReActTurn(params: {
+  userText: string;
+  attachments: AttachmentItem[];
+  screenFrame?: IncomingScreenFrame;
+  activePort: number;
+  jevDecision: JevRouteDecision;
+  studioCtx: StudioExecutionContext;
+}): Promise<{ reply: string; toolCalls: ToolCallRecord[]; engineUsed: string }> {
+  const { userText, attachments, screenFrame, activePort, jevDecision, studioCtx } = params;
   const state = db.getState();
   const isPt = state.settings.language === 'pt-PT';
   const lower = userText.toLowerCase();
   const toolCalls: ToolCallRecord[] = [];
-  const findings: string[] = [];
+  const sections: string[] = [];
 
-  if (jevDecision.microTick) {
-    const ranked = rankQ18Actions(state.candidates);
-    const top = ranked[0];
+  const activeProject = (state.projects || []).find((p) => p.id === studioCtx.projectId);
+
+  if (jevDecision.microTick && !screenFrame) {
+    const projGoals = state.goals.filter(
+      (g) => (g.projectId || studioCtx.projectId) === studioCtx.projectId && g.status !== 'COMPLETED'
+    );
+    const nextGoal = projGoals[0];
     return {
       reply: isPt
-        ? `Confirmado via **MICRO_TICK** (\`${jevDecision.tokenDiet.injectedTokens} tokens\`). Próximo passo ativo: **${top?.title || 'Monitorização nominal'}** (Q-18 \`${top?.q18Score ?? 0}\`).`
-        : `Acknowledged via **MICRO_TICK** (\`${jevDecision.tokenDiet.injectedTokens} tokens\`). Next step: **${top?.title || 'Nominal'}**.`,
+        ? `Registado! Continuamos focados em **${nextGoal?.title || activeProject?.name || 'estruturar o projeto'}**${
+            nextGoal ? ` (progresso atual: **${nextGoal.progress}%**)` : ''
+          }. Diz-me que funcionalidade ou ecrã queres detalhar a seguir.`
+        : `Got it! Continuing focus on **${nextGoal?.title || activeProject?.name || 'the project'}**.`,
       toolCalls: [],
-      engineUsed: 'JEV_S1_MICRO_TICK',
+      engineUsed: 'JARVIS_STUDIO_FASTPATH',
     };
+  }
+
+  // 1. Automatic Studio Planning: Goals + Sub-Agents + Antigravity Skills
+  const planDraft = extractDeterministicPlanFromPrompt({
+    prompt: userText,
+    project: activeProject,
+    existingGoals: state.goals,
+    existingRooms: state.rooms,
+    skills: state.skills,
+  });
+
+  if (planDraft.isPlanningIntent) {
+    let spawnedAgentId: string | undefined;
+
+    for (const sub of planDraft.subagentsToSpawn) {
+      const { record, rawResult } = await executeAgentTool(
+        'spawn_project_subagent',
+        {
+          name: sub.name,
+          callsign: sub.callsign,
+          roleTitle: sub.roleTitle,
+          description: sub.description,
+          accentColor: sub.accentColor,
+          allowedTools: sub.allowedTools,
+        },
+        activePort,
+        studioCtx
+      );
+      toolCalls.push(record);
+      const createdSub = rawResult.subagent as Room | undefined;
+      if (createdSub) {
+        spawnedAgentId = createdSub.id;
+        sections.push(
+          `- **Sub-Agente Criado**: **${createdSub.name}** (\`${createdSub.callsign}\`) — *${createdSub.roleTitle}*.`
+        );
+      }
+    }
+
+    for (const gDraft of planDraft.goalsToCreate) {
+      const { record, rawResult } = await executeAgentTool(
+        'upsert_project_goal',
+        {
+          title: gDraft.title,
+          category: gDraft.category,
+          targetMetric: gDraft.targetMetric,
+          subtasks: gDraft.subtasks,
+          assignedAgentId: spawnedAgentId,
+        },
+        activePort,
+        studioCtx
+      );
+      toolCalls.push(record);
+      const gObj = rawResult.goal as GoalItem | undefined;
+      if (gObj) {
+        sections.push(
+          `- **Goal Definido no Projeto**: **${gObj.title}**\n  ${(gObj.subtasks || [])
+            .map((st) => `  - [ ] ${st.title}`)
+            .join('\n')}`
+        );
+      }
+    }
+
+    for (const skSlug of planDraft.skillsToActivate) {
+      const { record, rawResult } = await executeAgentTool(
+        'activate_antigravity_skill',
+        { skillSlugOrQuery: skSlug },
+        activePort,
+        studioCtx
+      );
+      if (record.status === 'SUCCESS') {
+        toolCalls.push(record);
+        const skObj = rawResult.skill as SkillItem | undefined;
+        if (skObj) {
+          sections.push(`- **Skill Ativada**: **${skObj.name}** (\`${skObj.quickCommand}\`).`);
+        }
+      }
+    }
+  }
+
+  // 2. Real-time Screen Vision (from attached browser stream frame or requested Sidecar capture)
+  const asksAboutScreen =
+    Boolean(screenFrame) ||
+    lower.includes('ecrã') ||
+    lower.includes('ecra') ||
+    lower.includes('screen') ||
+    lower.includes('estás a ver') ||
+    lower.includes('estas a ver') ||
+    lower.includes('o que vês') ||
+    lower.includes('o que ves');
+
+  if (asksAboutScreen) {
+    if (screenFrame) {
+      const hostSnap = await collectSidecarHostSnapshot('dev-local-host');
+      const sourceLabel =
+        screenFrame.source === 'SIDECAR_NATIVE'
+          ? 'Captura Nativa Sidecar'
+          : 'Stream de Ecrã do Navegador em Direto';
+      sections.push(
+        `- **Visão do Teu Ecrã em Tempo Real (${sourceLabel})**: Recebi o frame visual atual${
+          screenFrame.activeWindowTitle ? ` (\`${screenFrame.activeWindowTitle}\`)` : ''
+        }. Contexto ativo detetado na máquina \`${hostSnap.hostname}\`: ${hostSnap.activeWindows
+          .slice(0, 3)
+          .map((w) => `\`${w.title}\``)
+          .join(', ')}.`
+      );
+    } else {
+      const { record } = await executeAgentTool(
+        'capture_and_inspect_sidecar_screen',
+        { focusPrompt: userText },
+        activePort,
+        studioCtx
+      );
+      toolCalls.push(record);
+      sections.push(`- **Visão de Ecrã via Sidecar**: ${record.outputSummary}`);
+    }
+  }
+
+  // 3. MCP Gateway & Engineering tools when requested
+  if (lower.includes('mcp') || lower.includes('gateway')) {
+    const { record } = await executeAgentTool(
+      'call_mcp_gateway_tool',
+      { toolName: 'search_brain', argsJson: JSON.stringify({ query: userText }) },
+      activePort,
+      studioCtx
+    );
+    toolCalls.push(record);
+    sections.push(`- **Gateway MCP**: ${record.outputSummary}`);
   }
 
   if (lower.includes('swarm') || lower.includes('enxame') || lower.includes('48x') || lower.includes('24x')) {
     const scale = lower.includes('24x') ? 24 : 48;
-    const { record } = await executeAgentTool('dispatch_swarm_48x', { objective: userText, scale }, activePort);
+    const { record } = await executeAgentTool(
+      'dispatch_swarm_48x',
+      { objective: userText, scale },
+      activePort,
+      studioCtx
+    );
     toolCalls.push(record);
-    findings.push(`- **Enxame Assimétrico Swarm ${scale}x**: ${record.outputSummary}`);
+    sections.push(`- **Enxame Swarm ${scale}x**: ${record.outputSummary}`);
   }
 
-  if (lower.includes('ast') || lower.includes('símbolo') || lower.includes('symbol') || lower.includes('scout')) {
-    const { record, rawResult } = await executeAgentTool('lookup_ast_symbol', { query: '' }, activePort);
+  if (lower.includes('ast') || lower.includes('símbolo') || lower.includes('symbol')) {
+    const { record, rawResult } = await executeAgentTool(
+      'lookup_ast_symbol',
+      { query: '' },
+      activePort,
+      studioCtx
+    );
     toolCalls.push(record);
     const syms = ((rawResult.symbols as { name: string; filePath: string; startLine: number }[]) || [])
       .slice(0, 4)
       .map((s) => `\`${s.name}\` (${s.filePath}:L${s.startLine})`);
-    findings.push(`- **SCOUT-01 AST Index**: ${syms.join(', ')}.`);
+    sections.push(`- **SCOUT-01 AST**: ${syms.join(', ')}.`);
   }
 
   if (
@@ -538,179 +1350,163 @@ async function runDeterministicReActTurn(
     lower.includes('cpu') ||
     lower.includes('ram') ||
     lower.includes('porta') ||
-    lower.includes('sistema') ||
-    lower.includes('telemetry') ||
-    lower.includes('system')
+    lower.includes('telemetry')
   ) {
-    const { record, rawResult } = await executeAgentTool('get_system_telemetry', { includePorts: true }, activePort);
+    const { record, rawResult } = await executeAgentTool(
+      'get_system_telemetry',
+      { includePorts: true },
+      activePort,
+      studioCtx
+    );
     toolCalls.push(record);
     const tel = rawResult.telemetry as Awaited<ReturnType<typeof collectOSTelemetry>>;
-    findings.push(
-      isPt
-        ? `- **Telemetria Nativa (${tel.platform}/${tel.arch})**: Host \`${tel.hostname}\`, CPU **${tel.cpuUsagePercent}%** (${tel.cpuCores} núcleos), RAM **${tel.ramUsedGb}/${tel.ramTotalGb} GB** (${tel.ramPercent}%), Disco **${tel.diskUsedGb}/${tel.diskTotalGb} GB** (${tel.diskPercent}%).`
-        : `- **Native Telemetry (${tel.platform}/${tel.arch})**: Host \`${tel.hostname}\`, CPU **${tel.cpuUsagePercent}%**, RAM **${tel.ramUsedGb}/${tel.ramTotalGb} GB** (${tel.ramPercent}%).`
+    sections.push(
+      `- **Telemetria Local (${tel.platform}/${tel.arch})**: CPU **${tel.cpuUsagePercent}%** · RAM **${tel.ramUsedGb}/${tel.ramTotalGb} GB** (${tel.ramPercent}%).`
     );
-  }
-
-  if (
-    lower.includes('sidecar') ||
-    lower.includes('processo') ||
-    lower.includes('janela') ||
-    lower.includes('hotkey') ||
-    lower.includes('máquina') ||
-    lower.includes('maquina')
-  ) {
-    const isHotkey = lower.includes('hotkey') || lower.includes('alt+space') || lower.includes('ctrl+shift');
-    const { record, rawResult } = await executeAgentTool(
-      'sidecar_host_control',
-      isHotkey ? { action: 'HOTKEY', target: 'Alt+Space' } : { action: 'SNAPSHOT' },
-      activePort
-    );
-    toolCalls.push(record);
-    if (isHotkey) {
-      findings.push(`- **Interação Direta Sidecar (Hotkey)**: ${record.outputSummary}`);
-    } else {
-      const snap = rawResult.snapshot as Awaited<ReturnType<typeof collectSidecarHostSnapshot>>;
-      const topProcs = snap.topProcesses
-        .slice(0, 4)
-        .map((p) => `\`${p.name}\` (PID ${p.pid}, ${p.cpuPercent}% CPU, ${p.memPercent}% RAM)`)
-        .join(', ');
-      findings.push(
-        `- **Ponte Direta Máquina Sidecar (\`${snap.hostname}\`)**: ${snap.activeWindows.length} janela(s) ativas · Processos de topo: ${topProcs}.`
-      );
-    }
   }
 
   if (lower.includes('git') || lower.includes('commit') || lower.includes('branch')) {
-    const { record, rawResult } = await executeAgentTool('get_git_status', { includeCommits: true }, activePort);
+    const { record, rawResult } = await executeAgentTool(
+      'get_git_status',
+      { includeCommits: true },
+      activePort,
+      studioCtx
+    );
     toolCalls.push(record);
     const g = rawResult as Awaited<ReturnType<typeof getGitOverview>>;
-    findings.push(
-      isPt
-        ? `- **Estado Git (\`${g.branch}\`)**: ${g.statusLines.length} alterações ativas; último registo: \`${g.recentCommits[0] || 'n/a'}\`.`
-        : `- **Git Status (\`${g.branch}\`)**: ${g.statusLines.length} modified entries; latest commit: \`${g.recentCommits[0] || 'n/a'}\`.`
+    sections.push(
+      `- **Estado Git (\`${g.branch}\`)**: ${g.statusLines.length} alterações; último commit \`${g.recentCommits[0] || 'n/a'}\`.`
     );
-  }
-
-  if (lower.includes('ficheiro') || lower.includes('file') || lower.includes('workspace') || lower.includes('package.json')) {
-    if (lower.includes('package.json')) {
-      const { record, rawResult } = await executeAgentTool('read_workspace_file', { filePath: 'package.json' }, activePort);
-      toolCalls.push(record);
-      findings.push(
-        isPt
-          ? `- **Leitura de \`package.json\`**: Ficheiro inspecionado com sucesso (${String(rawResult.content || '').length} bytes).`
-          : `- **Read \`package.json\`**: Inspected (${String(rawResult.content || '').length} bytes).`
-      );
-    } else {
-      const { record } = await executeAgentTool('list_workspace_files', {}, activePort);
-      toolCalls.push(record);
-      findings.push(`- **Workspace**: ${record.outputSummary}`);
-    }
-  }
-
-  if (lower.includes('memor') || lower.includes('vault') || lower.includes('hipporag') || lower.includes('lembra') || lower.includes('rrf')) {
-    if (lower.includes('guarda') || lower.includes('grava') || lower.includes('memoriza') || lower.includes('remember:')) {
-      const { record } = await executeAgentTool(
-        'save_memory',
-        { topic: userText.slice(0, 44), content: userText, category: 'FACT' },
-        activePort
-      );
-      toolCalls.push(record);
-      findings.push(`- **Memory Vault Bi-Temporal**: ${record.outputSummary}`);
-    } else {
-      const { record, rawResult } = await executeAgentTool('search_memories', { query: userText }, activePort);
-      toolCalls.push(record);
-      const topMems = (rawResult.memories as { topic: string }[]).slice(0, 3).map((m) => `\`${m.topic}\``);
-      findings.push(
-        isPt
-          ? `- **Memory Vault 4-Way RRF (${state.memories.length} registos)**: Destaques: ${topMems.join(', ')}.`
-          : `- **Memory Vault 4-Way RRF (${state.memories.length} records)**: Highlights: ${topMems.join(', ')}.`
-      );
-    }
-  }
-
-  if (lower.includes('workflow') || lower.includes('rotina') || lower.includes('ci')) {
-    const { record } = await executeAgentTool('trigger_workflow', { workflowQuery: 'ci' }, activePort);
-    toolCalls.push(record);
-    findings.push(`- **Workflow Engine**: ${record.outputSummary}`);
-  }
-
-  if (lower.includes('aprova') || lower.includes('executa comando') || lower.includes('run command:')) {
-    const cmdMatch = userText.match(/`([^`]+)`/) || [null, 'git status --short'];
-    const { record } = await executeAgentTool('request_shell_approval', { command: cmdMatch[1] }, activePort);
-    toolCalls.push(record);
-    findings.push(`- **Terminal Governado**: ${record.outputSummary}`);
   }
 
   if (attachments.length > 0) {
-    findings.push(
-      isPt
-        ? `- **Anexo Multimodal Recebido**: ${attachments.map((a) => `\`${a.name}\` (${a.mimeType}, ${Math.round(a.sizeBytes / 1024)} KB)`).join(', ')} registado na sessão para inspeção.`
-        : `- **Multimodal Attachment Received**: ${attachments.map((a) => `\`${a.name}\` (${a.mimeType})`).join(', ')} attached and indexed.`
+    sections.push(
+      `- **Anexos Recebidos**: ${attachments
+        .map((a) => `\`${a.name}\` (${a.mimeType}, ${Math.max(1, Math.round(a.sizeBytes / 1024))} KB)`)
+        .join(', ')}.`
     );
   }
 
-  if (findings.length === 0) {
-    const ranked = rankQ18Actions(state.candidates);
-    const topAction = ranked[0];
-    const { record } = await executeAgentTool('search_memories', { query: userText }, activePort);
+  if (sections.length === 0) {
+    const { record } = await executeAgentTool(
+      'call_mcp_gateway_tool',
+      { toolName: 'search_brain', argsJson: JSON.stringify({ query: userText }) },
+      activePort,
+      studioCtx
+    );
     toolCalls.push(record);
-    findings.push(
+    const projGoals = db
+      .getState()
+      .goals.filter((g) => (g.projectId || studioCtx.projectId) === studioCtx.projectId);
+    sections.push(
       isPt
-        ? `- **Próxima Ação Q-18 Recomendada**: **${topAction?.title || 'Nenhuma pendente'}** (Score \`${topAction?.q18Score ?? 0}\`).\n- **Roteamento JEV-S1**: Tier \`[${jevDecision.tier[0]}]\` · Poupança Token Diet **-${jevDecision.tokenDiet.savingsPercent}%** (${jevDecision.tokenDiet.activeToolsCount}/${jevDecision.tokenDiet.totalToolsCatalog} tools MCP ativas).`
-        : `- **Top Q-18 Next Action**: **${topAction?.title || 'None'}** (Score \`${topAction?.q18Score ?? 0}\`).\n- **JEV-S1 Route**: Tier \`[${jevDecision.tier[0]}]\` · Token Diet **-${jevDecision.tokenDiet.savingsPercent}%**.`
+        ? `Analisei o contexto do projeto **${activeProject?.name || 'Ativo'}** (${projGoals.length} Goal(s) registados).\n- Podes pedir-me para **planear uma nova funcionalidade** (crio automaticamente os Goals e sub-agentes necessários) ou **partilhar o teu ecrã** para trabalharmos em direto sobre o que estás a ver.`
+        : `Analyzed project **${activeProject?.name || 'Active'}** (${projGoals.length} Goal(s) tracked).`
     );
   }
 
-  const header = isPt
-    ? `Diretiva processada pelo motor **${state.settings.personalityMode}** (\`JEV-S1 ${jevDecision.latencyMs}ms\`):`
-    : `Directive processed by **${state.settings.personalityMode}** (\`JEV-S1 ${jevDecision.latencyMs}ms\`):`;
+  const intro = planDraft.isPlanningIntent
+    ? `Excelente direção para **${activeProject?.name || 'o teu projeto'}**! Já atualizei o plano no painel lateral direito com os novos **Goals**, **Sub-Agentes** e **Skills** para começarmos a executar:`
+    : `Aqui tens a atualização para **${activeProject?.name || 'esta conversa'}**:`;
 
   return {
-    reply: `${header}\n\n${findings.join('\n')}`,
+    reply: `${intro}\n\n${sections.join('\n\n')}`,
     toolCalls,
-    engineUsed: 'LOCAL_DETERMINISTIC_REACT_V3',
+    engineUsed: 'JARVIS_STUDIO_ENGINE_V3',
   };
 }
 
 export async function runAgentChatTurn(params: {
-  roomId: string;
+  roomId?: string;
+  chatId?: string;
+  projectId?: string;
   userText: string;
   attachments?: AttachmentItem[];
+  screenFrame?: IncomingScreenFrame;
   activePort?: number;
 }): Promise<{ userMessage: ChatMessage; assistantMessage: ChatMessage; blockedByCanary: boolean }> {
-  const { roomId, userText, attachments = [], activePort = 3000 } = params;
+  const {
+    roomId,
+    chatId,
+    projectId,
+    userText,
+    attachments = [],
+    screenFrame,
+    activePort = 3000,
+  } = params;
+
   const state = db.getState();
-  const room = state.rooms.find((r) => r.id === roomId) || state.rooms[0];
+  const projects = state.projects || [];
+  const threads = state.chatThreads || [];
+
+  const resolvedChat =
+    (chatId ? threads.find((c) => c.id === chatId) : undefined) ||
+    (projectId ? threads.find((c) => c.projectId === projectId) : undefined) ||
+    (state.activeChatId ? threads.find((c) => c.id === state.activeChatId) : undefined) ||
+    threads[0];
+
+  const resolvedProject =
+    (projectId ? projects.find((p) => p.id === projectId) : undefined) ||
+    (resolvedChat ? projects.find((p) => p.id === resolvedChat.projectId) : undefined) ||
+    (state.activeProjectId ? projects.find((p) => p.id === state.activeProjectId) : undefined) ||
+    projects[0];
+
+  const targetProjectId = resolvedProject?.id || 'proj-website-studio';
+  const targetChatId = resolvedChat?.id || 'chat-web-main';
+
+  const preferredRoomId = roomId || resolvedChat?.primaryAgentId || 'room-exec';
+  const room = state.rooms.find((r) => r.id === preferredRoomId) || state.rooms[0];
   const nowIso = new Date().toISOString();
+
+  const studioEventsOut: StudioInlineEvent[] = [];
+  const studioCtx: StudioExecutionContext = {
+    projectId: targetProjectId,
+    chatId: targetChatId,
+    actor: room.name || 'Jarvis',
+    studioEventsOut,
+  };
 
   const userMsg: ChatMessage = {
     id: `msg-u-${Date.now()}`,
     roomId: room.id,
+    chatId: targetChatId,
+    projectId: targetProjectId,
     role: 'user',
     content: userText,
     createdAt: nowIso,
+    screenIncluded: Boolean(screenFrame),
     attachments: attachments.length > 0 ? attachments : undefined,
   };
 
   const turnStart = performance.now();
-  debugLog('INFO', 'AI-ENGINE', `Incoming chat turn in room "${room.name}" (${room.id})`, {
-    payload: { prompt: userText, attachments: attachments.length },
-    maxPreviewLen: 180,
-  });
+  debugLog(
+    'INFO',
+    'AI-ENGINE',
+    `Incoming Studio turn in project="${targetProjectId}" chat="${targetChatId}" agent="${room.name}"`,
+    {
+      payload: {
+        prompt: userText,
+        attachments: attachments.length,
+        hasScreenFrame: Boolean(screenFrame),
+      },
+      maxPreviewLen: 180,
+    }
+  );
 
   // Security Canary & Prompt Injection Gate
   const injection = detectPromptInjection(userText);
   if (injection.blocked) {
-    debugLog(
-      'WARN',
-      'AI-ENGINE',
-      `Canary Gate intercepted prompt injection (risk=${injection.riskScore}/100)`,
-      {
-        durationMs: performance.now() - turnStart,
-        payload: { rules: injection.matchedRules, prompt: userText },
-      }
-    );
+    emitStudioActivity({
+      projectId: targetProjectId,
+      chatId: targetChatId,
+      actor: 'TrustBoundaryGate',
+      kind: 'SYSTEM_STEP',
+      status: 'ERROR',
+      summary: `Diretiva bloqueada pelo filtro de segurança (${injection.matchedRules.join(', ')})`,
+      detail: `Risco ${injection.riskScore}/100`,
+      durationMs: Math.round(performance.now() - turnStart),
+    });
+
     db.update((draft) => {
       draft.settings.personalityMode = 'GUARDIAN_DEFENSE';
     });
@@ -718,18 +1514,21 @@ export async function runAgentChatTurn(params: {
       'CANARY_GATE',
       'SECURITY',
       'PROMPT_INJECTION_BLOCKED',
-      `Sala ${room.name}: risco ${injection.riskScore}/100 (${injection.matchedRules.join(', ')})`,
+      `Projeto ${targetProjectId}: risco ${injection.riskScore}/100 (${injection.matchedRules.join(', ')})`,
       'BLOCKED'
     );
 
     const guardMsg: ChatMessage = {
       id: `msg-a-${Date.now() + 1}`,
       roomId: room.id,
+      chatId: targetChatId,
+      projectId: targetProjectId,
+      agentName: 'TrustBoundaryGate',
       role: 'assistant',
       content:
         state.settings.language === 'pt-PT'
-          ? `**Alerta de Segurança (TrustBoundaryGate)**: A diretiva foi intercetada por conter padrões de injeção ou tentativa de exfiltração (\`${injection.matchedRules.join(', ')}\`, Risco **${injection.riskScore}/100**). O perfil foi comutado preventivamente para \`GUARDIAN_DEFENSE\`.`
-          : `**Security Alert (TrustBoundaryGate)**: Directive intercepted due to prompt-injection pattern (\`${injection.matchedRules.join(', ')}\`, Risk **${injection.riskScore}/100**).`,
+          ? `**Alerta de Segurança (TrustBoundaryGate)**: A mensagem foi intercetada por conter padrões de injeção ou tentativa de exfiltração (\`${injection.matchedRules.join(', ')}\`, Risco **${injection.riskScore}/100**).`
+          : `**Security Alert (TrustBoundaryGate)**: Message intercepted due to prompt-injection pattern (\`${injection.matchedRules.join(', ')}\`, Risk **${injection.riskScore}/100**).`,
       createdAt: new Date().toISOString(),
       engineUsed: 'TRUST_BOUNDARY_CANARY',
     };
@@ -740,9 +1539,47 @@ export async function runAgentChatTurn(params: {
     return { userMessage: userMsg, assistantMessage: guardMsg, blockedByCanary: true };
   }
 
-  // PreInvocation JEV-S1 Reflex Router (<1ms) + SCOUT-01 Lookahead + 5-Stage Token Diet
+  // Record live screen frame if sent with this message
+  if (screenFrame && screenFrame.dataBase64 && screenFrame.mimeType) {
+    const snap: ScreenCaptureSnapshot = {
+      id: `scr-turn-${Date.now()}`,
+      source: screenFrame.source || 'BROWSER_STREAM',
+      capturedAt: nowIso,
+      width: screenFrame.width || 1280,
+      height: screenFrame.height || 720,
+      mimeType: screenFrame.mimeType,
+      dataBase64: screenFrame.dataBase64,
+      activeWindowTitle:
+        screenFrame.activeWindowTitle ||
+        (screenFrame.source === 'SIDECAR_NATIVE' ? 'Sidecar Desktop' : 'Partilha de Ecrã em Direto'),
+    };
+    db.update((draft) => {
+      draft.latestScreenSnapshot = snap;
+    });
+    emitStudioActivity({
+      projectId: targetProjectId,
+      chatId: targetChatId,
+      actor: studioCtx.actor,
+      kind: 'SCREEN_VISION',
+      status: 'SUCCESS',
+      summary: `Frame do ecrã analisado em direto (${snap.width}×${snap.height})`,
+      detail: snap.activeWindowTitle,
+      durationMs: 4,
+    });
+    studioEventsOut.push({
+      type: 'SCREEN',
+      id: snap.id,
+      title:
+        snap.source === 'SIDECAR_NATIVE'
+          ? 'Captura Sidecar Incluída'
+          : 'Ecrã em Direto Incluído',
+      subtitle: `${snap.activeWindowTitle} · ${snap.width}×${snap.height}`,
+    });
+  }
+
+  // PreInvocation JEV-S1 Reflex Router (<1ms)
   const scoutIdx = await buildScoutWorkspaceIndex();
-  const prevHash = roomDeltaHashes.get(room.id);
+  const prevHash = roomDeltaHashes.get(targetChatId);
   const nativeEligible = state.mcpRegistryTools
     ? state.mcpRegistryTools.filter((t) => t.enabled && t.jevEligible).map((t) => t.name)
     : undefined;
@@ -752,6 +1589,7 @@ export async function runAgentChatTurn(params: {
   const activeMcpCatalog = nativeEligible
     ? Array.from(new Set([...nativeEligible, ...externalEligible]))
     : undefined;
+
   const { decision: jevDecision, nextDeltaHash, compressedContextBlock } = routeJevS1({
     prompt: userText,
     memories: state.memories,
@@ -759,30 +1597,30 @@ export async function runAgentChatTurn(params: {
     previousDeltaHash: prevHash,
     activeMcpCatalog,
   });
-  roomDeltaHashes.set(room.id, nextDeltaHash);
+  roomDeltaHashes.set(targetChatId, nextDeltaHash);
 
-  debugLog(
-    'INFO',
-    'AI-ENGINE',
-    `JEV-S1 Route: tier=${jevDecision.tier} · intent=${jevDecision.intent} · TokenDiet=-${jevDecision.tokenDiet.savingsPercent}%`,
-    {
-      durationMs: jevDecision.latencyMs,
-      payload: {
-        microTick: jevDecision.microTick,
-        prunedTools: jevDecision.prunedTools,
-        savedTokens: jevDecision.tokenDiet.savedTokens,
-      },
-    }
+  emitStudioActivity({
+    projectId: targetProjectId,
+    chatId: targetChatId,
+    actor: studioCtx.actor,
+    kind: 'THOUGHT',
+    status: 'SUCCESS',
+    summary: `A analisar pedido (${jevDecision.intent.toLowerCase().replace(/_/g, ' ')})`,
+    detail: `Projeto "${resolvedProject?.name || targetProjectId}" · Poupança Token Diet -${jevDecision.tokenDiet.savingsPercent}%`,
+    durationMs: Math.max(1, Math.round(jevDecision.latencyMs)),
+  });
+
+  //Project context for System Instruction
+  const freshState = db.getState();
+  const projectGoals = freshState.goals.filter(
+    (g) => (g.projectId || targetProjectId) === targetProjectId
   );
-
-  const activeProject =
-    (state.projects || []).find((p) => p.id === (room.projectId || state.activeProjectId)) ||
-    (state.projects || [])[0];
-  const enabledSkillsSummary = state.skills
-    .filter((s) => s.enabled)
-    .slice(0, 5)
-    .map((s) => `${s.name} (${s.quickCommand})`)
-    .join(', ');
+  const projectAgents = freshState.rooms.filter(
+    (r) => r.projectId === targetProjectId || (resolvedProject?.assignedAgentIds || []).includes(r.id)
+  );
+  const projectSkills = freshState.skills.filter(
+    (s) => s.enabled && (!resolvedProject?.activeSkillIds || resolvedProject.activeSkillIds.includes(s.id))
+  );
 
   // Track PRE_PROMPT plugin invocations
   db.update((draft) => {
@@ -794,44 +1632,64 @@ export async function runAgentChatTurn(params: {
     }
   });
 
-  const provider = state.settings.modelProvider;
+  const provider = freshState.settings.modelProvider;
   const ai = provider === 'GEMINI_STUDIO' ? getGeminiClient() : null;
   let replyText = '';
   let toolCalls: ToolCallRecord[] = [];
-  let engineUsed = 'LOCAL_DETERMINISTIC_REACT_V3';
-
-  const lookaheadText =
-    jevDecision.lookaheadAlerts.length > 0
-      ? `Notice Lookahead AST:\n${jevDecision.lookaheadAlerts.map((a) => `- ${a.reason}`).join('\n')}`
-      : '';
+  let engineUsed = 'JARVIS_STUDIO_ENGINE_V3';
 
   const systemInstruction = [
-    getPersonalityDirective(state.settings.personalityMode, state.settings.language),
+    getPersonalityDirective(freshState.settings.personalityMode, freshState.settings.language),
     room.systemPrompt,
-    `Operador: ${state.settings.operatorName} (${state.settings.organizationName}). Rota JEV-S1: [${jevDecision.tier}] ${jevDecision.intent}.`,
-    activeProject
-      ? `Projeto Ativo: "${activeProject.name}" em "${activeProject.rootPath}" (${activeProject.techStack}, branch ${activeProject.gitBranch}, Proatividade=${activeProject.proactiveEnabled ? 'ON' : 'OFF'}).`
+    `Estás no Estúdio de Projetos do J.A.R.V.I.S. com ${freshState.settings.operatorName}.`,
+    resolvedProject
+      ? `Projeto / Ideia Atual: "${resolvedProject.name}" (Categoria: ${resolvedProject.ideaCategory || 'CUSTOM'} · Stack: ${resolvedProject.techStack}). Descrição: ${resolvedProject.ideaBrief || resolvedProject.description}`
       : '',
-    enabledSkillsSummary ? `Skills Ativas: ${enabledSkillsSummary}.` : '',
-    compressedContextBlock ? `Memória TOON:\n${compressedContextBlock}` : '',
-    lookaheadText,
-    'Usa as ferramentas disponíveis sempre que o utilizador pedir dados reais da máquina Sidecar, sistema, Swarm 48x, AST, ficheiros, Git, workflows ou memórias.',
+    projectGoals.length > 0
+      ? `Goals Atuais deste Projeto:\n${projectGoals
+          .slice(0, 8)
+          .map((g) => `- [${g.status} ${g.progress}%] ${g.title}`)
+          .join('\n')}`
+      : 'Ainda não existem Goals neste projeto — cria Goals estruturados com upsert_project_goal assim que o utilizador descrever objetivos ou funcionalidades.',
+    projectAgents.length > 0
+      ? `Agentes a colaborar neste Projeto: ${projectAgents.map((a) => `${a.name} (${a.roleTitle})`).join('; ')}.`
+      : '',
+    projectSkills.length > 0
+      ? `Skills Antigravity Ativas no Projeto: ${projectSkills.map((s) => `${s.name} (${s.quickCommand})`).join(', ')}.`
+      : '',
+    compressedContextBlock ? `Memória Relevante:\n${compressedContextBlock}` : '',
+    'REGRAS DE ESTÚDIO AGÊNTICO (MUITO IMPORTANTE):\n1. Sempre que o utilizador apresentar uma ideia, pedir para planear funcionalidades (ex: fazer um website, criar uma app, autenticação, pagamentos, UI, API) ou atualizar o rumo do projeto, invoca proativamente `upsert_project_goal` (com 2 a 4 subtasks claras) e, se fizer sentido ter ajuda especializada, invoca `spawn_project_subagent` e/ou `activate_antigravity_skill`.\n2. Se for fornecida uma imagem do ecrã em tempo real (`inlineData`), observa atentamente o que está no ecrã do utilizador (código, design, browser, erros ou janelas) e responde diretamente sobre o que estás a ver.\n3. Se o utilizador perguntar o que está no ecrã dele e não houver imagem anexada no turno, invoca `capture_and_inspect_sidecar_screen`.',
   ]
     .filter(Boolean)
     .join('\n\n');
 
-  if (ai && !jevDecision.microTick) {
+  if (ai && (!jevDecision.microTick || Boolean(screenFrame))) {
     try {
-      const modelName = room.modelOverride || state.settings.preferredGeminiModel || 'gemini-3.8-flash';
-      const recentHistory = state.messages
-        .filter((m) => m.roomId === room.id)
-        .slice(-6)
+      const modelName = normalizeGeminiModelId(
+        room.modelOverride || freshState.settings.preferredGeminiModel
+      );
+      const recentHistory = freshState.messages
+        .filter((m) => (m.chatId ? m.chatId === targetChatId : m.roomId === room.id))
+        .slice(-8)
         .map((m) => ({
           role: m.role === 'assistant' ? ('model' as const) : ('user' as const),
           parts: [{ text: m.content }],
         }));
 
       const currentParts: Record<string, unknown>[] = [];
+      if (
+        screenFrame &&
+        screenFrame.dataBase64 &&
+        RASTER_VISION_MIMES.has(screenFrame.mimeType.toLowerCase())
+      ) {
+        currentParts.push({
+          inlineData: {
+            mimeType: screenFrame.mimeType,
+            data: screenFrame.dataBase64,
+          },
+        });
+      }
+
       for (const att of attachments) {
         if (att.dataBase64 && att.mimeType) {
           currentParts.push({
@@ -842,25 +1700,49 @@ export async function runAgentChatTurn(params: {
           });
         }
       }
-      currentParts.push({ text: userText || 'Analisa o conteúdo enviado.' });
+
+      const promptWithScreenHint =
+        screenFrame && !RASTER_VISION_MIMES.has(screenFrame.mimeType.toLowerCase())
+          ? `${userText}\n\n[Nota de Visão Sidecar: Janela ativa "${screenFrame.activeWindowTitle || 'Desktop'}"]`
+          : userText || 'Analisa o ecrã e o contexto enviados.';
+
+      currentParts.push({ text: promptWithScreenHint });
 
       const contents: unknown[] = [...recentHistory, { role: 'user', parts: currentParts }];
 
-      const allowedSet = new Set(room.allowedTools || []);
-      const filteredDecls =
-        allowedSet.size > 0
-          ? AGENT_TOOL_DECLARATIONS.filter((d) => d.name && allowedSet.has(d.name))
-          : AGENT_TOOL_DECLARATIONS;
+      const allowedSet = new Set([...(room.allowedTools || []), ...STUDIO_CORE_TOOL_NAMES]);
+      const filteredDecls = AGENT_TOOL_DECLARATIONS.filter(
+        (d) => d.name && allowedSet.has(d.name)
+      );
 
-      for (let step = 0; step < 3; step++) {
-        const response = await ai.models.generateContent({
-          model: modelName,
-          contents: contents as never,
-          config: {
-            systemInstruction,
-            tools: filteredDecls.length > 0 ? [{ functionDeclarations: filteredDecls }] : undefined,
-          },
-        });
+      let activeGeminiModel = modelName;
+      for (let step = 0; step < 4; step++) {
+        let response;
+        try {
+          response = await ai.models.generateContent({
+            model: activeGeminiModel,
+            contents: contents as never,
+            config: {
+              systemInstruction,
+              tools: filteredDecls.length > 0 ? [{ functionDeclarations: filteredDecls }] : undefined,
+            },
+          });
+        } catch (stepErr) {
+          const errStr = (stepErr as Error).message || '';
+          if (activeGeminiModel !== 'gemini-3.1-flash-lite' && /503|UNAVAILABLE|overloaded|high demand/i.test(errStr)) {
+            activeGeminiModel = 'gemini-3.1-flash-lite';
+            response = await ai.models.generateContent({
+              model: activeGeminiModel,
+              contents: contents as never,
+              config: {
+                systemInstruction,
+                tools: filteredDecls.length > 0 ? [{ functionDeclarations: filteredDecls }] : undefined,
+              },
+            });
+          } else {
+            throw stepErr;
+          }
+        }
 
         const fCalls = response.functionCalls;
         if (fCalls && fCalls.length > 0) {
@@ -873,7 +1755,12 @@ export async function runAgentChatTurn(params: {
           for (const fc of fCalls) {
             const fname = fc.name || 'search_memories';
             const fargs = (fc.args as Record<string, unknown>) || {};
-            const { record, rawResult } = await executeAgentTool(fname, fargs, activePort);
+            const { record, rawResult } = await executeAgentTool(
+              fname,
+              fargs,
+              activePort,
+              studioCtx
+            );
             toolCalls.push(record);
             functionResponseParts.push({
               functionResponse: {
@@ -888,25 +1775,40 @@ export async function runAgentChatTurn(params: {
         }
 
         replyText = (response.text ?? '').trim();
-        engineUsed = `GEMINI (${modelName})`;
+        engineUsed = `GEMINI (${activeGeminiModel})`;
         break;
       }
 
       if (!replyText) {
-        const det = await runDeterministicReActTurn(userText, attachments, activePort, jevDecision);
+        const det = await runDeterministicReActTurn({
+          userText,
+          attachments,
+          screenFrame,
+          activePort,
+          jevDecision,
+          studioCtx,
+        });
         replyText = det.reply;
         if (toolCalls.length === 0) toolCalls = det.toolCalls;
       }
-    } catch {
-      const det = await runDeterministicReActTurn(userText, attachments, activePort, jevDecision);
+    } catch (err) {
+      debugLog('WARN', 'AI-ENGINE', `Gemini call fallback to Studio Deterministic: ${(err as Error).message}`);
+      const det = await runDeterministicReActTurn({
+        userText,
+        attachments,
+        screenFrame,
+        activePort,
+        jevDecision,
+        studioCtx,
+      });
       replyText = det.reply;
       toolCalls = det.toolCalls;
       engineUsed = det.engineUsed;
     }
   } else if (provider === 'OLLAMA_LOCAL' && !jevDecision.microTick) {
     try {
-      const base = (state.settings.ollamaEndpoint || 'http://127.0.0.1:11434').replace(/\/$/, '');
-      const model = room.modelOverride || state.settings.ollamaModel || 'qwen2.5-coder:7b';
+      const base = (freshState.settings.ollamaEndpoint || 'http://127.0.0.1:11434').replace(/\/$/, '');
+      const model = room.modelOverride || freshState.settings.ollamaModel || 'qwen2.5-coder:7b';
       const ctrl = new AbortController();
       const timer = setTimeout(() => ctrl.abort(), 6000);
       const r = await fetch(`${base}/api/chat`, {
@@ -929,28 +1831,41 @@ export async function runAgentChatTurn(params: {
         engineUsed = `OLLAMA (${model})`;
       }
     } catch {
-      // Fallback to deterministic engine if local Ollama is offline
+      // Fallback below
     }
     if (!replyText) {
-      const det = await runDeterministicReActTurn(userText, attachments, activePort, jevDecision);
+      const det = await runDeterministicReActTurn({
+        userText,
+        attachments,
+        screenFrame,
+        activePort,
+        jevDecision,
+        studioCtx,
+      });
       replyText = det.reply;
       toolCalls = det.toolCalls;
-      engineUsed = `${det.engineUsed} (Fallback Ollama Offline)`;
+      engineUsed = det.engineUsed;
     }
   } else if (provider === 'OPENROUTER_COMPAT' && !jevDecision.microTick) {
     const orKey = process.env.OPENROUTER_API_KEY?.trim();
-    if (orKey) {
+    const base = (freshState.settings.openRouterEndpoint || 'https://openrouter.ai/api/v1').replace(/\/$/, '');
+    const localCompat = isLocalOpenAiCompatibleEndpoint(base);
+    if (orKey || localCompat) {
       try {
-        const base = (state.settings.openRouterEndpoint || 'https://openrouter.ai/api/v1').replace(/\/$/, '');
-        const model = room.modelOverride || state.settings.openRouterModel || 'anthropic/claude-3.7-sonnet';
+        const model = room.modelOverride || freshState.settings.openRouterModel || 'meta-llama/llama-3.3-70b-instruct';
+        const headers: Record<string, string> = {
+          'Content-Type': 'application/json',
+        };
+        if (orKey) {
+          headers.Authorization = `Bearer ${orKey}`;
+        } else if (localCompat) {
+          headers.Authorization = 'Bearer local-studio';
+        }
         const ctrl = new AbortController();
         const timer = setTimeout(() => ctrl.abort(), 8000);
         const r = await fetch(`${base}/chat/completions`, {
           method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${orKey}`,
-          },
+          headers,
           body: JSON.stringify({
             model,
             messages: [
@@ -964,20 +1879,34 @@ export async function runAgentChatTurn(params: {
         if (r.ok) {
           const data = (await r.json()) as { choices?: { message?: { content?: string } }[] };
           replyText = String(data.choices?.[0]?.message?.content || '').trim();
-          engineUsed = `OPENROUTER (${model})`;
+          engineUsed = `${localCompat ? 'LOCAL_OPENAI' : 'OPENROUTER'} (${model})`;
         }
       } catch {
         // Fallback below
       }
     }
     if (!replyText) {
-      const det = await runDeterministicReActTurn(userText, attachments, activePort, jevDecision);
+      const det = await runDeterministicReActTurn({
+        userText,
+        attachments,
+        screenFrame,
+        activePort,
+        jevDecision,
+        studioCtx,
+      });
       replyText = det.reply;
       toolCalls = det.toolCalls;
       engineUsed = det.engineUsed;
     }
   } else {
-    const det = await runDeterministicReActTurn(userText, attachments, activePort, jevDecision);
+    const det = await runDeterministicReActTurn({
+      userText,
+      attachments,
+      screenFrame,
+      activePort,
+      jevDecision,
+      studioCtx,
+    });
     replyText = det.reply;
     toolCalls = det.toolCalls;
     engineUsed = det.engineUsed;
@@ -986,19 +1915,32 @@ export async function runAgentChatTurn(params: {
   const assistantMsg: ChatMessage = {
     id: `msg-a-${Date.now() + 2}`,
     roomId: room.id,
+    chatId: targetChatId,
+    projectId: targetProjectId,
+    agentName: room.name,
     role: 'assistant',
     content: replyText,
     createdAt: new Date().toISOString(),
     engineUsed,
+    screenIncluded: Boolean(screenFrame),
+    studioEvents: studioEventsOut.length > 0 ? studioEventsOut : undefined,
     toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
     jevRoute: jevDecision,
   };
 
-  // Update 5h Token Diet Quota Telemetry & Post-Turn Self-Learn Harvest
   db.update((draft) => {
+    draft.activeProjectId = targetProjectId;
+    draft.activeChatId = targetChatId;
+    const chat = (draft.chatThreads || []).find((c) => c.id === targetChatId);
+    if (chat) {
+      chat.updatedAt = assistantMsg.createdAt;
+      if (chat.title === 'Nova Conversa' && userText.trim().length >= 4) {
+        chat.title = userText.trim().slice(0, 42) + (userText.trim().length > 42 ? '…' : '');
+      }
+    }
     draft.messages.push(userMsg, assistantMsg);
-    if (draft.messages.length > 200) {
-      draft.messages = draft.messages.slice(-200);
+    if (draft.messages.length > 300) {
+      draft.messages = draft.messages.slice(-300);
     }
     if (draft.quota5h) {
       draft.quota5h.consumedTokens5h += jevDecision.tokenDiet.injectedTokens;
@@ -1020,7 +1962,7 @@ export async function runAgentChatTurn(params: {
   debugLog(
     'INFO',
     'AI-ENGINE',
-    `Chat turn completed via ${engineUsed} (${toolCalls.length} tool call(s))`,
+    `Studio turn completed via ${engineUsed} (${toolCalls.length} tool(s), ${studioEventsOut.length} studio event(s))`,
     {
       durationMs: performance.now() - turnStart,
       payload: { replyChars: replyText.length, tools: toolCalls.map((tc) => tc.name) },
@@ -1028,6 +1970,120 @@ export async function runAgentChatTurn(params: {
   );
 
   return { userMessage: userMsg, assistantMessage: assistantMsg, blockedByCanary: false };
+}
+
+/**
+ * Standalone Real-Time Screen Frame Analyzer (1-click or continuous observation)
+ */
+export async function analyzeLiveScreenFrame(params: {
+  projectId?: string;
+  chatId?: string;
+  prompt?: string;
+  screenFrame?: IncomingScreenFrame;
+  activePort?: number;
+}): Promise<{
+  analysis: string;
+  snapshot: ScreenCaptureSnapshot;
+  engineUsed: string;
+}> {
+  const t0 = performance.now();
+  const state = db.getState();
+  const activePort = params.activePort || 3000;
+  const projectId = params.projectId || state.activeProjectId || 'proj-website-studio';
+  const chatId = params.chatId || state.activeChatId || 'chat-web-main';
+  const activeProject = (state.projects || []).find((p) => p.id === projectId);
+
+  let snapshot: ScreenCaptureSnapshot;
+  if (params.screenFrame && params.screenFrame.dataBase64 && params.screenFrame.mimeType) {
+    snapshot = {
+      id: `scr-live-${Date.now()}`,
+      source: params.screenFrame.source || 'BROWSER_STREAM',
+      capturedAt: new Date().toISOString(),
+      width: params.screenFrame.width || 1280,
+      height: params.screenFrame.height || 720,
+      mimeType: params.screenFrame.mimeType,
+      dataBase64: params.screenFrame.dataBase64,
+      activeWindowTitle:
+        params.screenFrame.activeWindowTitle || 'Stream em Direto do Ecrã',
+    };
+  } else {
+    snapshot = await captureSidecarDesktopScreen('dev-local-host', activePort);
+  }
+
+  const ai = state.settings.modelProvider === 'GEMINI_STUDIO' ? getGeminiClient() : null;
+  let analysis = '';
+  let engineUsed = 'SIDECAR_VISION_LOCAL';
+
+  if (ai && RASTER_VISION_MIMES.has(snapshot.mimeType.toLowerCase())) {
+    try {
+      const modelName = normalizeGeminiModelId(state.settings.preferredGeminiModel);
+      const askPrompt =
+        params.prompt?.trim() ||
+        `Observa este ecrã em tempo real no contexto do projeto "${
+          activeProject?.name || 'Estúdio Jarvis'
+        }". Resume em 3 pontos curtos (PT-PT) o que está visível e sugere 1 melhoria ou próximo passo útil.`;
+
+      const res = await ai.models.generateContent({
+        model: modelName,
+        contents: {
+          parts: [
+            {
+              inlineData: {
+                mimeType: snapshot.mimeType,
+                data: snapshot.dataBase64,
+              },
+            },
+            { text: askPrompt },
+          ],
+        },
+        config: {
+          systemInstruction:
+            'Responde em Português de Portugal (PT-PT) de forma concisa, útil e prática como assistente visual em tempo real do Jarvis.',
+        },
+      });
+      analysis = (res.text ?? '').trim();
+      if (analysis) {
+        engineUsed = `GEMINI_VISION (${modelName})`;
+      }
+    } catch (err) {
+      debugLog('WARN', 'AI-ENGINE', `Live screen Gemini vision fallback: ${(err as Error).message}`);
+    }
+  }
+
+  if (!analysis) {
+    const hostSnap = await collectSidecarHostSnapshot('dev-local-host');
+    const winList = hostSnap.activeWindows
+      .slice(0, 3)
+      .map((w) => w.title)
+      .join(' · ');
+    const procList = hostSnap.topProcesses
+      .slice(0, 3)
+      .map((p) => `${p.name} (${p.cpuPercent}% CPU)`)
+      .join(', ');
+    analysis = `Ecrã capturado (${snapshot.width}×${snapshot.height}, fonte: ${
+      snapshot.source === 'BROWSER_STREAM' ? 'Stream do Navegador' : 'Sidecar Nativo'
+    }). Janelas ativas: ${winList || snapshot.activeWindowTitle || hostSnap.hostname}. Processos em destaque: ${procList}. Tudo pronto para apoiar o projeto "${
+      activeProject?.name || 'Ativo'
+    }".`;
+  }
+
+  snapshot.visionSummary = analysis;
+  db.update((draft) => {
+    draft.latestScreenSnapshot = snapshot;
+  });
+
+  emitStudioActivity({
+    projectId,
+    chatId,
+    actor: 'Visão Jarvis',
+    kind: 'SCREEN_VISION',
+    status: 'SUCCESS',
+    summary: `Inspeção visual do ecrã (${snapshot.source === 'BROWSER_STREAM' ? 'Stream WebRTC' : 'Sidecar'})`,
+    detail: analysis.slice(0, 220),
+    durationMs: Math.max(1, Math.round(performance.now() - t0)),
+  });
+
+  return { analysis, snapshot, engineUsed };
 }
 
 export async function synthesizeBriefText(customContext?: string): Promise<string> {
@@ -1177,18 +2233,28 @@ export async function generateWorkflowFromNaturalLanguage(prompt: string): Promi
   return { ...det, engineUsed: 'LOCAL_DETERMINISTIC_DAG' };
 }
 
-export async function testModelProviderConnection(params?: {
-  provider?: string;
-  ollamaEndpoint?: string;
-  openRouterEndpoint?: string;
-}): Promise<{
+export interface ProviderConnectivityResult {
   ok: boolean;
   provider: string;
   latencyMs: number;
   detail: string;
+  modelUsed?: string;
+  endpointUsed?: string;
+  sampleOutput?: string;
+  discoveredModels?: string[];
+  fallbackReady: boolean;
   envKeysStatus: { geminiConfigured: boolean; openRouterConfigured: boolean };
-}> {
-  const t0 = Date.now();
+}
+
+export async function testModelProviderConnection(params?: {
+  provider?: string;
+  preferredGeminiModel?: string;
+  ollamaEndpoint?: string;
+  ollamaModel?: string;
+  openRouterEndpoint?: string;
+  openRouterModel?: string;
+}): Promise<ProviderConnectivityResult> {
+  const t0 = performance.now();
   const state = db.getState();
   const provider = params?.provider || state.settings.modelProvider;
   const envKeysStatus = {
@@ -1197,79 +2263,285 @@ export async function testModelProviderConnection(params?: {
   };
 
   if (provider === 'LOCAL_DETERMINISTIC') {
+    const jevBench = routeJevS1({
+      prompt: 'Verificar estado cognitivo e planear próximos Goals do projeto ativo',
+      memories: state.memories.slice(0, 6),
+    });
+    const planBench = extractDeterministicPlanFromPrompt({
+      prompt: 'Planear arquitetura modular de website SaaS com API e testes',
+      existingGoals: [],
+      existingRooms: [],
+      skills: state.skills,
+    });
+    const latencyMs = Math.max(1, Math.round(performance.now() - t0));
     return {
       ok: true,
       provider,
-      latencyMs: Math.max(1, Date.now() - t0),
-      detail: 'Motor Determinístico Local ReAct v3 ativo (0ms rede, 100% autónomo sem chaves externas).',
+      latencyMs,
+      modelUsed: 'JARVIS_STUDIO_ENGINE_V3',
+      endpointUsed: 'In-Process · Zero Rede · 0 GB VRAM',
+      sampleOutput: `JEV-S1 (${jevBench.decision.intent}, -${jevBench.decision.tokenDiet.savingsPercent}% tokens) · ${planBench.goalsToCreate.length} Goal(s) prontos`,
+      detail:
+        'Motor Determinístico Nativo operacional a 100% (0 GB VRAM, latência sub-2ms, planeamento de Goals, Sub-Agentes e Sidecar sem chaves externas).',
+      fallbackReady: true,
       envKeysStatus,
     };
   }
 
   if (provider === 'GEMINI_STUDIO') {
-    if (!envKeysStatus.geminiConfigured) {
+    const targetModel = normalizeGeminiModelId(
+      params?.preferredGeminiModel || state.settings.preferredGeminiModel
+    );
+    const ai = getGeminiClient();
+    if (!ai || !envKeysStatus.geminiConfigured) {
       return {
         ok: false,
         provider,
-        latencyMs: Math.max(1, Date.now() - t0),
-        detail: 'Variável GEMINI_API_KEY ausente no servidor (.env). O fallback determinístico local assumirá automaticamente.',
+        latencyMs: Math.max(1, Math.round(performance.now() - t0)),
+        modelUsed: targetModel,
+        endpointUsed: '@google/genai Server SDK',
+        detail:
+          'GEMINI_API_KEY não detetada no servidor. Associa a chave em Settings > Secrets (ou no ficheiro .env local). Enquanto ausente, o Motor Determinístico Local assume sem interrupções.',
+        fallbackReady: true,
         envKeysStatus,
       };
     }
-    return {
-      ok: true,
-      provider,
-      latencyMs: Math.max(1, Date.now() - t0),
-      detail: `GEMINI_API_KEY detetada no servidor · Modelo ativo: ${state.settings.preferredGeminiModel}.`,
-      envKeysStatus,
+
+    const pingGeminiWithTimeout = async (mdl: string, timeoutMs: number) => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        const callPromise = ai.models.generateContent({
+          model: mdl,
+          contents: 'Responde apenas com a palavra: OPERACIONAL',
+          config:
+            mdl === 'gemini-3.8-flash'
+              ? { thinkingConfig: { thinkingLevel: ThinkingLevel.LOW } }
+              : undefined,
+        });
+        const timeoutPromise = new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new Error('TIMEOUT_503_SPIKE')), timeoutMs);
+        });
+        return await Promise.race([callPromise, timeoutPromise]);
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
     };
+
+    try {
+      const res = await pingGeminiWithTimeout(targetModel, 4800);
+      const sample = (res.text ?? '').trim().slice(0, 80) || 'OPERACIONAL';
+      const latencyMs = Math.max(1, Math.round(performance.now() - t0));
+      return {
+        ok: true,
+        provider,
+        latencyMs,
+        modelUsed: targetModel,
+        endpointUsed: '@google/genai Server SDK',
+        sampleOutput: sample,
+        detail: `Round-trip real concluído com sucesso em ${targetModel} (${latencyMs}ms). Visão multimodal e 18 tools ativas.`,
+        fallbackReady: true,
+        envKeysStatus,
+      };
+    } catch (err) {
+      const rawMsg = (err as Error).message || 'Erro de rede ou autenticação';
+      // Automatic failover check to gemini-3.1-flash-lite on temporary 503 high-demand spikes
+      if (
+        targetModel !== 'gemini-3.1-flash-lite' &&
+        /503|UNAVAILABLE|high demand|TIMEOUT_503_SPIKE/i.test(rawMsg)
+      ) {
+        try {
+          const fallbackRes = await pingGeminiWithTimeout('gemini-3.1-flash-lite', 4200);
+          const sample = (fallbackRes.text ?? '').trim().slice(0, 80) || 'OPERACIONAL';
+          const latencyMs = Math.max(1, Math.round(performance.now() - t0));
+          return {
+            ok: true,
+            provider,
+            latencyMs,
+            modelUsed: 'gemini-3.1-flash-lite (failover 503)',
+            endpointUsed: '@google/genai Server SDK',
+            sampleOutput: sample,
+            detail: `Ligação Gemini operacional via failover rápido para gemini-3.1-flash-lite (${latencyMs}ms) devido a pico temporário de procura em ${targetModel}.`,
+            fallbackReady: true,
+            envKeysStatus,
+          };
+        } catch {
+          // Proceed to structured hint below
+        }
+      }
+
+      const latencyMs = Math.max(1, Math.round(performance.now() - t0));
+      let hint = `Serviço Gemini temporariamente indisponível para ${targetModel}.`;
+      if (/403|PERMISSION_DENIED|400|API_KEY_INVALID/i.test(rawMsg)) {
+        hint =
+          'Chave recusada (400/403). Verifica a GEMINI_API_KEY em Settings > Secrets ou no .env do servidor.';
+      } else if (/429|RESOURCE_EXHAUSTED/i.test(rawMsg)) {
+        hint =
+          'Quota temporariamente atingida (429). No escalão gratuito aguarda alguns segundos ou seleciona gemini-3.1-flash-lite / chave com faturação em Settings > Secrets.';
+      } else if (/503|UNAVAILABLE|high demand|TIMEOUT_503_SPIKE/i.test(rawMsg)) {
+        hint = `Pico temporário de procura nos servidores Gemini (503) para ${targetModel}. Tenta novamente em instantes ou usa gemini-3.1-flash-lite.`;
+      } else if (/404|NOT_FOUND/i.test(rawMsg)) {
+        hint = `Modelo "${targetModel}" não encontrado (404). Seleciona gemini-3.8-flash ou gemini-3.1-flash-lite.`;
+      }
+      return {
+        ok: false,
+        provider,
+        latencyMs,
+        modelUsed: targetModel,
+        endpointUsed: '@google/genai Server SDK',
+        detail: `${hint} O fallback determinístico local permanece pronto.`,
+        fallbackReady: true,
+        envKeysStatus,
+      };
+    }
   }
 
   if (provider === 'OLLAMA_LOCAL') {
-    const base = (params?.ollamaEndpoint || state.settings.ollamaEndpoint || 'http://127.0.0.1:11434').replace(/\/$/, '');
+    const base = (
+      params?.ollamaEndpoint ||
+      state.settings.ollamaEndpoint ||
+      'http://127.0.0.1:11434'
+    ).replace(/\/$/, '');
+    const requestedModel =
+      (params?.ollamaModel || state.settings.ollamaModel || 'qwen2.5-coder:7b').trim();
+
     try {
       const ctrl = new AbortController();
-      const timer = setTimeout(() => ctrl.abort(), 1600);
+      const timer = setTimeout(() => ctrl.abort(), 2200);
       const r = await fetch(`${base}/api/tags`, { signal: ctrl.signal });
       clearTimeout(timer);
+      const latencyMs = Math.max(1, Math.round(performance.now() - t0));
+
       if (r.ok) {
         const data = (await r.json()) as { models?: { name: string }[] };
-        const count = data.models?.length ?? 0;
+        const discoveredModels = (data.models || []).map((m) => m.name).filter(Boolean);
+        const hasModel = discoveredModels.some(
+          (m) => m === requestedModel || m.startsWith(`${requestedModel}:`)
+        );
         return {
           ok: true,
           provider,
-          latencyMs: Math.max(1, Date.now() - t0),
-          detail: `Ollama online em ${base} (${count} modelo(s) locais disponíveis).`,
+          latencyMs,
+          modelUsed: requestedModel,
+          endpointUsed: base,
+          discoveredModels,
+          sampleOutput:
+            discoveredModels.length > 0
+              ? `Modelos detetados: ${discoveredModels.slice(0, 4).join(', ')}`
+              : 'Daemon ativo (0 modelos transferidos)',
+          detail: hasModel
+            ? `Ollama online em ${base} · Modelo "${requestedModel}" pronto (${discoveredModels.length} instalados).`
+            : `Ollama online em ${base} (${discoveredModels.length} modelo(s)), mas "${requestedModel}" ainda não consta em /api/tags (executa: ollama pull ${requestedModel}).`,
+          fallbackReady: true,
           envKeysStatus,
         };
       }
       return {
         ok: false,
         provider,
-        latencyMs: Math.max(1, Date.now() - t0),
-        detail: `Ollama respondeu HTTP ${r.status} em ${base}.`,
+        latencyMs,
+        modelUsed: requestedModel,
+        endpointUsed: base,
+        detail: `Ollama respondeu HTTP ${r.status} em ${base}. Fallback local ativo.`,
+        fallbackReady: true,
         envKeysStatus,
       };
     } catch {
       return {
         ok: false,
         provider,
-        latencyMs: Math.max(1, Date.now() - t0),
-        detail: `Sem resposta em ${base}. Quando offline, o Jarvis usa automaticamente o motor determinístico local.`,
+        latencyMs: Math.max(1, Math.round(performance.now() - t0)),
+        modelUsed: requestedModel,
+        endpointUsed: base,
+        detail: `Daemon Ollama não detetado em ${base} (inicia com "ollama serve"). Enquanto offline, o Jarvis usa automaticamente o Motor Determinístico Nativo.`,
+        fallbackReady: true,
         envKeysStatus,
       };
     }
   }
 
-  // OPENROUTER_COMPAT
-  const base = (params?.openRouterEndpoint || state.settings.openRouterEndpoint || 'https://openrouter.ai/api/v1').replace(/\/$/, '');
-  return {
-    ok: envKeysStatus.openRouterConfigured,
-    provider,
-    latencyMs: Math.max(1, Date.now() - t0),
-    detail: envKeysStatus.openRouterConfigured
-      ? `OPENROUTER_API_KEY configurada no servidor · Endpoint ${base}.`
-      : `OPENROUTER_API_KEY não definida no ambiente (.env). Configura no servidor para ativar chamadas remotas em ${base}.`,
-    envKeysStatus,
-  };
+  // OPENROUTER_COMPAT (OpenRouter Cloud OR Local LM Studio / vLLM / LiteLLM)
+  const base = (
+    params?.openRouterEndpoint ||
+    state.settings.openRouterEndpoint ||
+    'https://openrouter.ai/api/v1'
+  ).replace(/\/$/, '');
+  const targetModel = (
+    params?.openRouterModel ||
+    state.settings.openRouterModel ||
+    'meta-llama/llama-3.3-70b-instruct'
+  ).trim();
+  const localCompat = isLocalOpenAiCompatibleEndpoint(base);
+  const orKey = process.env.OPENROUTER_API_KEY?.trim();
+
+  if (!localCompat && !orKey) {
+    return {
+      ok: false,
+      provider,
+      latencyMs: Math.max(1, Math.round(performance.now() - t0)),
+      modelUsed: targetModel,
+      endpointUsed: base,
+      detail: `OPENROUTER_API_KEY não detetada no servidor para ${base}. Define OPENROUTER_API_KEY em Settings > Secrets / .env, ou aponta o endpoint para um servidor local sem chave (ex.: LM Studio http://127.0.0.1:1234/v1).`,
+      fallbackReady: true,
+      envKeysStatus,
+    };
+  }
+
+  try {
+    const headers: Record<string, string> = {};
+    if (orKey) {
+      headers.Authorization = `Bearer ${orKey}`;
+    } else if (localCompat) {
+      headers.Authorization = 'Bearer local-studio';
+    }
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 3500);
+    const r = await fetch(`${base}/models`, { headers, signal: ctrl.signal });
+    clearTimeout(timer);
+    const latencyMs = Math.max(1, Math.round(performance.now() - t0));
+
+    if (r.ok) {
+      const payload = (await r.json()) as { data?: { id?: string }[] };
+      const discoveredModels = (payload.data || [])
+        .map((m) => m.id || '')
+        .filter(Boolean)
+        .slice(0, 12);
+      return {
+        ok: true,
+        provider,
+        latencyMs,
+        modelUsed: targetModel,
+        endpointUsed: base,
+        discoveredModels,
+        sampleOutput:
+          discoveredModels.length > 0
+            ? `${discoveredModels.length}+ modelos acessíveis (${discoveredModels.slice(0, 3).join(', ')})`
+            : 'Endpoint OpenAI-compatível respondeu HTTP 200',
+        detail: `${localCompat ? 'Servidor OpenAI local' : 'OpenRouter Cloud'} acessível em ${base} (${latencyMs}ms). Modelo configurado: ${targetModel}.`,
+        fallbackReady: true,
+        envKeysStatus,
+      };
+    }
+    return {
+      ok: false,
+      provider,
+      latencyMs,
+      modelUsed: targetModel,
+      endpointUsed: base,
+      detail: `Endpoint ${base} respondeu HTTP ${r.status}. Verifica as credenciais do servidor ou o URL base.`,
+      fallbackReady: true,
+      envKeysStatus,
+    };
+  } catch {
+    return {
+      ok: false,
+      provider,
+      latencyMs: Math.max(1, Math.round(performance.now() - t0)),
+      modelUsed: targetModel,
+      endpointUsed: base,
+      detail: `Sem resposta de rede em ${base}. O Motor Determinístico Local garante continuidade automática.`,
+      fallbackReady: true,
+      envKeysStatus,
+    };
+  }
 }
+

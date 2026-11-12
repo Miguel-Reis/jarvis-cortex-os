@@ -14,9 +14,12 @@ import {
 } from '../shared/mcp-catalog.ts';
 import { CORTEX_PLUGINS_CATALOG } from '../shared/skills-plugins-catalog.ts';
 import type {
+  ChatThread,
+  GoalItem,
   JarvisStoreData,
   MemoryItem,
   PluginItem,
+  ProjectActivityLogEntry,
   ProjectWorkspace,
   SwarmLane,
   SwarmTask,
@@ -306,14 +309,97 @@ function buildInitialSeed(): JarvisStoreData {
 
   const seedProjects: ProjectWorkspace[] = [
     {
-      id: 'proj-jarvis-core',
-      name: 'J.A.R.V.I.S. Cortex OS v3',
-      slug: 'jarvis-cortex-os',
+      id: 'proj-website-studio',
+      name: 'Website & Plataforma SaaS',
+      slug: 'website-plataforma-saas',
       rootPath: '.',
-      techStack: 'TypeScript · React 19 · Express · MCP 2026',
+      techStack: 'React 19 · TypeScript · Tailwind · API',
       gitBranch: 'main',
       description:
-        'Workspace principal unificado com Swarm 48x, Roteador JEV-S1, Cérebro Bi-Temporal e Gateway MCP 2026.',
+        'Conceção e construção de um website moderno de produto com landing page editorial, autenticação e painel web.',
+      ideaCategory: 'WEBSITE',
+      ideaBrief:
+        'Criar um website moderno e rápido para lançar um produto digital, com fluxo de registo, área de cliente e pagamentos.',
+      activeSkillIds: ['skill-01', 'skill-02'],
+      defaultChatId: 'chat-web-main',
+      status: 'ACTIVE',
+      proactiveEnabled: true,
+      proactiveIntervalSec: 90,
+      healthScore: 97,
+      openTasksCount: 3,
+      symbolCount: 148,
+      assignedAgentIds: ['room-exec', 'room-eng', 'room-ui-web'],
+      lastProactiveAt: nowIso,
+      proactiveInsights: [
+        {
+          id: 'ins-seed-web-1',
+          projectId: 'proj-website-studio',
+          createdAt: nowIso,
+          category: 'NEXT_STEP',
+          severity: 'OPPORTUNITY',
+          title: 'Estrutura Hero & Fluxo de Conversão prontos para refinar com Sub-Agente UI',
+          detail: 'O Arquiteto UI & Frontend definiu 3 sub-tarefas verificáveis no Goal principal.',
+          suggestedActionLabel: 'Continuar no Chat',
+          suggestedCommandOrPrompt:
+            'Vamos definir as secções principais da landing page e o sistema de autenticação do Website.',
+          actionKind: 'OPEN_CHAT',
+          status: 'OPEN',
+        },
+      ],
+    },
+    {
+      id: 'proj-mobile-app',
+      name: 'App Mobile Cross-Platform',
+      slug: 'app-mobile-cross-platform',
+      rootPath: 'src',
+      techStack: 'React Native · Expo · SQLite Offline-First',
+      gitBranch: 'main',
+      description:
+        'Ideia de aplicação móvel iOS/Android com experiência fluida, modo offline e notificações inteligentes.',
+      ideaCategory: 'APP',
+      ideaBrief:
+        'Desenvolver uma app mobile intuitiva com sincronização instantânea, perfil do utilizador e notificações.',
+      activeSkillIds: ['skill-01', 'skill-04'],
+      defaultChatId: 'chat-app-main',
+      status: 'ACTIVE',
+      proactiveEnabled: true,
+      proactiveIntervalSec: 120,
+      healthScore: 95,
+      openTasksCount: 2,
+      symbolCount: 84,
+      assignedAgentIds: ['room-exec', 'room-mobile-arch'],
+      lastProactiveAt: nowIso,
+      proactiveInsights: [
+        {
+          id: 'ins-seed-app-1',
+          projectId: 'proj-mobile-app',
+          createdAt: nowIso,
+          category: 'NEXT_STEP',
+          severity: 'INFO',
+          title: 'Mapa de ecrãs MVP pronto para decomposição em contratos de API',
+          detail: 'O Jarvis pode gerar sub-agentes dedicados para navegação móvel e sincronização.',
+          suggestedActionLabel: 'Planear Ecrãs MVP',
+          suggestedCommandOrPrompt:
+            'Planeia os ecrãs principais da App Mobile e cria sub-tarefas para autenticação e base de dados.',
+          actionKind: 'OPEN_CHAT',
+          status: 'OPEN',
+        },
+      ],
+    },
+    {
+      id: 'proj-jarvis-core',
+      name: 'J.A.R.V.I.S. Cortex & Automação',
+      slug: 'jarvis-cortex-os',
+      rootPath: '.',
+      techStack: 'TypeScript · Python 3.11+ · Sidecar · MCP 2026',
+      gitBranch: 'main',
+      description:
+        'Ecossistema nuclear do Jarvis com Visão de Ecrã em Tempo Real, Sidecar local, Skills Antigravity e Gateway MCP.',
+      ideaCategory: 'AUTOMATION',
+      ideaBrief:
+        'Evoluir capacidades autónomas do Jarvis, agentes especialistas, servidores MCP e controlo direto da máquina Sidecar.',
+      activeSkillIds: ['skill-01', 'skill-02', 'skill-03', 'skill-04'],
+      defaultChatId: 'chat-core-main',
       status: 'ACTIVE',
       proactiveEnabled: true,
       proactiveIntervalSec: 90,
@@ -337,72 +423,142 @@ function buildInitialSeed(): JarvisStoreData {
           actionKind: 'VERIFY_CONTRACTS',
           status: 'OPEN',
         },
-        {
-          id: 'ins-seed-core-2',
-          projectId: 'proj-jarvis-core',
-          createdAt: nowIso,
-          category: 'NEXT_STEP',
-          severity: 'INFO',
-          title: '3 tarefas DOTS prontas para avanço paralelo nas lanes UI/TESTS/DOCS',
-          detail: 'O enxame assimétrico mantém convergência Ruflo EMA 0.962 sem conflitos de ficheiros.',
-          suggestedActionLabel: 'Coordenar com Agente',
-          suggestedCommandOrPrompt:
-            'Analisa as próximas tarefas DOTS do projeto J.A.R.V.I.S. Cortex OS v3 e recomenda o passo imediato.',
-          actionKind: 'OPEN_CHAT',
-          status: 'OPEN',
-        },
       ],
     },
+  ];
+
+  const seedChatThreads: ChatThread[] = [
     {
-      id: 'proj-python-kernel',
-      name: 'Kernel Python & Sidecar Nativo',
-      slug: 'jarvis-python-kernel',
-      rootPath: 'jarvis_os',
-      techStack: 'Python 3.11+ · SQLite WAL · Zero-Dep Sidecar',
-      gitBranch: 'main',
-      description:
-        'Núcleo determinístico local (<15ms arranque) com telemetria de kernel, DesktopSidecar e sintetizador Mark-VII.',
-      status: 'ACTIVE',
-      proactiveEnabled: true,
-      proactiveIntervalSec: 120,
-      healthScore: 98,
-      openTasksCount: 1,
-      symbolCount: 46,
-      assignedAgentIds: ['room-sidecar', 'room-devops'],
-      lastProactiveAt: nowIso,
-      proactiveInsights: [
-        {
-          id: 'ins-seed-py-1',
-          projectId: 'proj-python-kernel',
-          createdAt: nowIso,
-          category: 'HEALTH',
-          severity: 'INFO',
-          title: 'Suite Python Zero-Dependency (15 testes) pronta para verificação rápida',
-          detail: 'Monitorização proativa confirmou 0 dependências externas pesadas em jarvis_os/.',
-          suggestedActionLabel: 'Correr Unittest Python',
-          suggestedCommandOrPrompt: 'python3 -m unittest discover -s tests -v',
-          actionKind: 'EXEC_COMMAND',
-          status: 'OPEN',
-        },
-      ],
+      id: 'chat-web-main',
+      projectId: 'proj-website-studio',
+      title: 'Arquitetura & Planeamento do Website',
+      createdAt: nowIso,
+      updatedAt: nowIso,
+      primaryAgentId: 'room-exec',
+      participatingAgentIds: ['room-exec', 'room-ui-web', 'room-eng'],
+      screenAutoSendEnabled: true,
     },
     {
-      id: 'proj-mcp-gateway',
-      name: 'Malha MCP 2026 & Motores Server',
-      slug: 'orbit-mcp-server',
-      rootPath: 'src/server',
-      techStack: 'Node.js 22 · JSON-RPC 2.0 · CoW Sandboxes',
-      gitBranch: 'main',
-      description:
-        'Subsistema backend dedicado a sondas JSON-RPC 2.0, Authority Gate SSRF/stdio e orquestração de enxame.',
-      status: 'STANDBY',
-      proactiveEnabled: false,
-      proactiveIntervalSec: 180,
-      healthScore: 94,
-      openTasksCount: 2,
-      symbolCount: 64,
-      assignedAgentIds: ['room-eng', 'room-research'],
-      proactiveInsights: [],
+      id: 'chat-web-ui',
+      projectId: 'proj-website-studio',
+      title: 'Sistema Visual, Copy & Conversão',
+      createdAt: nowIso,
+      updatedAt: nowIso,
+      primaryAgentId: 'room-ui-web',
+      participatingAgentIds: ['room-ui-web', 'room-exec'],
+      screenAutoSendEnabled: true,
+    },
+    {
+      id: 'chat-app-main',
+      projectId: 'proj-mobile-app',
+      title: 'MVP Mobile, Fluxos & Offline Sync',
+      createdAt: nowIso,
+      updatedAt: nowIso,
+      primaryAgentId: 'room-exec',
+      participatingAgentIds: ['room-exec', 'room-mobile-arch'],
+      screenAutoSendEnabled: true,
+    },
+    {
+      id: 'chat-core-main',
+      projectId: 'proj-jarvis-core',
+      title: 'Orquestração de Agentes, MCPs & Sidecar',
+      createdAt: nowIso,
+      updatedAt: nowIso,
+      primaryAgentId: 'room-exec',
+      participatingAgentIds: ['room-exec', 'room-eng', 'room-sidecar'],
+      screenAutoSendEnabled: true,
+    },
+  ];
+
+  const seedActivityLogs: ProjectActivityLogEntry[] = [
+    {
+      id: 'actlog-web-01',
+      projectId: 'proj-website-studio',
+      chatId: 'chat-web-main',
+      timestamp: nowIso,
+      actor: 'JARVIS',
+      kind: 'THOUGHT',
+      status: 'SUCCESS',
+      summary: 'Contexto da ideia "Website & Plataforma SaaS" analisado e estruturado',
+      detail: 'Identificados 2 Goals iniciais (UX/Landing + Autenticação/API) e 2 Skills Antigravity ativas.',
+      durationMs: 14,
+    },
+    {
+      id: 'actlog-web-02',
+      projectId: 'proj-website-studio',
+      chatId: 'chat-web-main',
+      timestamp: nowIso,
+      actor: 'JARVIS',
+      kind: 'AGENT_SPAWNED',
+      status: 'SUCCESS',
+      summary: 'Sub-agente "Arquiteto UI & Frontend" (STUDIO-UI-01) criado para o projeto',
+      detail: 'Especializado em layout editorial, design responsivo e componentes interativos.',
+      durationMs: 8,
+      relatedAgentId: 'room-ui-web',
+    },
+    {
+      id: 'actlog-web-03',
+      projectId: 'proj-website-studio',
+      chatId: 'chat-web-main',
+      timestamp: nowIso,
+      actor: 'JARVIS',
+      kind: 'GOAL_CREATED',
+      status: 'SUCCESS',
+      summary: 'Goal definido: "Arquitetura Visual, Landing Page & Fluxo de Registo"',
+      detail: '3 sub-tarefas criadas com verificação progressiva atribuída a STUDIO-UI-01.',
+      durationMs: 6,
+      relatedGoalId: 'goal-web-01',
+    },
+    {
+      id: 'actlog-web-ui-01',
+      projectId: 'proj-website-studio',
+      chatId: 'chat-web-ui',
+      timestamp: nowIso,
+      actor: 'STUDIO-UI-01',
+      kind: 'SKILL_ACTIVATED',
+      status: 'SUCCESS',
+      summary: 'Skill "Auditor AST & Testes" vinculada à revisão de componentes UI',
+      detail: 'Pronta para inspecionar código e layout em tempo real quando partilhares o ecrã.',
+      durationMs: 5,
+      relatedSkillSlug: 'repo-test-auditor',
+    },
+    {
+      id: 'actlog-app-01',
+      projectId: 'proj-mobile-app',
+      chatId: 'chat-app-main',
+      timestamp: nowIso,
+      actor: 'JARVIS',
+      kind: 'AGENT_SPAWNED',
+      status: 'SUCCESS',
+      summary: 'Sub-agente "Engenheiro Mobile & Fluxos" (MOBILE-ARCH-02) alocado ao projeto',
+      detail: 'Responsável pela navegação nativa, sincronização offline-first e estado local.',
+      durationMs: 9,
+      relatedAgentId: 'room-mobile-arch',
+    },
+    {
+      id: 'actlog-app-02',
+      projectId: 'proj-mobile-app',
+      chatId: 'chat-app-main',
+      timestamp: nowIso,
+      actor: 'JARVIS',
+      kind: 'GOAL_CREATED',
+      status: 'SUCCESS',
+      summary: 'Goal definido: "Prototipar Ecrãs Nucleares & Sincronização Offline"',
+      detail: 'Roadmap inicial da App Mobile pronto para evoluir conforme conversamos.',
+      durationMs: 6,
+      relatedGoalId: 'goal-app-01',
+    },
+    {
+      id: 'actlog-core-01',
+      projectId: 'proj-jarvis-core',
+      chatId: 'chat-core-main',
+      timestamp: nowIso,
+      actor: 'MCP:gateway',
+      kind: 'MCP_TOOL',
+      status: 'SUCCESS',
+      summary: 'Gateway MCP 2026 & Ponte Sidecar prontos na sessão',
+      detail: '18 ferramentas nativas MCP + captura direta da máquina anfitriã disponíveis.',
+      durationMs: 4,
     },
   ];
 
@@ -415,7 +571,7 @@ function buildInitialSeed(): JarvisStoreData {
   return {
     settings: {
       operatorName: 'Comandante',
-      organizationName: 'Stark Obsidian Lab',
+      organizationName: 'Jarvis Studio',
       language: 'pt-PT',
       personalityMode: 'STARK_EXECUTIVE',
       autonomyLevel: 'BALANCED_PROACTIVE',
@@ -434,43 +590,95 @@ function buildInitialSeed(): JarvisStoreData {
         'npx --yes tsx --test src/shared/cortex-math.test.ts',
         'node -v',
       ],
-      onboardingCompleted: false,
+      onboardingCompleted: true,
       wakeWordEnabled: false,
       voiceDspEnabled: true,
+      preferredVoiceName: 'Charon',
+      liveVoiceScreenSync: true,
       focusModeEnabled: false,
       proactiveGlobalEnabled: true,
       proactiveCadenceSec: 90,
       sidecarDirectControlEnabled: true,
     },
     projects: seedProjects,
-    activeProjectId: 'proj-jarvis-core',
+    activeProjectId: 'proj-website-studio',
+    chatThreads: seedChatThreads,
+    activeChatId: 'chat-web-main',
+    projectActivityLogs: seedActivityLogs,
+    latestScreenSnapshot: null,
     goals: [
       {
-        id: 'goal-01',
-        title: 'Convergência Swarm 48x & Persistência Zero-Falhas (Windows/Linux)',
-        category: 'Enxame & Infraestrutura',
-        progress: 96,
-        targetMetric: '96/96 Verify Gates + CoW Sandboxes atómicas ativas',
+        id: 'goal-web-01',
+        projectId: 'proj-website-studio',
+        chatId: 'chat-web-main',
+        title: 'Arquitetura Visual, Landing Page & Fluxo de Registo',
+        category: 'Produto & UI',
+        progress: 33,
+        targetMetric: 'Protótipo responsivo validado com navegação principal e registo',
         deadline: '2026-11-30',
         status: 'ACTIVE',
+        assignedAgentId: 'room-ui-web',
+        createdBy: 'JARVIS_AUTO',
+        updatedAt: nowIso,
+        subtasks: [
+          { id: 'st-web-1', title: 'Definir proposta de valor, tipografia e paleta do Website', done: true },
+          { id: 'st-web-2', title: 'Construir secções Hero, Funcionalidades e Preços', done: false },
+          { id: 'st-web-3', title: 'Integrar registo de utilizadores e painel inicial', done: false },
+        ],
       },
       {
-        id: 'goal-02',
-        title: 'Eficiência Token Diet (-96% MCP Overhead) & JEV-S1 (<1ms)',
-        category: 'Cognição & Orbit OS',
-        progress: 91,
-        targetMetric: 'Poda dinâmica de 18 tools para 4-6 tools por intenção',
-        deadline: '2026-11-20',
+        id: 'goal-web-02',
+        projectId: 'proj-website-studio',
+        chatId: 'chat-web-main',
+        title: 'API Backend, Base de Dados & Checkout',
+        category: 'Backend & API',
+        progress: 0,
+        targetMetric: 'Endpoints autenticados e persistência testada ponta-a-ponta',
+        deadline: '2026-12-10',
         status: 'ACTIVE',
+        assignedAgentId: 'room-eng',
+        createdBy: 'JARVIS_AUTO',
+        updatedAt: nowIso,
+        subtasks: [
+          { id: 'st-web-4', title: 'Modelar esquema de utilizadores, projetos e subscrições', done: false },
+          { id: 'st-web-5', title: 'Configurar webhooks de pagamento e validação de segurança', done: false },
+        ],
       },
       {
-        id: 'goal-03',
-        title: 'Segurança Zero-Trust OpenClaw & Redação AI-Defence',
-        category: 'Cibersegurança',
-        progress: 88,
-        targetMetric: 'Owner Allow-List + 0 fugas de segredos em Self-Learn',
-        deadline: '2026-11-15',
+        id: 'goal-app-01',
+        projectId: 'proj-mobile-app',
+        chatId: 'chat-app-main',
+        title: 'Prototipar Ecrãs Nucleares & Sincronização Offline',
+        category: 'App Mobile',
+        progress: 50,
+        targetMetric: 'Fluxo de onboarding + cache SQLite local funcionais em iOS/Android',
+        deadline: '2026-12-05',
         status: 'ACTIVE',
+        assignedAgentId: 'room-mobile-arch',
+        createdBy: 'JARVIS_AUTO',
+        updatedAt: nowIso,
+        subtasks: [
+          { id: 'st-app-1', title: 'Mapear tab bar e ecrãs principais do MVP', done: true },
+          { id: 'st-app-2', title: 'Implementar fila de sincronização offline-first', done: false },
+        ],
+      },
+      {
+        id: 'goal-01',
+        projectId: 'proj-jarvis-core',
+        chatId: 'chat-core-main',
+        title: 'Convergência Agêntica, Visão em Tempo Real & MCP 2026',
+        category: 'Ecossistema Jarvis',
+        progress: 96,
+        targetMetric: 'Stream de ecrã em direto + Sidecar + 18 tools MCP operacionais',
+        deadline: '2026-11-30',
+        status: 'ACTIVE',
+        assignedAgentId: 'room-exec',
+        createdBy: 'JARVIS_AUTO',
+        updatedAt: nowIso,
+        subtasks: [
+          { id: 'st-core-1', title: 'Ativar partilha de ecrã WebRTC e captura Sidecar nativa', done: true },
+          { id: 'st-core-2', title: 'Isolar logs de execução à direita por conversa e projeto', done: true },
+        ],
       },
     ],
     contracts: [
@@ -680,28 +888,129 @@ function buildInitialSeed(): JarvisStoreData {
         accentColor: 'violet',
         allowedTools: [
           'sidecar_host_control',
+          'capture_and_inspect_sidecar_screen',
           'get_system_telemetry',
           'request_shell_approval',
           'get_git_status',
         ],
       },
+      {
+        id: 'room-ui-web',
+        callsign: 'STUDIO-UI-01',
+        name: 'Arquiteto UI & Frontend',
+        roleTitle: 'Especialista de Interface, UX & Componentes Web',
+        description: 'Sub-agente criado pelo Jarvis para estruturar páginas, design system e fluxos de utilizador.',
+        systemPrompt:
+          'Atua como Arquiteto UI & Frontend no J.A.R.V.I.S. Studio: ajuda a desenhar e construir websites modernos, limpos e eficazes em Português de Portugal (PT-PT).',
+        accentColor: 'amber',
+        allowedTools: [
+          'upsert_project_goal',
+          'activate_antigravity_skill',
+          'list_workspace_files',
+          'read_workspace_file',
+          'search_memories',
+        ],
+        projectId: 'proj-website-studio',
+        createdByJarvis: true,
+        isCustom: true,
+      },
+      {
+        id: 'room-mobile-arch',
+        callsign: 'MOBILE-ARCH-02',
+        name: 'Engenheiro Mobile & Fluxos',
+        roleTitle: 'Especialista em Apps Móveis & Sincronização Offline',
+        description: 'Sub-agente criado pelo Jarvis para desenhar arquitetura mobile, navegação e persistência local.',
+        systemPrompt:
+          'Atua como Engenheiro Mobile no J.A.R.V.I.S. Studio: estrutura ecrãs, estado offline-first, APIs e experiência móvel em Português de Portugal (PT-PT).',
+        accentColor: 'violet',
+        allowedTools: [
+          'upsert_project_goal',
+          'activate_antigravity_skill',
+          'search_memories',
+          'save_memory',
+        ],
+        projectId: 'proj-mobile-app',
+        createdByJarvis: true,
+        isCustom: true,
+      },
     ],
     messages: [
+      {
+        id: 'msg-welcome-web',
+        roomId: 'room-exec',
+        chatId: 'chat-web-main',
+        projectId: 'proj-website-studio',
+        agentName: 'Jarvis',
+        role: 'assistant',
+        content:
+          'Olá! Estamos no projeto **Website & Plataforma SaaS**. Já criei os primeiros **Goals** e recrutei o sub-agente **Arquiteto UI & Frontend** (`STUDIO-UI-01`) para nos ajudar.\n\nConta-me mais sobre a ideia do website que queres construir — ou partilha o teu ecrã em direto em baixo para eu ver o que estás a desenhar ou programar em tempo real.',
+        createdAt: nowIso,
+        engineUsed: 'JARVIS_STUDIO_ORCHESTRATOR',
+        studioEvents: [
+          {
+            type: 'GOAL',
+            id: 'goal-web-01',
+            title: 'Arquitetura Visual, Landing Page & Fluxo de Registo',
+            subtitle: '3 sub-tarefas definidas · 33%',
+          },
+          {
+            type: 'AGENT',
+            id: 'room-ui-web',
+            title: 'Arquiteto UI & Frontend (STUDIO-UI-01)',
+            subtitle: 'Sub-agente recrutado para Website & Plataforma SaaS',
+          },
+        ],
+      },
+      {
+        id: 'msg-welcome-web-ui',
+        roomId: 'room-ui-web',
+        chatId: 'chat-web-ui',
+        projectId: 'proj-website-studio',
+        agentName: 'Arquiteto UI & Frontend',
+        role: 'assistant',
+        content:
+          'Conversa dedicada a **Sistema Visual, Copy & Conversão**. Partilha referências, cola capturas ou ativa a **Visão de Ecrã em Tempo Real** para revermos cada detalhe visual juntos.',
+        createdAt: nowIso,
+        engineUsed: 'STUDIO-UI-01',
+      },
+      {
+        id: 'msg-welcome-app',
+        roomId: 'room-exec',
+        chatId: 'chat-app-main',
+        projectId: 'proj-mobile-app',
+        agentName: 'Jarvis',
+        role: 'assistant',
+        content:
+          'Bem-vindo ao projeto **App Mobile Cross-Platform**. Defini a meta inicial de prototipagem e sincronização offline, e criei o sub-agente **Engenheiro Mobile & Fluxos** (`MOBILE-ARCH-02`). Que funcionalidades queres incluir na primeira versão da app?',
+        createdAt: nowIso,
+        engineUsed: 'JARVIS_STUDIO_ORCHESTRATOR',
+        studioEvents: [
+          {
+            type: 'GOAL',
+            id: 'goal-app-01',
+            title: 'Prototipar Ecrãs Nucleares & Sincronização Offline',
+            subtitle: '2 sub-tarefas definidas · 50%',
+          },
+        ],
+      },
+      {
+        id: 'msg-welcome-core',
+        roomId: 'room-exec',
+        chatId: 'chat-core-main',
+        projectId: 'proj-jarvis-core',
+        agentName: 'Jarvis',
+        role: 'assistant',
+        content:
+          'Espaço **J.A.R.V.I.S. Cortex & Automação** ativo com **Skills Antigravity**, **Gateway MCP 2026** e **Ponte Direta Sidecar**. Todos os passos executados nesta conversa aparecem isolados no painel de **Logs** à direita.',
+        createdAt: nowIso,
+        engineUsed: 'JARVIS_STUDIO_ORCHESTRATOR',
+      },
       {
         id: 'msg-welcome-exec',
         roomId: 'room-exec',
         role: 'assistant',
         content:
-          'Bom dia, Comandante. O núcleo **J.A.R.V.I.S. Cortex OS v3.0** encontra-se operacional com os motores **Swarm 48x**, **Roteador JEV-S1 (`<1ms`)**, **Memória Bi-Temporal 4-Way RRF + Ebbinghaus**, **Escritório Espacial 3D** e **Orbit MCP 2026**. Envia qualquer diretiva ou dispara um enxame completo.',
-        createdAt: nowIso,
-        engineUsed: 'CORTEX_V3_BOOT',
-      },
-      {
-        id: 'msg-welcome-eng',
-        roomId: 'room-eng',
-        role: 'assistant',
-        content:
-          'Sala de **Engenharia & AST Scout** pronta. O `SCOUT-01` já indexou os símbolos `:Lstart-end` e o acoplamento Git Co-Change para avisar sobre raio de impacto em pré-voo.',
+          'Bom dia, Comandante. O núcleo **J.A.R.V.I.S. Studio** encontra-se operacional com Projetos de Ideias, Goals automáticos, Sub-Agentes, Visão de Ecrã em Tempo Real e MCP 2026.',
         createdAt: nowIso,
         engineUsed: 'CORTEX_V3_BOOT',
       },
@@ -1257,18 +1566,138 @@ function ensureV3Migration(state: JarvisStoreData, seed: JarvisStoreData): Jarvi
   }
 
   const existingRooms = state.rooms && state.rooms.length > 0 ? [...state.rooms] : [...seed.rooms];
-  if (!existingRooms.some((r) => r.id === 'room-sidecar')) {
-    const sidecarSeedRoom = seed.rooms.find((r) => r.id === 'room-sidecar');
-    if (sidecarSeedRoom) existingRooms.push(sidecarSeedRoom);
+  for (const requiredId of ['room-sidecar', 'room-ui-web', 'room-mobile-arch']) {
+    if (!existingRooms.some((r) => r.id === requiredId)) {
+      const seedRoom = seed.rooms.find((r) => r.id === requiredId);
+      if (seedRoom) existingRooms.push(seedRoom);
+    }
   }
+
+  let migratedProjects: ProjectWorkspace[] =
+    state.projects && state.projects.length > 0 ? [...state.projects] : [...(seed.projects || [])];
+
+  const isFirstStudioUpgrade = !Array.isArray(state.chatThreads) || state.chatThreads.length === 0;
+  if (isFirstStudioUpgrade && seed.projects) {
+    for (const ideaSeed of seed.projects.filter(
+      (p) => p.id === 'proj-website-studio' || p.id === 'proj-mobile-app'
+    ).reverse()) {
+      if (!migratedProjects.some((p) => p.id === ideaSeed.id)) {
+        migratedProjects.unshift(ideaSeed);
+      }
+    }
+  }
+
+  migratedProjects = migratedProjects.map((p) => ({
+    ...p,
+    ideaCategory:
+      p.ideaCategory ||
+      (p.name.toLowerCase().includes('web')
+        ? 'WEBSITE'
+        : p.name.toLowerCase().includes('app') || p.name.toLowerCase().includes('mobile')
+          ? 'APP'
+          : 'AUTOMATION'),
+    ideaBrief: p.ideaBrief || p.description,
+    activeSkillIds:
+      Array.isArray(p.activeSkillIds) && p.activeSkillIds.length > 0
+        ? p.activeSkillIds
+        : ['skill-01', 'skill-02'],
+  }));
+
+  let migratedChats: ChatThread[] =
+    state.chatThreads && state.chatThreads.length > 0
+      ? [...state.chatThreads]
+      : [...(seed.chatThreads || [])];
+
+  // Ensure every project has at least 1 chat thread
+  for (const proj of migratedProjects) {
+    let projChats = migratedChats.filter((c) => c.projectId === proj.id);
+    if (projChats.length === 0) {
+      const createdThread: ChatThread = {
+        id: proj.defaultChatId || `chat-${proj.id}-main`,
+        projectId: proj.id,
+        title: `Conversa Principal · ${proj.name}`,
+        createdAt: nowIso,
+        updatedAt: nowIso,
+        primaryAgentId: proj.assignedAgentIds?.[0] || 'room-exec',
+        participatingAgentIds: proj.assignedAgentIds?.length ? proj.assignedAgentIds : ['room-exec'],
+        screenAutoSendEnabled: true,
+      };
+      migratedChats.push(createdThread);
+      projChats = [createdThread];
+    }
+    if (!proj.defaultChatId) {
+      proj.defaultChatId = projChats[0].id;
+    }
+  }
+
+  const migratedMessages =
+    state.messages && state.messages.length > 0 ? [...state.messages] : [...seed.messages];
+  if (isFirstStudioUpgrade) {
+    for (const seedMsg of seed.messages) {
+      if (seedMsg.chatId && !migratedMessages.some((m) => m.id === seedMsg.id)) {
+        migratedMessages.push(seedMsg);
+      }
+    }
+  }
+
+  let migratedGoals: GoalItem[] = (state.goals && state.goals.length > 0 ? state.goals : seed.goals).map(
+    (g) => ({
+      ...g,
+      projectId: g.projectId || 'proj-jarvis-core',
+      subtasks:
+        Array.isArray(g.subtasks) && g.subtasks.length > 0
+          ? g.subtasks
+          : [
+              {
+                id: `st-${g.id}-1`,
+                title: g.targetMetric || 'Validar critério principal do objetivo',
+                done: g.progress >= 80,
+              },
+            ],
+    })
+  );
+
+  if (isFirstStudioUpgrade) {
+    for (const sg of seed.goals) {
+      if (
+        (sg.projectId === 'proj-website-studio' || sg.projectId === 'proj-mobile-app') &&
+        !migratedGoals.some((g) => g.id === sg.id)
+      ) {
+        migratedGoals = [sg, ...migratedGoals];
+      }
+    }
+  }
+
+  const resolvedActiveProjectId =
+    (isFirstStudioUpgrade
+      ? 'proj-website-studio'
+      : state.activeProjectId && migratedProjects.some((p) => p.id === state.activeProjectId)
+        ? state.activeProjectId
+        : migratedProjects[0]?.id) || 'proj-website-studio';
+
+  const activeProjChats = migratedChats.filter((c) => c.projectId === resolvedActiveProjectId);
+  const resolvedActiveChatId =
+    state.activeChatId && activeProjChats.some((c) => c.id === state.activeChatId)
+      ? state.activeChatId
+      : activeProjChats[0]?.id || migratedChats[0]?.id || 'chat-web-main';
+
+  const migratedActivityLogs: ProjectActivityLogEntry[] =
+    state.projectActivityLogs && state.projectActivityLogs.length > 0
+      ? state.projectActivityLogs
+      : seed.projectActivityLogs || [];
 
   return {
     ...seed,
     ...state,
     settings: { ...seed.settings, ...(state.settings ?? {}) },
-    projects:
-      state.projects && state.projects.length > 0 ? state.projects : seed.projects,
-    activeProjectId: state.activeProjectId || seed.activeProjectId || 'proj-jarvis-core',
+    projects: migratedProjects,
+    activeProjectId: resolvedActiveProjectId,
+    chatThreads: migratedChats,
+    activeChatId: resolvedActiveChatId,
+    projectActivityLogs: migratedActivityLogs,
+    latestScreenSnapshot: state.latestScreenSnapshot ?? null,
+    goals: migratedGoals,
+    messages: migratedMessages,
     rooms: existingRooms,
     plugins:
       state.plugins && state.plugins.length > 0 ? state.plugins : seed.plugins,
@@ -1466,6 +1895,48 @@ class JarvisDatabase {
       }
     });
   }
+
+  public appendActivityLog(
+    entry: Omit<ProjectActivityLogEntry, 'id' | 'timestamp'> & { id?: string; timestamp?: string }
+  ): ProjectActivityLogEntry {
+    const fullEntry: ProjectActivityLogEntry = {
+      id: entry.id || `actlog-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+      timestamp: entry.timestamp || new Date().toISOString(),
+      projectId: entry.projectId,
+      chatId: entry.chatId,
+      actor: entry.actor,
+      kind: entry.kind,
+      status: entry.status,
+      summary: entry.summary,
+      detail: entry.detail,
+      durationMs: entry.durationMs,
+      relatedGoalId: entry.relatedGoalId,
+      relatedAgentId: entry.relatedAgentId,
+      relatedSkillSlug: entry.relatedSkillSlug,
+    };
+
+    debugLog(
+      fullEntry.status === 'ERROR' ? 'WARN' : 'INFO',
+      'STUDIO-LOG',
+      `[${fullEntry.projectId}/${fullEntry.chatId}] ${fullEntry.actor} · ${fullEntry.kind}: ${fullEntry.summary}`,
+      {
+        durationMs: fullEntry.durationMs,
+        payload: fullEntry.detail || undefined,
+        maxPreviewLen: 200,
+      }
+    );
+
+    this.update((draft) => {
+      if (!draft.projectActivityLogs) draft.projectActivityLogs = [];
+      draft.projectActivityLogs.unshift(fullEntry);
+      if (draft.projectActivityLogs.length > 400) {
+        draft.projectActivityLogs.length = 400;
+      }
+    });
+
+    return fullEntry;
+  }
 }
 
 export const db = new JarvisDatabase();
+

@@ -16,11 +16,12 @@ export default defineConfig({
   esbuild: {
     jsx: 'automatic',
   },
-  base: './',
+  base: '/',
   server: {
     port: 3000,
     host: '0.0.0.0',
-    hmr: process.env.DISABLE_HMR !== 'true',
+    allowedHosts: true,
+    hmr: false,
   },
   build: {
     outDir: 'dist',

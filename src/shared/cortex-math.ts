@@ -3,6 +3,9 @@ import type {
   AutonomyLevel,
   ChannelConfig,
   CoChangeEdge,
+  GeminiVoiceName,
+  GoalItem,
+  GoalSubtask,
   GraphEdge,
   GraphNodeComputed,
   JarvisStoreData,
@@ -19,9 +22,13 @@ import type {
   MemoryRankedHit,
   MemoryTier,
   ProactiveInsight,
+  ProjectActivityLogEntry,
   ProjectWorkspace,
   Q18Candidate,
+  Room,
   ScoutSymbolEntry,
+  SkillItem,
+  VoicePersonaOption,
   WorkflowNode,
 } from './types.ts';
 
@@ -1053,6 +1060,17 @@ export function computeViewStepCompletion(section: string, store: JarvisStoreDat
   const clamp01 = (v: number) => Number(Math.min(1, Math.max(0, v)).toFixed(3));
 
   switch (section) {
+    case 'studio': {
+      const projId = store.activeProjectId || store.projects?.[0]?.id;
+      const projGoals = store.goals.filter((g) =>
+        g.projectId ? g.projectId === projId : projId === 'proj-jarvis-core'
+      );
+      if (projGoals.length === 0) return 0.5;
+      const avg =
+        projGoals.reduce((acc, g) => acc + Math.min(100, Math.max(0, g.progress)) / 100, 0) /
+        projGoals.length;
+      return clamp01(Math.max(0.15, avg));
+    }
     case 'brief': {
       const totalContracts = store.contracts.length;
       const verifiedContracts = store.contracts.filter((c) => c.status === 'VERIFIED').length;
@@ -1155,6 +1173,9 @@ export function computeViewStepCompletion(section: string, store: JarvisStoreDat
       const resolved = store.approvals.filter((a) => a.status !== 'PENDING').length;
       return clamp01(resolved / store.approvals.length);
     }
+    case 'llm': {
+      return 1;
+    }
     default:
       return 0.5;
   }
@@ -1166,6 +1187,8 @@ export function computeViewStepCompletion(section: string, store: JarvisStoreDat
  * and 'authority' when there are 0 pending approvals) are hidden unless currently active.
  */
 const CRITICAL_FOCUS_SECTIONS = new Set([
+  'studio',
+  'llm',
   'brief',
   'brain',
   'swarm',
@@ -1992,6 +2015,649 @@ export function formatDebugPayloadPreview(payload: unknown, maxLen = 280): strin
   const extra = rawStr.length - safeMax;
   return `${rawStr.slice(0, safeMax)}…(+${extra} chars)`;
 }
+
+// ============================================================================
+// 22. Conversational Studio Helpers (Isolated Logs, Goal Progress & Auto-Planning)
+// ============================================================================
+
+export function filterProjectActivityLogs(
+  logs: ProjectActivityLogEntry[],
+  projectIdOrOptions:
+    | string
+    | {
+        projectId?: string;
+        chatId?: string;
+        scope?: 'CHAT' | 'PROJECT';
+      },
+  chatIdArg?: string,
+  scopeArg: 'CHAT' | 'PROJECT' = 'CHAT'
+): ProjectActivityLogEntry[] {
+  if (!Array.isArray(logs) || logs.length === 0) return [];
+
+  const resolvedProjectId =
+    typeof projectIdOrOptions === 'string'
+      ? projectIdOrOptions
+      : projectIdOrOptions?.projectId || '';
+  const resolvedChatId =
+    typeof projectIdOrOptions === 'string'
+      ? chatIdArg
+      : projectIdOrOptions?.chatId;
+  const resolvedScope: 'CHAT' | 'PROJECT' =
+    typeof projectIdOrOptions === 'string'
+      ? scopeArg
+      : projectIdOrOptions?.scope || 'CHAT';
+
+  return logs.filter((entry) => {
+    if (resolvedProjectId && entry.projectId !== resolvedProjectId) return false;
+    if (resolvedScope === 'CHAT' && resolvedChatId) {
+      return entry.chatId === resolvedChatId;
+    }
+    return true;
+  });
+}
+
+export function computeGoalProgressFromSubtasks(
+  subtasks: GoalSubtask[] | undefined,
+  fallbackProgress = 15
+): { progress: number; status: GoalItem['status'] } {
+  if (!Array.isArray(subtasks) || subtasks.length === 0) {
+    const clamped = Math.max(0, Math.min(100, Math.round(fallbackProgress)));
+    return {
+      progress: clamped,
+      status: clamped >= 100 ? 'COMPLETED' : 'ACTIVE',
+    };
+  }
+  const doneCount = subtasks.filter((s) => s.done).length;
+  const progress = Math.round((doneCount / subtasks.length) * 100);
+  return {
+    progress,
+    status: progress >= 100 ? 'COMPLETED' : 'ACTIVE',
+  };
+}
+
+export interface DeterministicStudioPlanDraft {
+  isPlanningIntent: boolean;
+  goalsToCreate: {
+    title: string;
+    category: string;
+    targetMetric: string;
+    subtasks: string[];
+  }[];
+  subagentsToSpawn: {
+    name: string;
+    callsign: string;
+    roleTitle: string;
+    description: string;
+    accentColor: Room['accentColor'];
+    allowedTools: string[];
+  }[];
+  skillsToActivate: string[]; // skill slugs
+}
+
+export function extractDeterministicPlanFromPrompt(params: {
+  prompt: string;
+  project?: ProjectWorkspace;
+  existingGoals?: GoalItem[];
+  existingRooms?: Room[];
+  skills?: SkillItem[];
+}): DeterministicStudioPlanDraft {
+  const {
+    prompt,
+    project,
+    existingGoals = [],
+    existingRooms = [],
+    skills = [],
+  } = params;
+  const lower = prompt.toLowerCase().trim();
+
+  const planningKeywords = [
+    'quero fazer',
+    'quero criar',
+    'vamos fazer',
+    'vamos criar',
+    'vamos planear',
+    'planear',
+    'planeia',
+    'estruturar',
+    'ideia',
+    'website',
+    'site',
+    'landing',
+    'saas',
+    'app',
+    'aplicação',
+    'aplicacao',
+    'mobile',
+    'sistema',
+    'plataforma',
+    'goal',
+    'meta',
+    'objetivo',
+    'roadmap',
+    'arquitetura',
+    'construir',
+    'build',
+    'create',
+    'plan',
+    'design',
+    'agente',
+    'sub-agente',
+    'subagente',
+  ];
+
+  const isPlanningIntent =
+    lower.length >= 16 && planningKeywords.some((kw) => lower.includes(kw));
+
+  if (!isPlanningIntent) {
+    return {
+      isPlanningIntent: false,
+      goalsToCreate: [],
+      subagentsToSpawn: [],
+      skillsToActivate: [],
+    };
+  }
+
+  const projectGoals = existingGoals.filter(
+    (g) => !project || !g.projectId || g.projectId === project.id
+  );
+  const existingTitlesLower = new Set(projectGoals.map((g) => g.title.toLowerCase()));
+  const existingAgentRolesLower = new Set(
+    existingRooms
+      .filter((r) => !r.projectId || (project && r.projectId === project.id))
+      .map((r) => `${r.name} ${r.roleTitle}`.toLowerCase())
+  );
+
+  const goalsToCreate: DeterministicStudioPlanDraft['goalsToCreate'] = [];
+  const subagentsToSpawn: DeterministicStudioPlanDraft['subagentsToSpawn'] = [];
+  const skillsToActivate: string[] = [];
+
+  const isWeb =
+    lower.includes('website') ||
+    lower.includes('site') ||
+    lower.includes('landing') ||
+    lower.includes('web') ||
+    lower.includes('saas') ||
+    lower.includes('frontend') ||
+    project?.ideaCategory === 'WEBSITE';
+
+  const isMobile =
+    lower.includes('app') ||
+    lower.includes('mobile') ||
+    lower.includes('ios') ||
+    lower.includes('android') ||
+    lower.includes('aplicação') ||
+    lower.includes('aplicacao') ||
+    project?.ideaCategory === 'APP';
+
+  const isBackendOrDb =
+    lower.includes('api') ||
+    lower.includes('backend') ||
+    lower.includes('base de dados') ||
+    lower.includes('database') ||
+    lower.includes('auth') ||
+    lower.includes('login') ||
+    lower.includes('pagamentos') ||
+    lower.includes('stripe');
+
+  if (isWeb) {
+    const title = 'Definir Arquitetura Visual, UX & Páginas Principais';
+    if (!existingTitlesLower.has(title.toLowerCase())) {
+      goalsToCreate.push({
+        title,
+        category: 'Produto & UI',
+        targetMetric: 'Estrutura de navegação, design system e protótipo navegável validados',
+        subtasks: [
+          'Mapear fluxo principal do utilizador e proposta de valor',
+          'Estruturar sistema visual tipográfico e componentes chave',
+          'Construir e validar secções principais em desktop e mobile',
+        ],
+      });
+    }
+    if (!Array.from(existingAgentRolesLower).some((s) => s.includes('frontend') || s.includes('ui'))) {
+      subagentsToSpawn.push({
+        name: 'Arquiteto UI & Frontend',
+        callsign: 'STUDIO-UI-01',
+        roleTitle: 'Especialista de Interface, UX & Componentes Web',
+        description: 'Desenha fluxos de utilizador limpos, sistemas de design responsivos e código React/CSS.',
+        accentColor: 'amber',
+        allowedTools: ['upsert_project_goal', 'list_workspace_files', 'read_workspace_file', 'search_memories'],
+      });
+    }
+  }
+
+  if (isMobile) {
+    const title = 'Estruturar Fluxos Mobile, Ecrãs Nucleares & Estado Offline';
+    if (!existingTitlesLower.has(title.toLowerCase())) {
+      goalsToCreate.push({
+        title,
+        category: 'App Mobile',
+        targetMetric: 'Navegação móvel fluida, autenticação e sincronização testadas',
+        subtasks: [
+          'Definir ecrãs do MVP e transições principais',
+          'Modelar armazenamento local e sincronização de sessão',
+          'Validar ergonomia tátil e notificações chave',
+        ],
+      });
+    }
+    if (!Array.from(existingAgentRolesLower).some((s) => s.includes('mobile'))) {
+      subagentsToSpawn.push({
+        name: 'Engenheiro Mobile & Fluxos',
+        callsign: 'MOBILE-ARCH-02',
+        roleTitle: 'Especialista em Aplicações Móveis & Estado Offline-First',
+        description: 'Planeia arquitetura móvel, navegação nativa, cache local e experiência cross-platform.',
+        accentColor: 'violet',
+        allowedTools: ['upsert_project_goal', 'search_memories', 'save_memory'],
+      });
+    }
+  }
+
+  if (isBackendOrDb || goalsToCreate.length === 0) {
+    const cleanIdeaSnippet = prompt
+      .replace(/^(olá|ola|jarvis|quero|vamos|preciso de)\s+/i, '')
+      .trim()
+      .slice(0, 56);
+    const title = isBackendOrDb
+      ? 'Modelar Dados, Autenticação & Contratos de API'
+      : `Estruturar Plano de Execução: ${cleanIdeaSnippet}${prompt.length > 56 ? '…' : ''}`;
+
+    if (!existingTitlesLower.has(title.toLowerCase())) {
+      goalsToCreate.push({
+        title,
+        category: isBackendOrDb ? 'Backend & Dados' : 'Planeamento',
+        targetMetric: 'Requisitos técnicos decompostos e validados com critérios claros',
+        subtasks: [
+          'Levantar entidades principais, regras de negócio e integrações',
+          'Definir contratos de API, segurança e validação de dados',
+          'Verificar entrega inicial com testes automatizados',
+        ],
+      });
+    }
+
+    if (
+      !Array.from(existingAgentRolesLower).some(
+        (s) => s.includes('backend') || s.includes('api') || s.includes('estrategista')
+      )
+    ) {
+      subagentsToSpawn.push({
+        name: isBackendOrDb ? 'Arquiteto Backend & Dados' : 'Estrategista de Produto',
+        callsign: isBackendOrDb ? 'API-CORE-03' : 'PRODUCT-LEAD-01',
+        roleTitle: isBackendOrDb
+          ? 'Especialista de APIs, Esquemas & Segurança'
+          : 'Coordenador de Escopo, Prioridades & Entregáveis',
+        description: isBackendOrDb
+          ? 'Estrutura endpoints, modelos de dados, autenticação e testes de contrato.'
+          : 'Decompõe ideias complexas em etapas claras, metas mensuráveis e prioridades.',
+        accentColor: 'cyan',
+        allowedTools: ['upsert_project_goal', 'search_memories', 'save_memory', 'lookup_ast_symbol'],
+      });
+    }
+  }
+
+  for (const sk of skills) {
+    const skText = `${sk.name} ${sk.slug} ${sk.description}`.toLowerCase();
+    if (
+      (lower.includes('test') || lower.includes('código') || lower.includes('codigo') || isWeb || isBackendOrDb) &&
+      skText.includes('ast')
+    ) {
+      skillsToActivate.push(sk.slug);
+    } else if ((lower.includes('ecrã') || lower.includes('ecra') || lower.includes('sidecar')) && skText.includes('sidecar')) {
+      skillsToActivate.push(sk.slug);
+    } else if (skText.includes('rrf') || skText.includes('curator')) {
+      skillsToActivate.push(sk.slug);
+    }
+  }
+
+  return {
+    isPlanningIntent: true,
+    goalsToCreate: goalsToCreate.slice(0, 2),
+    subagentsToSpawn: subagentsToSpawn.slice(0, 1),
+    skillsToActivate: Array.from(new Set(skillsToActivate)).slice(0, 2),
+  };
+}
+
+// ============================================================================
+// Unified LLM Provider Configuration, Validation & Cost/Benefit Engine
+// ============================================================================
+
+const DEPRECATED_GEMINI_MODELS = new Set([
+  'gemini-1.5-flash',
+  'gemini-1.5-pro',
+  'gemini-pro',
+  'gemini-2.0-flash',
+  'gemini-2.0-pro',
+  'gemini-2.0-flash-thinking',
+  'gemini-2.5-flash',
+]);
+
+/**
+ * Ensures the configured Gemini model is a supported @google/genai model,
+ * migrating legacy/deprecated identifiers cleanly to 'gemini-3.8-flash'.
+ */
+export function normalizeGeminiModelId(rawModel?: string): string {
+  const clean = (rawModel || '').trim();
+  if (!clean) return 'gemini-3.8-flash';
+  const lower = clean.toLowerCase();
+  if (DEPRECATED_GEMINI_MODELS.has(lower) || lower.startsWith('gemini-1.5-') || lower.startsWith('gemini-2.0-')) {
+    return 'gemini-3.8-flash';
+  }
+  return clean;
+}
+
+/**
+ * Detects whether an OpenAI-compatible base URL points to a local inference server
+ * (e.g., LM Studio :1234, vLLM :8000, LiteLLM, Jan :1337) that can operate without
+ * requiring a remote cloud API key.
+ */
+export function isLocalOpenAiCompatibleEndpoint(endpointUrl?: string): boolean {
+  const raw = (endpointUrl || '').trim();
+  if (!raw) return false;
+  try {
+    const parsed = new URL(raw);
+    const host = parsed.hostname.toLowerCase();
+    return (
+      host === 'localhost' ||
+      host === '127.0.0.1' ||
+      host === '0.0.0.0' ||
+      host === '[::1]' ||
+      host === '::1' ||
+      host.endsWith('.local')
+    );
+  } catch {
+    return /^https?:\/\/(localhost|127\.0\.0\.1|0\.0\.0\.0)(:|\/|$)/i.test(raw);
+  }
+}
+
+export interface MonthlyLlmCostEstimate {
+  promptsPerMonth: number;
+  monthlyInputTokensRaw: number;
+  monthlyInputTokensEffective: number;
+  monthlyOutputTokens: number;
+  monthlyTokensSavedByDiet: number;
+  withinGeminiFreeTierQuota: boolean;
+  geminiFreeTierEur: number;
+  geminiFlashLitePaidEur: number;
+  geminiFlashPaidEur: number;
+  openRouterCloudEur: number;
+  antigravityMcpIncrementalEur: number;
+  localModesEur: number;
+}
+
+/**
+ * Pure, deterministic monthly cost & token savings calculator comparing Cloud APIs
+ * (with and without Jarvis 5-Stage Token Diet) against Free Tier, Antigravity MCP, and Local modes.
+ */
+export function estimateMonthlyLlmCostEur(params: {
+  promptsPerDay: number;
+  avgContextTokens?: number;
+  avgOutputTokens?: number;
+  tokenDietEnabled?: boolean;
+}): MonthlyLlmCostEstimate {
+  const promptsPerDay = Math.max(1, Math.min(5000, Math.round(params.promptsPerDay || 40)));
+  const avgContextTokens = Math.max(200, params.avgContextTokens ?? 3400);
+  const avgOutputTokens = Math.max(80, params.avgOutputTokens ?? 520);
+  const dietEnabled = params.tokenDietEnabled !== false;
+
+  const promptsPerMonth = promptsPerDay * 30;
+  const monthlyInputTokensRaw = promptsPerMonth * avgContextTokens;
+  // 5-Stage Token Diet compresses MCP schemas + memory context by ~84% on average
+  const dietRatio = dietEnabled ? 0.18 : 1.0;
+  const monthlyInputTokensEffective = Math.round(monthlyInputTokensRaw * dietRatio);
+  const monthlyOutputTokens = promptsPerMonth * avgOutputTokens;
+  const monthlyTokensSavedByDiet = Math.max(0, monthlyInputTokensRaw - monthlyInputTokensEffective);
+
+  const inMillions = monthlyInputTokensEffective / 1_000_000;
+  const outMillions = monthlyOutputTokens / 1_000_000;
+
+  // Approximate EUR per 1M tokens rates for transparent comparison:
+  // gemini-3.1-flash-lite (~0.09€ in / 0.36€ out), gemini-3.8-flash (~0.28€ in / 1.85€ out), OpenRouter frontier (~2.75€ in / 13.80€ out)
+  const geminiFlashLitePaidEur = Number((inMillions * 0.09 + outMillions * 0.36).toFixed(2));
+  const geminiFlashPaidEur = Number((inMillions * 0.28 + outMillions * 1.85).toFixed(2));
+  const openRouterCloudEur = Number((inMillions * 2.75 + outMillions * 13.8).toFixed(2));
+
+  const withinGeminiFreeTierQuota = promptsPerDay <= 250;
+
+  return {
+    promptsPerMonth,
+    monthlyInputTokensRaw,
+    monthlyInputTokensEffective,
+    monthlyOutputTokens,
+    monthlyTokensSavedByDiet,
+    withinGeminiFreeTierQuota,
+    geminiFreeTierEur: 0,
+    geminiFlashLitePaidEur,
+    geminiFlashPaidEur,
+    openRouterCloudEur,
+    antigravityMcpIncrementalEur: 0,
+    localModesEur: 0,
+  };
+}
+
+/**
+ * Official Prebuilt Voice Personas supported by Gemini Live API (gemini-3.8-live)
+ * and Gemini TTS (gemini-3.8-flash-lite-tts).
+ */
+export const GEMINI_VOICE_CATALOG: VoicePersonaOption[] = [
+  {
+    id: 'Charon',
+    label: 'Charon',
+    badgePt: 'Clássica J.A.R.V.I.S.',
+    timbrePt: 'Profunda, serena e executiva — ideal para co-pilotagem estratégica.',
+    timbreEn: 'Deep, calm, and executive — ideal for strategic co-piloting.',
+  },
+  {
+    id: 'Zephyr',
+    label: 'Zephyr',
+    badgePt: 'Equilibrada & Fluida',
+    timbrePt: 'Natural, luminosa e versátil para sessões longas de brainstorming.',
+    timbreEn: 'Natural, balanced, and versatile for long brainstorming sessions.',
+  },
+  {
+    id: 'Kore',
+    label: 'Kore',
+    badgePt: 'Clara & Analítica',
+    timbrePt: 'Articulada, nítida e precisa — excelente para revisão técnica e código.',
+    timbreEn: 'Crisp, articulate, and precise — great for code and technical review.',
+  },
+  {
+    id: 'Fenrir',
+    label: 'Fenrir',
+    badgePt: 'Firme & Tática',
+    timbrePt: 'Grave, direta e assertiva — ideal para operações rápidas e foco.',
+    timbreEn: 'Resonant, direct, and tactical — built for focused operations.',
+  },
+  {
+    id: 'Puck',
+    label: 'Puck',
+    badgePt: 'Dinâmica & Criativa',
+    timbrePt: 'Expressiva, ágil e conversacional para explorar ideias de produto.',
+    timbreEn: 'Expressive, upbeat, and conversational for product ideation.',
+  },
+];
+
+export function normalizeGeminiVoiceName(raw?: string | null): GeminiVoiceName {
+  const clean = (raw || '').trim().toLowerCase();
+  const match = GEMINI_VOICE_CATALOG.find((v) => v.id.toLowerCase() === clean);
+  return match ? match.id : 'Charon';
+}
+
+/**
+ * Anti-aliased box-averaging downsampler (e.g. 48000 Hz or 44100 Hz -> 16000 Hz)
+ * for Gemini Live API 16kHz PCM microphone input.
+ */
+export function downsampleFloat32Buffer(
+  input: Float32Array,
+  inputSampleRate: number,
+  targetSampleRate = 16000
+): Float32Array {
+  if (!input.length || inputSampleRate <= 0 || targetSampleRate <= 0) {
+    return new Float32Array(0);
+  }
+  if (inputSampleRate === targetSampleRate) {
+    return input;
+  }
+  if (targetSampleRate > inputSampleRate) {
+    // Linear upsample fallback if hardware runs below 16kHz
+    const outLength = Math.max(1, Math.round((input.length * targetSampleRate) / inputSampleRate));
+    const out = new Float32Array(outLength);
+    const ratio = (input.length - 1) / Math.max(1, outLength - 1);
+    for (let i = 0; i < outLength; i++) {
+      const pos = i * ratio;
+      const idx0 = Math.floor(pos);
+      const idx1 = Math.min(input.length - 1, idx0 + 1);
+      const frac = pos - idx0;
+      out[i] = input[idx0] * (1 - frac) + input[idx1] * frac;
+    }
+    return out;
+  }
+
+  const ratio = inputSampleRate / targetSampleRate;
+  const newLength = Math.max(1, Math.round(input.length / ratio));
+  const result = new Float32Array(newLength);
+  let offsetResult = 0;
+  let offsetBuffer = 0;
+
+  while (offsetResult < result.length) {
+    const nextOffsetBuffer = Math.min(input.length, Math.round((offsetResult + 1) * ratio));
+    let accum = 0;
+    let count = 0;
+    for (let i = offsetBuffer; i < nextOffsetBuffer; i++) {
+      accum += input[i];
+      count++;
+    }
+    result[offsetResult] = count > 0 ? accum / count : input[Math.min(input.length - 1, offsetBuffer)];
+    offsetResult++;
+    offsetBuffer = nextOffsetBuffer;
+  }
+
+  return result;
+}
+
+function uint8ToBase64CrossEnv(bytes: Uint8Array): string {
+  if (typeof Buffer !== 'undefined') {
+    return Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength).toString('base64');
+  }
+  let binary = '';
+  const chunkSize = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    const slice = bytes.subarray(i, i + chunkSize);
+    binary += String.fromCharCode(...slice);
+  }
+  return btoa(binary);
+}
+
+function base64ToUint8CrossEnv(base64: string): Uint8Array {
+  const clean = (base64 || '').trim();
+  if (!clean) return new Uint8Array(0);
+  if (typeof Buffer !== 'undefined') {
+    const buf = Buffer.from(clean, 'base64');
+    return new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
+  }
+  const bin = atob(clean);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) {
+    out[i] = bin.charCodeAt(i);
+  }
+  return out;
+}
+
+/**
+ * Encodes normalized Float32 [-1, 1] audio samples to Base64 16-bit Little-Endian PCM
+ * (`audio/pcm;rate=16000` for Gemini Live API).
+ */
+export function encodeFloat32ToPcm16Base64(samples: Float32Array): string {
+  if (!samples.length) return '';
+  const buffer = new ArrayBuffer(samples.length * 2);
+  const view = new DataView(buffer);
+  for (let i = 0; i < samples.length; i++) {
+    const clamped = Math.max(-1, Math.min(1, samples[i]));
+    const int16 = clamped < 0 ? Math.round(clamped * 0x8000) : Math.round(clamped * 0x7fff);
+    view.setInt16(i * 2, int16, true); // little-endian
+  }
+  return uint8ToBase64CrossEnv(new Uint8Array(buffer));
+}
+
+/**
+ * Decodes Base64 16-bit Little-Endian raw PCM (`24000` Hz from Gemini Live API)
+ * directly into normalized Float32 [-1, 1] samples for WebAudio playback.
+ */
+export function decodePcm16Base64ToFloat32(base64: string): Float32Array {
+  const bytes = base64ToUint8CrossEnv(base64);
+  const sampleCount = Math.floor(bytes.byteLength / 2);
+  if (sampleCount <= 0) return new Float32Array(0);
+  const view = new DataView(bytes.buffer, bytes.byteOffset, sampleCount * 2);
+  const out = new Float32Array(sampleCount);
+  for (let i = 0; i < sampleCount; i++) {
+    const int16 = view.getInt16(i * 2, true);
+    out[i] = int16 < 0 ? int16 / 0x8000 : int16 / 0x7fff;
+  }
+  return out;
+}
+
+/**
+ * Extracts Float32 samples and sampleRate from either a unary RIFF WAV (`audio/wav`
+ * returned by `gemini-3.8-flash-lite-tts`) or headerless raw 16-bit LE PCM (`24000` Hz).
+ */
+export function extractPcm16FromWavOrRawBase64(
+  base64: string,
+  defaultSampleRate = 24000
+): { samples: Float32Array; sampleRate: number; wasWav: boolean } {
+  const bytes = base64ToUint8CrossEnv(base64);
+  if (bytes.byteLength < 2) {
+    return { samples: new Float32Array(0), sampleRate: defaultSampleRate, wasWav: false };
+  }
+
+  // Check for "RIFF" .... "WAVE" header
+  const isRiffWave =
+    bytes.byteLength > 44 &&
+    bytes[0] === 0x52 && // R
+    bytes[1] === 0x49 && // I
+    bytes[2] === 0x46 && // F
+    bytes[3] === 0x46 && // F
+    bytes[8] === 0x57 && // W
+    bytes[9] === 0x41 && // A
+    bytes[10] === 0x56 && // V
+    bytes[11] === 0x45; // E
+
+  if (isRiffWave) {
+    const headerView = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    const wavSampleRate = headerView.getUint32(24, true) || defaultSampleRate;
+    // Locate "data" subchunk dynamically (usually at byte 36 -> payload at 44)
+    let dataOffset = 44;
+    let dataByteLen = bytes.byteLength - 44;
+    let cursor = 12;
+    while (cursor + 8 <= bytes.byteLength) {
+      const c0 = bytes[cursor];
+      const c1 = bytes[cursor + 1];
+      const c2 = bytes[cursor + 2];
+      const c3 = bytes[cursor + 3];
+      const chunkSize = headerView.getUint32(cursor + 4, true);
+      if (c0 === 0x64 && c1 === 0x61 && c2 === 0x74 && c3 === 0x61) {
+        dataOffset = cursor + 8;
+        dataByteLen = Math.min(chunkSize, bytes.byteLength - dataOffset);
+        break;
+      }
+      cursor += 8 + chunkSize + (chunkSize % 2);
+    }
+
+    const sampleCount = Math.floor(Math.max(0, dataByteLen) / 2);
+    const pcmView = new DataView(bytes.buffer, bytes.byteOffset + dataOffset, sampleCount * 2);
+    const samples = new Float32Array(sampleCount);
+    for (let i = 0; i < sampleCount; i++) {
+      const int16 = pcmView.getInt16(i * 2, true);
+      samples[i] = int16 < 0 ? int16 / 0x8000 : int16 / 0x7fff;
+    }
+    return { samples, sampleRate: wavSampleRate, wasWav: true };
+  }
+
+  return {
+    samples: decodePcm16Base64ToFloat32(base64),
+    sampleRate: defaultSampleRate,
+    wasWav: false,
+  };
+}
+
+
+
 
 
 

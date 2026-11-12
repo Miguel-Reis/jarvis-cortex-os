@@ -14,7 +14,31 @@ export type ModelProviderType =
   | 'OPENROUTER_COMPAT'
   | 'LOCAL_DETERMINISTIC';
 
+export type GeminiVoiceName = 'Charon' | 'Zephyr' | 'Kore' | 'Puck' | 'Fenrir';
+
+export interface VoicePersonaOption {
+  id: GeminiVoiceName;
+  label: string;
+  badgePt: string;
+  timbrePt: string;
+  timbreEn: string;
+}
+
 export type VerificationRuleType = 'TEST_PASS' | 'FILE_EXISTS' | 'HTTP_CHECK' | 'EXEC_SIGN';
+
+export type ProjectIdeaCategory =
+  | 'WEBSITE'
+  | 'APP'
+  | 'AUTOMATION'
+  | 'RESEARCH'
+  | 'SYSTEM'
+  | 'CUSTOM';
+
+export interface GoalSubtask {
+  id: string;
+  title: string;
+  done: boolean;
+}
 
 export interface GoalItem {
   id: string;
@@ -24,6 +48,72 @@ export interface GoalItem {
   targetMetric: string;
   deadline: string;
   status: 'ACTIVE' | 'COMPLETED' | 'AT_RISK';
+  projectId?: string;
+  chatId?: string;
+  assignedAgentId?: string;
+  subtasks?: GoalSubtask[];
+  createdBy?: 'JARVIS_AUTO' | 'OPERATOR';
+  updatedAt?: string;
+}
+
+export interface ChatThread {
+  id: string;
+  projectId: string;
+  title: string;
+  createdAt: string;
+  updatedAt: string;
+  primaryAgentId?: string;
+  participatingAgentIds?: string[];
+  screenAutoSendEnabled?: boolean;
+}
+
+export type ProjectActivityLogKind =
+  | 'THOUGHT'
+  | 'GOAL_CREATED'
+  | 'GOAL_UPDATED'
+  | 'AGENT_SPAWNED'
+  | 'AGENT_DELEGATED'
+  | 'SKILL_ACTIVATED'
+  | 'MCP_TOOL'
+  | 'SCREEN_VISION'
+  | 'VOICE_LIVE'
+  | 'AUDIO_TRANSCRIBE'
+  | 'SYSTEM_STEP';
+
+export interface ProjectActivityLogEntry {
+  id: string;
+  projectId: string;
+  chatId: string;
+  timestamp: string;
+  actor: string;
+  kind: ProjectActivityLogKind;
+  status: 'RUNNING' | 'SUCCESS' | 'WARNING' | 'ERROR';
+  summary: string;
+  detail?: string;
+  durationMs?: number;
+  relatedGoalId?: string;
+  relatedAgentId?: string;
+  relatedSkillSlug?: string;
+}
+
+export interface ScreenCaptureSnapshot {
+  id: string;
+  source: 'BROWSER_STREAM' | 'SIDECAR_NATIVE';
+  capturedAt: string;
+  width: number;
+  height: number;
+  mimeType: string;
+  dataBase64: string;
+  activeWindowTitle?: string;
+  hostname?: string;
+  visionSummary?: string;
+}
+
+export interface StudioInlineEvent {
+  type: 'GOAL' | 'AGENT' | 'SKILL' | 'MCP' | 'SCREEN' | 'VOICE';
+  id: string;
+  title: string;
+  subtitle?: string;
 }
 
 export interface TodayContractItem {
@@ -93,6 +183,7 @@ export interface Room {
   accentColor: 'cyan' | 'amber' | 'emerald' | 'rose' | 'violet';
   allowedTools: string[];
   projectId?: string;
+  createdByJarvis?: boolean;
   modelOverride?: string;
   isCustom?: boolean;
 }
@@ -156,10 +247,15 @@ export interface JevRouteDecision {
 export interface ChatMessage {
   id: string;
   roomId: string;
+  chatId?: string;
+  projectId?: string;
+  agentName?: string;
   role: 'user' | 'assistant' | 'system';
   content: string;
   createdAt: string;
   engineUsed?: string;
+  screenIncluded?: boolean;
+  studioEvents?: StudioInlineEvent[];
   attachments?: AttachmentItem[];
   toolCalls?: ToolCallRecord[];
   jevRoute?: JevRouteDecision;
@@ -377,6 +473,10 @@ export interface ProjectWorkspace {
   techStack: string;
   gitBranch: string;
   description: string;
+  ideaCategory?: ProjectIdeaCategory;
+  ideaBrief?: string;
+  activeSkillIds?: string[];
+  defaultChatId?: string;
   status: 'ACTIVE' | 'STANDBY' | 'AUDITING';
   proactiveEnabled: boolean;
   proactiveIntervalSec: number;
@@ -764,6 +864,8 @@ export interface AppSettings {
   onboardingCompleted: boolean;
   wakeWordEnabled: boolean;
   voiceDspEnabled: boolean;
+  preferredVoiceName?: GeminiVoiceName;
+  liveVoiceScreenSync?: boolean;
   focusModeEnabled: boolean;
   proactiveGlobalEnabled?: boolean;
   proactiveCadenceSec?: number;
@@ -889,6 +991,10 @@ export interface JarvisStoreData {
   settings: AppSettings;
   projects?: ProjectWorkspace[];
   activeProjectId?: string;
+  chatThreads?: ChatThread[];
+  activeChatId?: string;
+  projectActivityLogs?: ProjectActivityLogEntry[];
+  latestScreenSnapshot?: ScreenCaptureSnapshot | null;
   goals: GoalItem[];
   contracts: TodayContractItem[];
   candidates: Q18Candidate[];
