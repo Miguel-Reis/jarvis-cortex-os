@@ -1,9 +1,11 @@
-import { db } from './db.ts';
-import { collectOSTelemetry, executeGovernedCommand } from './os-adapter.ts';
-import { synthesizeBriefText } from './gemini-engine.ts';
-import { runProjectProactiveScan } from './swarm-orbit-engine.ts';
+import { compactMemoryVault } from '../shared/cortex-math.ts';
 import type { Workflow, WorkflowRun, WorkflowStepLog } from '../shared/types.ts';
+import { domainMutex } from './async-mutex.ts';
+import { db } from './db.ts';
 import { debugLog } from './debug-logger.ts';
+import { synthesizeBriefText } from './gemini-engine.ts';
+import { collectOSTelemetry, executeGovernedCommand } from './os-adapter.ts';
+import { runProjectProactiveScan } from './swarm-orbit-engine.ts';
 
 type SseBroadcastFn = (event: string, data: unknown) => void;
 
@@ -179,6 +181,7 @@ export async function runWorkflowById(
     totalDurationMs: Math.max(2, Date.now() - t0),
     steps,
     pendingApprovalId,
+    source: 'REAL',
   };
 
   db.update((draft) => {
@@ -259,6 +262,31 @@ export function startOrRefreshHeartbeatDaemon(activePort = 3000): void {
           draft.heartbeat.recentAlerts.length = 20;
         }
       });
+
+      // §7: Periodic scheduled Memory Vault Compaction every 5 Heartbeat cycles
+      if (db.getState().heartbeat.totalBeats % 5 === 0) {
+        await domainMutex.withLock('memories', async () => {
+          db.update((draft) => {
+            const compacted = compactMemoryVault({
+              memories: draft.memories,
+              edges: draft.graphEdges,
+            });
+            if (
+              compacted.duplicatesSuperseded > 0 ||
+              compacted.workingPruned > 0 ||
+              compacted.importanceDecayed > 0
+            ) {
+              draft.memories = compacted.memories;
+              draft.graphEdges = compacted.edges;
+              debugLog(
+                'INFO',
+                'HEARTBEAT',
+                `Scheduled vault compaction: superseded=${compacted.duplicatesSuperseded}, pruned=${compacted.workingPruned}, decayed=${compacted.importanceDecayed}`
+              );
+            }
+          });
+        });
+      }
 
       if (db.getState().settings.proactiveGlobalEnabled !== false) {
         await runProjectProactiveScan().catch(() => {});

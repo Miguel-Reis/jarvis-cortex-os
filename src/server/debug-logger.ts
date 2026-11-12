@@ -5,6 +5,7 @@ import type { NextFunction, Request, Response } from 'express';
 import {
   classifyHttpLogLevel,
   formatDebugPayloadPreview,
+  redactAiDefenceSecrets,
   type DebugLogLevel,
 } from '../shared/cortex-math.ts';
 
@@ -14,6 +15,7 @@ export type DebugSubsystem =
   | 'SSE'
   | 'DB'
   | 'AUDIT'
+  | 'SECURITY'
   | 'OS-EXEC'
   | 'SIDECAR'
   | 'CONTRACT'
@@ -42,14 +44,14 @@ export interface DebugLogEntry {
 }
 
 const LOGS_DIR = path.resolve(process.cwd(), 'logs');
-const DEBUG_LOG_FILE = path.join(LOGS_DIR, 'jarvis-debug.log');
-const DEBUG_LOG_PREV_FILE = path.join(LOGS_DIR, 'jarvis-debug.prev.log');
-const MAX_LOG_FILE_BYTES = 5 * 1024 * 1024; // 5 MB auto-rotate
+const MAX_DAILY_LOG_FILE_BYTES = 8 * 1024 * 1024; // 8 MB cap per daily log file
+const LOG_RETENTION_DAYS = 7;
 const MAX_RING_BUFFER = 300;
 
 const ringBuffer: DebugLogEntry[] = [];
 let seqCounter = 0;
 let logDirReady = false;
+let lastPrunedDateKey = '';
 
 function isRunningUnderUnitTest(): boolean {
   return (
@@ -69,6 +71,14 @@ export function isDebugLoggingEnabled(): boolean {
   return true;
 }
 
+function currentUtcDateKey(now = new Date()): string {
+  return now.toISOString().slice(0, 10); // YYYY-MM-DD
+}
+
+function getDailyLogFilePath(dateKey = currentUtcDateKey()): string {
+  return path.join(LOGS_DIR, `jarvis-debug-${dateKey}.log`);
+}
+
 function ensureLogDirectory(): boolean {
   if (logDirReady) return true;
   try {
@@ -80,23 +90,73 @@ function ensureLogDirectory(): boolean {
   }
 }
 
-function appendFileSafe(plainLine: string): void {
-  if (!ensureLogDirectory()) return;
+/**
+ * A-11: Daily log retention sweep (keeps last 7 days of `jarvis-debug-YYYY-MM-DD*.log`).
+ */
+export function pruneOldDebugLogs(nowMs = Date.now(), retentionDays = LOG_RETENTION_DAYS): number {
+  if (!ensureLogDirectory()) return 0;
+  let removed = 0;
+  const maxAgeMs = Math.max(1, retentionDays) * 86_400_000;
   try {
-    if (fs.existsSync(DEBUG_LOG_FILE)) {
-      const stat = fs.statSync(DEBUG_LOG_FILE);
-      if (stat.size >= MAX_LOG_FILE_BYTES) {
+    const entries = fs.readdirSync(LOGS_DIR);
+    for (const fileName of entries) {
+      if (!fileName.startsWith('jarvis-debug') || !fileName.endsWith('.log')) continue;
+      const fullPath = path.join(LOGS_DIR, fileName);
+      try {
+        const stat = fs.statSync(fullPath);
+        if (nowMs - stat.mtimeMs > maxAgeMs) {
+          fs.unlinkSync(fullPath);
+          removed += 1;
+        }
+      } catch {
+        // Ignore concurrent deletion
+      }
+    }
+  } catch {
+    // Non-fatal
+  }
+  return removed;
+}
+
+function appendFileSafe(plainLine: string, now = new Date()): void {
+  if (!ensureLogDirectory()) return;
+  const dateKey = currentUtcDateKey(now);
+  if (dateKey !== lastPrunedDateKey) {
+    lastPrunedDateKey = dateKey;
+    pruneOldDebugLogs(now.getTime());
+  }
+
+  const dailyFile = getDailyLogFilePath(dateKey);
+  try {
+    if (fs.existsSync(dailyFile)) {
+      const stat = fs.statSync(dailyFile);
+      if (stat.size >= MAX_DAILY_LOG_FILE_BYTES) {
         try {
-          fs.renameSync(DEBUG_LOG_FILE, DEBUG_LOG_PREV_FILE);
+          fs.renameSync(dailyFile, `${dailyFile}.prev.log`);
         } catch {
           // ignore rotation collision
         }
       }
     }
-    fs.appendFileSync(DEBUG_LOG_FILE, `${plainLine}\n`, 'utf-8');
+    fs.appendFileSync(dailyFile, `${plainLine}\n`, 'utf-8');
   } catch {
     // Non-fatal if filesystem is read-only
   }
+}
+
+/**
+ * A-11: Redacts AI-Defence secrets PLUS configured JARVIS_API_TOKEN / Bearer tokens
+ * from every debug log message and payload preview before writing to memory, console, or disk.
+ */
+export function sanitizeLogText(raw: string): string {
+  if (!raw) return '';
+  let text = redactAiDefenceSecrets(raw).sanitized;
+  text = text.replace(/\bBearer\s+[A-Za-z0-9._~+/=-]{8,}\b/gi, 'Bearer [REDACTED_BEARER_TOKEN]');
+  const envToken = (process.env.JARVIS_API_TOKEN || '').trim();
+  if (envToken.length >= 6 && text.includes(envToken)) {
+    text = text.split(envToken).join('[REDACTED_JARVIS_API_TOKEN]');
+  }
+  return text;
 }
 
 const ANSI = {
@@ -147,6 +207,7 @@ function colorForSubsystem(sub: DebugSubsystem): string {
     case 'AUDIT':
     case 'CONTRACT':
       return ANSI.emerald;
+    case 'SECURITY':
     case 'FATAL':
       return ANSI.rose;
     default:
@@ -167,23 +228,27 @@ export function debugLog(
   if (!isDebugLoggingEnabled()) return;
 
   seqCounter += 1;
-  const nowIso = new Date().toISOString();
+  const now = new Date();
+  const nowIso = now.toISOString();
   const timeShort = nowIso.slice(11, 23); // HH:MM:SS.mmm
   const durStr =
     options?.durationMs !== undefined ? ` (${Number(options.durationMs.toFixed(2))}ms)` : '';
-  const meta =
+
+  const safeMessage = sanitizeLogText(message);
+  const rawMeta =
     options?.payload !== undefined
       ? formatDebugPayloadPreview(options.payload, options.maxPreviewLen ?? 280)
       : '';
+  const safeMeta = rawMeta ? sanitizeLogText(rawMeta) : '';
 
   const entry: DebugLogEntry = {
     seq: seqCounter,
     timestamp: nowIso,
     level,
     subsystem,
-    message,
+    message: safeMessage,
     durationMs: options?.durationMs,
-    meta: meta || undefined,
+    meta: safeMeta || undefined,
   };
 
   ringBuffer.push(entry);
@@ -192,11 +257,11 @@ export function debugLog(
   }
 
   const seqTag = `#${String(seqCounter).padStart(4, '0')}`;
-  const plainLine = `[${nowIso}] ${seqTag} [${level.padEnd(5)}] [${subsystem.padEnd(10)}] ${message}${durStr}${
-    meta ? ` | ${meta}` : ''
+  const plainLine = `[${nowIso}] ${seqTag} [${level.padEnd(5)}] [${subsystem.padEnd(10)}] ${safeMessage}${durStr}${
+    safeMeta ? ` | ${safeMeta}` : ''
   }`;
 
-  appendFileSafe(plainLine);
+  appendFileSafe(plainLine, now);
 
   const useColor = Boolean(process.stdout.isTTY) && process.env.NO_COLOR !== '1';
   if (useColor) {
@@ -206,9 +271,9 @@ export function debugLog(
       `${ANSI.gray}${timeShort} ${seqTag}${ANSI.reset} ` +
       `${lvlColor}${level.padEnd(5)}${ANSI.reset} ` +
       `${subColor}[${subsystem.padEnd(10)}]${ANSI.reset} ` +
-      `${message}` +
+      `${safeMessage}` +
       `${durStr ? `${ANSI.amber}${durStr}${ANSI.reset}` : ''}` +
-      `${meta ? ` ${ANSI.gray}| ${meta}${ANSI.reset}` : ''}`;
+      `${safeMeta ? ` ${ANSI.gray}| ${safeMeta}${ANSI.reset}` : ''}`;
 
     if (level === 'ERROR') {
       console.error(consoleLine);
@@ -229,7 +294,7 @@ export function debugLog(
 }
 
 export function getDebugLogFilePath(): string {
-  return DEBUG_LOG_FILE;
+  return getDailyLogFilePath();
 }
 
 export function getRecentDebugLogs(limit = 150): DebugLogEntry[] {
@@ -278,7 +343,7 @@ export function printStartupDebugBanner(params: {
       params.openRouterConfigured ? 'CONFIGURED' : 'OFF'
     } · BrainBridge=http://127.0.0.1:8765`
   );
-  debugLog('INFO', 'BOOT', `Debug Log File: ${DEBUG_LOG_FILE}`);
+  debugLog('INFO', 'BOOT', `Daily Redacted Log: ${getDailyLogFilePath()} (7-day retention)`);
   debugLog(
     'INFO',
     'BOOT',
@@ -293,8 +358,10 @@ export function createHttpDebugMiddleware() {
       return;
     }
 
-    const url = req.originalUrl || req.url || '/';
-    // Skip noisy Vite internal module/asset requests unless JARVIS_DEBUG_ASSETS=1
+    const rawUrl = req.originalUrl || req.url || '/';
+    // Redact token query param if present on SSE /api/events?token=...
+    const url = rawUrl.replace(/([?&]token=)[^&]+/gi, '$1[REDACTED]');
+
     const isViteAsset =
       !url.startsWith('/api') &&
       (url.startsWith('/@') ||
@@ -310,7 +377,10 @@ export function createHttpDebugMiddleware() {
     const startNs = process.hrtime.bigint();
     const method = req.method;
     const hasBody =
-      req.body && typeof req.body === 'object' && Object.keys(req.body as object).length > 0;
+      req.body &&
+      typeof req.body === 'object' &&
+      !Buffer.isBuffer(req.body) &&
+      Object.keys(req.body as object).length > 0;
 
     debugLog('DEBUG', 'HTTP', `--> ${method} ${url}`, {
       payload: hasBody ? req.body : Object.keys(req.query || {}).length > 0 ? req.query : undefined,
@@ -331,7 +401,6 @@ export function createHttpDebugMiddleware() {
       const contentLen = res.getHeader('content-length');
       const sizeTag = contentLen ? ` · ${contentLen}B` : '';
 
-      // Summarize large bootstrap payloads cleanly instead of dumping 50KB
       let outPayload = responsePreview;
       if (url.startsWith('/api/bootstrap') && outPayload && typeof outPayload === 'object') {
         const b = outPayload as {

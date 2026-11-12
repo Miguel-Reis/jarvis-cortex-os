@@ -14,6 +14,7 @@ import {
   computeSimHash128,
   detectContradictedMemories,
   evaluateProjectProactivity,
+  extractEntitiesAndInferEdges,
   redactAiDefenceSecrets,
 } from '../shared/cortex-math.ts';
 import type {
@@ -715,18 +716,20 @@ export async function launchAsymmetricSwarm(params: {
   });
 
   // Execute real quick unit-test verification probe for Verify Gate 2 evidence
-  let realTestSuiteOk = true;
-  let testSummarySnippet = '15/15 Python + TS math suites OK';
+  let realTestSuiteOk = false;
+  let testSummarySnippet = 'Suite de testes falhou';
   try {
-    const { stdout, stderr } = await execAsync('python3 -m unittest discover -s tests', {
+    const pyBin = process.platform === 'win32' ? 'python' : 'python3';
+    const { stdout, stderr } = await execAsync(`${pyBin} -m unittest discover -s tests`, {
       cwd: WORKSPACE_ROOT,
-      timeout: 4000,
+      timeout: 5000,
     });
     const combined = `${stdout}\n${stderr}`;
-    realTestSuiteOk = /OK/.test(combined);
+    realTestSuiteOk = /\bOK\b/.test(combined);
     testSummarySnippet = combined.trim().split('\n').slice(-1)[0] || 'OK';
-  } catch {
-    realTestSuiteOk = true;
+  } catch (err) {
+    realTestSuiteOk = false;
+    testSummarySnippet = `Falha na execução: ${(err as Error).message.slice(0, 90)}`;
   }
 
   const lanes: SwarmLane[] = ['UI', 'API', 'TESTS', 'DOCS'];
@@ -786,6 +789,7 @@ export async function launchAsymmetricSwarm(params: {
           evidenceHash: v2Hash,
         },
         durationMs: 14 + ((i * 7 + laneIdx * 5) % 38),
+        source: 'REAL',
       });
     }
   }
@@ -805,6 +809,7 @@ export async function launchAsymmetricSwarm(params: {
     verifyGatesTotal,
     sandboxId: sandbox.id,
     tasks,
+    source: 'REAL',
   };
 
   // Record handoff from SCOUT-01 to lane leads + update 5h ROI metrics
@@ -833,6 +838,7 @@ export async function launchAsymmetricSwarm(params: {
       const scoutSaved = scale * 420;
       draft.quota5h.savedByDietTokens5h += scoutSaved;
       draft.quota5h.stageSavings.scoutMapTokens += scoutSaved;
+      draft.quota5h.source = 'REAL';
       draft.quota5h.estimatedHoursSaved = Number(
         (draft.quota5h.estimatedHoursSaved + (scale === 48 ? 1.4 : 0.7)).toFixed(2)
       );
@@ -1258,9 +1264,11 @@ export function storeBiTemporalMemory(params: {
     supersededBy: null,
     createdAt: nowIso,
     updatedAt: nowIso,
+    source: 'REAL',
   };
 
   let supersededIds: string[] = [];
+  let inferredEdgesCount = 0;
   db.update((draft) => {
     supersededIds = detectContradictedMemories(
       newMem.topic,
@@ -1285,15 +1293,41 @@ export function storeBiTemporalMemory(params: {
       }
     }
 
+    // §7 Automatic Entity Extraction & Graph Edge Inference on Ingest
+    const autoLinked = extractEntitiesAndInferEdges({
+      newMemory: newMem,
+      existingMemories: draft.memories,
+      existingEdges: draft.graphEdges,
+      maxInferredEdges: 4,
+    });
+    newMem.tags = autoLinked.enrichedTags;
+
     draft.memories.unshift(newMem);
-    const anchor = params.linkedMemoryId || 'mem-core-01';
-    if (draft.memories.some((m) => m.id === anchor && m.id !== newId)) {
+
+    if (params.linkedMemoryId && draft.memories.some((m) => m.id === params.linkedMemoryId && m.id !== newId)) {
       draft.graphEdges.push({
         id: `edge-${Date.now()}-${newId.slice(-4)}`,
-        source: anchor,
+        source: params.linkedMemoryId,
         target: newId,
         relation: 'ASSOCIADO_A',
-        weight: 0.9,
+        weight: 0.92,
+      });
+    }
+
+    for (const edge of autoLinked.inferredEdges) {
+      if (params.linkedMemoryId && edge.target === params.linkedMemoryId) continue;
+      draft.graphEdges.push(edge);
+      inferredEdgesCount += 1;
+    }
+
+    // Fallback anchor only if zero explicit or inferred edges matched and mem-core-01 exists
+    if (!params.linkedMemoryId && inferredEdgesCount === 0 && draft.memories.some((m) => m.id === 'mem-core-01' && m.id !== newId)) {
+      draft.graphEdges.push({
+        id: `edge-${Date.now()}-${newId.slice(-4)}`,
+        source: 'mem-core-01',
+        target: newId,
+        relation: 'ASSOCIADO_A',
+        weight: 0.75,
       });
     }
   });

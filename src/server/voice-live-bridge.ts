@@ -1,5 +1,5 @@
 import type http from 'node:http';
-import { LiveServerMessage, Modality } from '@google/genai';
+import { type LiveServerMessage, Modality } from '@google/genai';
 import { WebSocket, WebSocketServer } from 'ws';
 import {
   GEMINI_VOICE_CATALOG,

@@ -5,6 +5,7 @@ import {
   GitCommitHorizontal,
   HelpCircle,
   History,
+  Layers,
   Pin,
   Plus,
   RefreshCw,
@@ -12,7 +13,7 @@ import {
   Trash2,
   X,
 } from 'lucide-react';
-import { apiJson } from '../../lib/api';
+import { apiJson, compactMemoryVaultApi } from '../../lib/api';
 import { useToast } from '../ToastContext';
 import { computeEbbinghausRetention } from '../../shared/cortex-math';
 import type {
@@ -67,6 +68,7 @@ export const MemoryGraphView: React.FC<MemoryGraphViewProps> = ({
   const [seedNodeId, setSeedNodeId] = useState<string | undefined>(initialSeedId);
   const [pprNodes, setPprNodes] = useState<GraphNodeComputed[]>(pprNodesInitial);
   const [syncingBrain, setSyncingBrain] = useState(false);
+  const [compactingVault, setCompactingVault] = useState(false);
 
   // Shortest Path BFS state
   const [pathFromId, setPathFromId] = useState<string>(store.memories[0]?.id || '');
@@ -391,6 +393,28 @@ export const MemoryGraphView: React.FC<MemoryGraphViewProps> = ({
     }
   };
 
+  const handleCompactVault = async () => {
+    if (compactingVault) return;
+    setCompactingVault(true);
+    try {
+      const res = await compactMemoryVaultApi();
+      await onRefreshBootstrap();
+      pushToast({
+        title: 'Cofre de Memória compactado',
+        detail: `Duplicados superados: ${res.duplicatesSuperseded} · Working expiradas: ${res.workingPruned} · Decaídas: ${res.importanceDecayed}`,
+        tone: 'success',
+      });
+    } catch (err) {
+      pushToast({
+        title: 'Erro ao compactar cofre',
+        detail: (err as Error).message,
+        tone: 'error',
+      });
+    } finally {
+      setCompactingVault(false);
+    }
+  };
+
   const memoryLabelById = (id: string) =>
     store.memories.find((m) => m.id === id)?.topic || id;
 
@@ -419,6 +443,15 @@ export const MemoryGraphView: React.FC<MemoryGraphViewProps> = ({
                 Limpar Semente PPR
               </button>
             )}
+            <button
+              type="button"
+              disabled={compactingVault}
+              onClick={handleCompactVault}
+              className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium bg-[#151c26] border border-slate-700 text-slate-200 rounded-lg hover:border-cyan-500/50 whitespace-nowrap disabled:opacity-50"
+            >
+              <Layers className="w-3.5 h-3.5 text-cyan-400" />
+              {compactingVault ? 'A compactar...' : 'Compactar Cofre'}
+            </button>
             <button
               type="button"
               disabled={syncingBrain}
@@ -642,8 +675,9 @@ export const MemoryGraphView: React.FC<MemoryGraphViewProps> = ({
                   </div>
                   <p className="text-xs text-slate-300 leading-relaxed">{mem.content}</p>
                   <p className="text-xs text-slate-500 font-mono tabular-nums">
-                    {mem.category} · Retenção Ebbinghaus {Math.round(ebb.retentionScore * 100)}%
-                    (H={ebb.halfLifeDays}d) · BQ128 {bqPrefix}
+                    {mem.category} · {mem.source === 'REAL' ? 'Real' : 'Demo'} · Retenção Ebbinghaus{' '}
+                    {Math.round(ebb.retentionScore * 100)}% (H={ebb.halfLifeDays}d) · BQ128{' '}
+                    {bqPrefix}
                     {mem.tags.length > 0 ? ` · #${mem.tags.join(' #')}` : ''}
                   </p>
                 </div>

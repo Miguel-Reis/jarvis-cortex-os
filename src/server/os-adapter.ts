@@ -5,7 +5,13 @@ import net from 'node:net';
 import crypto from 'node:crypto';
 import { exec, execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { detectPromptInjection } from '../shared/cortex-math.ts';
+import {
+  analyzeShellCommandSafety,
+  detectPromptInjection,
+  isPathInsideWorkspace,
+  redactAiDefenceSecrets,
+  validateSafeOutboundUrl,
+} from '../shared/cortex-math.ts';
 import type {
   OSTelemetry,
   PortRadarEntry,
@@ -195,7 +201,10 @@ export function listWorkspaceFiles(maxEntries = 140, subPath = ''): WorkspaceFil
   const results: WorkspaceFileEntry[] = [];
   const cleanSub = subPath === '.' ? '' : subPath.replace(/^(\.\.(\/|\\|$))+/, '').replace(/^\.\//, '');
   const baseRoot = cleanSub ? path.resolve(WORKSPACE_ROOT, cleanSub) : WORKSPACE_ROOT;
-  const safeRoot = baseRoot.startsWith(WORKSPACE_ROOT) && fs.existsSync(baseRoot) ? baseRoot : WORKSPACE_ROOT;
+  const safeRoot =
+    isPathInsideWorkspace(WORKSPACE_ROOT, baseRoot) && fs.existsSync(baseRoot)
+      ? baseRoot
+      : WORKSPACE_ROOT;
   const prefixLabel = safeRoot === WORKSPACE_ROOT ? '' : path.relative(WORKSPACE_ROOT, safeRoot).replace(/\\/g, '/');
 
   const walk = (relDir: string, depth: number) => {
@@ -247,9 +256,12 @@ export function listWorkspaceFiles(maxEntries = 140, subPath = ''): WorkspaceFil
 }
 
 export function readSafeWorkspaceFile(relPath: string): { ok: boolean; content: string; error?: string } {
-  const normalized = path.normalize(relPath).replace(/^(\.\.(\/|\\|$))+/, '');
-  const abs = path.resolve(WORKSPACE_ROOT, normalized);
-  if (!abs.startsWith(WORKSPACE_ROOT)) {
+  const rawInput = String(relPath || '').trim();
+  if (!rawInput || rawInput.includes('\0')) {
+    return { ok: false, content: '', error: 'Caminho de ficheiro inválido.' };
+  }
+  const abs = path.resolve(WORKSPACE_ROOT, rawInput);
+  if (!isPathInsideWorkspace(WORKSPACE_ROOT, abs)) {
     return { ok: false, content: '', error: 'Acesso fora do workspace bloqueado pelo TrustBoundaryGate.' };
   }
   const baseName = path.basename(abs);
@@ -333,49 +345,80 @@ export async function executeGovernedCommand(
 }> {
   const cleanCmd = command.trim();
   const start = Date.now();
+  const state = db.getState();
+  const configuredThreshold =
+    state.settings.trustThreshold ?? (Number(process.env.JARVIS_TRUST_THRESHOLD) || 70);
 
-  const scan = detectPromptInjection(cleanCmd);
+  const scan = detectPromptInjection(cleanCmd, configuredThreshold);
+  const shellSafety = analyzeShellCommandSafety(cleanCmd);
+  const combinedRiskScore = Math.min(100, scan.riskScore + shellSafety.riskAdjustment);
+
   if (scan.blocked) {
-    debugLog('WARN', 'OS-EXEC', `Blocked command from ${source} (risk=${scan.riskScore}/100)`, {
+    debugLog('WARN', 'OS-EXEC', `Blocked command from ${source} (risk=${combinedRiskScore}/100)`, {
       payload: { command: cleanCmd, rules: scan.matchedRules },
     });
-    db.appendAudit('TRUST_GATE', 'SECURITY', 'COMMAND_BLOCKED', `Comando bloqueado: ${cleanCmd}`, 'BLOCKED');
+    db.appendAudit(
+      'TRUST_GATE',
+      'SECURITY',
+      'COMMAND_BLOCKED',
+      redactAiDefenceSecrets(`Risco ${combinedRiskScore}/100 [${scan.matchedRules.join(',')}]: ${cleanCmd}`).sanitized,
+      'BLOCKED'
+    );
     return {
       status: 'BLOCKED',
-      output: `Bloqueado pelo TrustBoundaryGate (Risco ${scan.riskScore}/100): ${scan.matchedRules.join(', ')}`,
+      output: `Bloqueado pelo TrustBoundaryGate (Risco ${combinedRiskScore}/100): ${scan.matchedRules.join(', ')}`,
       exitCode: 126,
       durationMs: Date.now() - start,
     };
   }
 
-  const state = db.getState();
+  // A-04: Commands with shell operators (;, |, &&, $(), >) NEVER auto-execute via FULL_EXECUTIVE alone;
+  // they require explicit allowlist membership or 1x human approval in the Authority Inbox.
+  const explicitlyAllowlisted = state.settings.alwaysApprovedCommands.includes(cleanCmd);
+  const safeReadonlyNoShell =
+    !shellSafety.hasShellOperators && SAFE_READONLY_PATTERNS.some((re) => re.test(cleanCmd));
   const isPreApproved =
     bypassApprovalOnce ||
-    state.settings.autonomyLevel === 'FULL_EXECUTIVE' ||
-    state.settings.alwaysApprovedCommands.includes(cleanCmd) ||
-    SAFE_READONLY_PATTERNS.some((re) => re.test(cleanCmd));
+    explicitlyAllowlisted ||
+    safeReadonlyNoShell ||
+    (!shellSafety.hasShellOperators && state.settings.autonomyLevel === 'FULL_EXECUTIVE');
 
   if (!isPreApproved) {
     const approvalId = `appr-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
-    debugLog('INFO', 'OS-EXEC', `Queued command for human approval (${approvalId}) from ${source}`, {
+    const riskLevel: 'MEDIUM' | 'HIGH' | 'CRITICAL' =
+      combinedRiskScore >= 60 || cleanCmd.includes('rm ') || cleanCmd.includes('clean')
+        ? 'HIGH'
+        : shellSafety.hasShellOperators
+          ? 'HIGH'
+          : 'MEDIUM';
+
+    debugLog('INFO', 'OS-EXEC', `Queued command for human approval (${approvalId}, risk=${combinedRiskScore}/100) from ${source}`, {
       payload: cleanCmd,
     });
     db.update((draft) => {
       draft.approvals.unshift({
         id: approvalId,
-        title: `Execução Shell (${source})`,
+        title: shellSafety.hasShellOperators
+          ? `Execução Shell com Operadores [${shellSafety.detectedOperators.join(' ')}] (${source})`
+          : `Execução Governada (${source})`,
         commandOrAction: cleanCmd,
         source,
-        riskLevel: cleanCmd.includes('rm ') || cleanCmd.includes('clean') ? 'HIGH' : 'MEDIUM',
+        riskLevel,
         requestedAt: new Date().toISOString(),
         status: 'PENDING',
         workflowRunId,
       });
     });
-    db.appendAudit(source, 'TERMINAL', 'APPROVAL_REQUESTED', `Aguarda aprovação: ${cleanCmd}`, 'ALLOWED');
+    db.appendAudit(
+      source,
+      'TERMINAL',
+      'APPROVAL_REQUESTED',
+      redactAiDefenceSecrets(`Risco ${combinedRiskScore}/100 · Aguarda aprovação: ${cleanCmd}`).sanitized,
+      'ALLOWED'
+    );
     return {
       status: 'PENDING_APPROVAL',
-      output: `Comando colocado em espera na Inbox de Autoridade (${approvalId}): "${cleanCmd}"`,
+      output: `Comando colocado em espera na Inbox de Autoridade (${approvalId}, risco ${combinedRiskScore}/100): "${cleanCmd}"`,
       exitCode: 2,
       durationMs: Date.now() - start,
       approvalId,
@@ -383,27 +426,56 @@ export async function executeGovernedCommand(
   }
 
   try {
-    const shellOpt =
-      process.platform === 'win32' ? { shell: 'powershell.exe' } : { shell: '/bin/bash' };
-    const effectiveCmd =
-      process.platform === 'win32' && /^python3(\s|$)/.test(cleanCmd)
-        ? cleanCmd.replace(/^python3\b/, 'python')
-        : cleanCmd;
-    debugLog('DEBUG', 'OS-EXEC', `Executing [${source}]: ${effectiveCmd}`);
-    const { stdout, stderr } = await execAsync(effectiveCmd, {
-      cwd: WORKSPACE_ROOT,
-      timeout: 12_000,
-      maxBuffer: 512 * 1024,
-      ...shellOpt,
-    });
+    let stdout = '';
+    let stderr = '';
+    const modeLabel = shellSafety.canUseExecFile ? 'execFile(no-shell)' : 'shell-approved';
+
+    if (shellSafety.canUseExecFile) {
+      const bin =
+        process.platform === 'win32' && shellSafety.executable === 'python3'
+          ? 'python'
+          : shellSafety.executable;
+      debugLog('DEBUG', 'OS-EXEC', `Executing [${source} · ${modeLabel}]: ${bin} ${shellSafety.args.join(' ')}`);
+      const res = await execFileAsync(bin, shellSafety.args, {
+        cwd: WORKSPACE_ROOT,
+        timeout: 12_000,
+        maxBuffer: 512 * 1024,
+        shell: false,
+      });
+      stdout = res.stdout;
+      stderr = res.stderr;
+    } else {
+      const shellOpt =
+        process.platform === 'win32' ? { shell: 'powershell.exe' } : { shell: '/bin/bash' };
+      const effectiveCmd =
+        process.platform === 'win32' && /^python3(\s|$)/.test(cleanCmd)
+          ? cleanCmd.replace(/^python3\b/, 'python')
+          : cleanCmd;
+      debugLog('DEBUG', 'OS-EXEC', `Executing [${source} · ${modeLabel}]: ${effectiveCmd}`);
+      const res = await execAsync(effectiveCmd, {
+        cwd: WORKSPACE_ROOT,
+        timeout: 12_000,
+        maxBuffer: 512 * 1024,
+        ...shellOpt,
+      });
+      stdout = res.stdout;
+      stderr = res.stderr;
+    }
+
     const durationMs = Date.now() - start;
     const combined = [stdout?.trim(), stderr?.trim()].filter(Boolean).join('\n') || '(Comando concluído sem output)';
-    debugLog('INFO', 'OS-EXEC', `Exit 0 [${source}]: ${effectiveCmd}`, {
+    debugLog('INFO', 'OS-EXEC', `Exit 0 [${source} · ${modeLabel}]: ${cleanCmd}`, {
       durationMs,
       payload: combined,
       maxPreviewLen: 200,
     });
-    db.appendAudit(source, 'TERMINAL', 'COMMAND_EXECUTED', cleanCmd, 'VERIFIED');
+    db.appendAudit(
+      source,
+      'TERMINAL',
+      'COMMAND_EXECUTED',
+      redactAiDefenceSecrets(`[${modeLabel} · Risco ${combinedRiskScore}/100] ${cleanCmd}`).sanitized,
+      'VERIFIED'
+    );
     return {
       status: 'EXECUTED',
       output: combined.slice(0, 6000),
@@ -443,10 +515,11 @@ export async function verifyTodayContractItem(
 
   if (contract.verificationRule === 'FILE_EXISTS') {
     const abs = path.resolve(WORKSPACE_ROOT, contract.verificationTarget);
-    const exists = abs.startsWith(WORKSPACE_ROOT) && fs.existsSync(abs);
+    const exists = isPathInsideWorkspace(WORKSPACE_ROOT, abs) && fs.existsSync(abs);
+    const filePayload = exists && !fs.statSync(abs).isDirectory() ? fs.readFileSync(abs) : Buffer.from(`${contract.verificationTarget}:${exists}`);
     const hash = crypto
       .createHash('sha256')
-      .update(`${contract.verificationTarget}:${exists}:${nowIso}`)
+      .update(filePayload)
       .digest('hex')
       .slice(0, 16);
     debugLog(exists ? 'INFO' : 'WARN', 'CONTRACT', `FILE_EXISTS=${exists} sha256=${hash}`, {
@@ -456,21 +529,51 @@ export async function verifyTodayContractItem(
       verified: exists,
       evidenceHash: hash,
       summary: exists
-        ? `Ficheiro "${contract.verificationTarget}" presente e íntegro.`
-        : `Ficheiro "${contract.verificationTarget}" não encontrado.`,
+        ? `Ficheiro "${contract.verificationTarget}" presente e íntegro (SHA-256 ${hash}).`
+        : `Ficheiro "${contract.verificationTarget}" não encontrado ou fora do workspace.`,
     };
   }
 
   if (contract.verificationRule === 'HTTP_CHECK') {
     const targetUrl = contract.verificationTarget.startsWith('http')
       ? contract.verificationTarget
-      : `http://127.0.0.1:${activeServerPort}${contract.verificationTarget}`;
+      : `http://127.0.0.1:${activeServerPort}${contract.verificationTarget.startsWith('/') ? '' : '/'}${contract.verificationTarget}`;
+
+    const ssrfGuard = validateSafeOutboundUrl(targetUrl, {
+      allowLocalPorts: [activeServerPort, 3000, 8765, 8766],
+      allowPrivateNetworks: process.env.JARVIS_ALLOW_PRIVATE_NET_PROBES === '1',
+    });
+
+    if (!ssrfGuard.allowed) {
+      db.appendAudit(
+        'CONTRACT_GATE',
+        'SECURITY',
+        'HTTP_CHECK_SSRF_BLOCKED',
+        `${targetUrl}: ${ssrfGuard.reason}`,
+        'BLOCKED'
+      );
+      return {
+        verified: false,
+        evidenceHash: '0000000000000000',
+        summary: `Bloqueado por Anti-SSRF: ${ssrfGuard.reason}`,
+      };
+    }
+
     try {
-      const res = await fetch(targetUrl);
+      const headers: Record<string, string> = {};
+      if (process.env.JARVIS_API_TOKEN?.trim() && targetUrl.startsWith(`http://127.0.0.1:${activeServerPort}`)) {
+        headers.Authorization = `Bearer ${process.env.JARVIS_API_TOKEN.trim()}`;
+      }
+      const res = await fetch(targetUrl, {
+        headers,
+        redirect: 'error',
+        signal: AbortSignal.timeout(3500),
+      });
+      const bodyText = await res.text().catch(() => '');
       const ok = res.ok;
       const hash = crypto
         .createHash('sha256')
-        .update(`${targetUrl}:${res.status}:${nowIso}`)
+        .update(`${targetUrl}:${res.status}:${bodyText.slice(0, 512)}`)
         .digest('hex')
         .slice(0, 16);
       debugLog(ok ? 'INFO' : 'WARN', 'CONTRACT', `HTTP_CHECK ${res.status} on ${targetUrl} sha256=${hash}`, {

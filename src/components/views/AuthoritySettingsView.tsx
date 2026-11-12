@@ -1,4 +1,4 @@
-import React, { useRef, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   ShieldAlert,
   Check,
@@ -16,7 +16,7 @@ import {
   Trash2,
   RefreshCw,
 } from 'lucide-react';
-import { apiJson } from '../../lib/api';
+import { apiJson, fetchSystemDoctor, purgeDemoSeedsApi } from '../../lib/api';
 import { markViiAudio } from '../../lib/audio-dsp';
 import { useToast } from '../ToastContext';
 import { LLMSettingsView } from './LLMSettingsView';
@@ -24,6 +24,7 @@ import type {
   AppSettings,
   AutonomyLevel,
   BrainLiveStatus,
+  DoctorReport,
   JarvisStoreData,
   LanguageCode,
   PersonalityMode,
@@ -78,6 +79,72 @@ export const AuthoritySettingsView: React.FC<AuthoritySettingsViewProps> = ({
   );
   const [newAllowedCmd, setNewAllowedCmd] = useState('');
   const [probingBrain, setProbingBrain] = useState(false);
+
+  // System Doctor (--doctor), Trust Threshold & Demo Seed Purge (A-04, A-06, §7)
+  const [doctorReport, setDoctorReport] = useState<DoctorReport | null>(null);
+  const [runningDoctor, setRunningDoctor] = useState(false);
+  const [purgingSeeds, setPurgingSeeds] = useState(false);
+  const [trustThresholdDraft, setTrustThresholdDraft] = useState<number>(
+    store.settings.trustThreshold ?? 70
+  );
+
+  useEffect(() => {
+    setTrustThresholdDraft(store.settings.trustThreshold ?? 70);
+  }, [store.settings.trustThreshold]);
+
+  const loadDoctorReport = useCallback(async (notify = false) => {
+    setRunningDoctor(true);
+    try {
+      const report = await fetchSystemDoctor();
+      setDoctorReport(report);
+      if (notify) {
+        pushToast({
+          title: report.healthy
+            ? 'Diagnóstico do Sistema: Nominal'
+            : 'Diagnóstico detetou avisos operacionais',
+          detail: `Node ${report.nodeVersion} · Schema v${report.schemaVersion} · Host ${report.bindHost}`,
+          tone: report.healthy ? 'success' : 'warning',
+        });
+      }
+    } catch (err) {
+      if (notify) {
+        pushToast({
+          title: 'Falha ao executar diagnóstico',
+          detail: (err as Error).message,
+          tone: 'error',
+        });
+      }
+    } finally {
+      setRunningDoctor(false);
+    }
+  }, [pushToast]);
+
+  useEffect(() => {
+    loadDoctorReport(false);
+  }, [loadDoctorReport]);
+
+  const handlePurgeDemoSeeds = async () => {
+    if (purgingSeeds) return;
+    setPurgingSeeds(true);
+    try {
+      const res = await purgeDemoSeedsApi();
+      await onRefreshBootstrap();
+      await loadDoctorReport(false);
+      pushToast({
+        title: 'Dados de demonstração removidos (Modo Real ativo)',
+        detail: `Removidos: ${res.removedSwarmRuns} enxames demo, ${res.removedWorkflowRuns} execuções demo e ${res.removedMemories} memórias semeadas.`,
+        tone: 'success',
+      });
+    } catch (err) {
+      pushToast({
+        title: 'Erro ao limpar dados demo',
+        detail: (err as Error).message,
+        tone: 'error',
+      });
+    } finally {
+      setPurgingSeeds(false);
+    }
+  };
 
   const fileImportRef = useRef<HTMLInputElement>(null);
   const pendingApprovals = store.approvals.filter((a) => a.status === 'PENDING');
@@ -583,6 +650,169 @@ export const AuthoritySettingsView: React.FC<AuthoritySettingsViewProps> = ({
                   className="mt-1 accent-amber-500"
                 />
               </label>
+            </div>
+          </section>
+
+          {/* System Doctor (--doctor), Trust Boundary Threshold & Seed Honesty (A-04, A-06, A-09, §7) */}
+          <section
+            data-testid="system-doctor-panel"
+            className="lg:col-span-12 jarvis-surface border border-slate-800/80 rounded-xl p-6 space-y-5"
+          >
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-4 border-b border-slate-800/80">
+              <div>
+                <h2 className="text-base font-semibold text-slate-100 font-display">
+                  Diagnóstico Operacional (--doctor), Trust Boundary & Modo de Dados
+                </h2>
+                <p className="text-xs text-slate-400 mt-0.5">
+                  Verificação em tempo real do runtime Node.js, persistência SQLite WAL v4 por
+                  coleção, sidecar Python, política de autenticação e proveniência de dados.
+                </p>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-2 shrink-0">
+                <button
+                  type="button"
+                  disabled={runningDoctor}
+                  onClick={() => loadDoctorReport(true)}
+                  className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-medium rounded-lg bg-[#141b25] border border-slate-700 text-cyan-300 hover:border-cyan-500/50 transition-colors whitespace-nowrap disabled:opacity-50"
+                >
+                  <RefreshCw className={`w-3.5 h-3.5 ${runningDoctor ? 'animate-spin' : ''}`} />
+                  Executar Diagnóstico
+                </button>
+
+                <button
+                  type="button"
+                  disabled={purgingSeeds}
+                  onClick={handlePurgeDemoSeeds}
+                  className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold rounded-lg bg-amber-500 text-slate-950 hover:bg-amber-400 transition-colors whitespace-nowrap disabled:opacity-50"
+                >
+                  <Trash2 className="w-3.5 h-3.5" />
+                  {purgingSeeds
+                    ? 'A limpar seeds...'
+                    : 'Limpar Dados Demo (Ativar Modo Real)'}
+                </button>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
+              <div className="lg:col-span-7 space-y-2.5">
+                <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-slate-400 font-mono tabular-nums">
+                  <span>Verificações de Saúde do Sistema</span>
+                  {doctorReport && (
+                    <span>
+                      Runtime {doctorReport.nodeVersion} · Schema v{doctorReport.schemaVersion} ·
+                      Modo {store.seedMode === 'real' ? 'Real' : 'Demo'} · {storageEngine}
+                    </span>
+                  )}
+                </div>
+
+                {doctorReport ? (
+                  <div className="divide-y divide-slate-800/70 border-t border-b border-slate-800/80">
+                    {doctorReport.checks.map((chk) => (
+                      <div
+                        key={chk.id}
+                        className="py-2.5 flex items-start justify-between gap-4 text-xs"
+                      >
+                        <div className="min-w-0">
+                          <p className="font-medium text-slate-200">{chk.label}</p>
+                          <p className="text-[11px] text-slate-400 font-mono break-all mt-0.5">
+                            {chk.detail}
+                          </p>
+                        </div>
+                        <span
+                          className={`font-mono font-semibold tabular-nums shrink-0 ${
+                            chk.status === 'PASS'
+                              ? 'text-emerald-400'
+                              : chk.status === 'WARN'
+                                ? 'text-amber-400'
+                                : 'text-rose-400'
+                          }`}
+                        >
+                          {chk.status}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <p className="text-xs text-slate-400 py-3">
+                    A recolher diagnóstico operacional...
+                  </p>
+                )}
+              </div>
+
+              <div className="lg:col-span-5 space-y-4 lg:pl-6 lg:border-l lg:border-slate-800/80">
+                <div className="space-y-2">
+                  <div className="flex items-center justify-between gap-2">
+                    <label
+                      htmlFor="trust-threshold-slider"
+                      className="text-xs font-semibold text-slate-200"
+                    >
+                      Limiar Trust Boundary (Canary)
+                    </label>
+                    <span className="text-xs font-mono tabular-nums text-cyan-300">
+                      {trustThresholdDraft}/100
+                    </span>
+                  </div>
+                  <input
+                    id="trust-threshold-slider"
+                    type="range"
+                    min={20}
+                    max={100}
+                    step={5}
+                    value={trustThresholdDraft}
+                    onChange={(e) => setTrustThresholdDraft(Number(e.target.value))}
+                    onMouseUp={() => {
+                      if (trustThresholdDraft !== (store.settings.trustThreshold ?? 70)) {
+                        handleUpdateSettings(
+                          { trustThreshold: trustThresholdDraft },
+                          `Limiar Trust Boundary ajustado para ${trustThresholdDraft}/100`
+                        );
+                      }
+                    }}
+                    onTouchEnd={() => {
+                      if (trustThresholdDraft !== (store.settings.trustThreshold ?? 70)) {
+                        handleUpdateSettings(
+                          { trustThreshold: trustThresholdDraft },
+                          `Limiar Trust Boundary ajustado para ${trustThresholdDraft}/100`
+                        );
+                      }
+                    }}
+                    onKeyUp={() => {
+                      if (trustThresholdDraft !== (store.settings.trustThreshold ?? 70)) {
+                        handleUpdateSettings(
+                          { trustThreshold: trustThresholdDraft },
+                          `Limiar Trust Boundary ajustado para ${trustThresholdDraft}/100`
+                        );
+                      }
+                    }}
+                    className="w-full accent-cyan-400 cursor-pointer"
+                  />
+                  <p className="text-[11px] text-slate-400 leading-relaxed">
+                    Valores mais baixos (ex.: 45) intercetam paráfrases subtis; comandos com
+                    operadores shell (<code className="font-mono text-slate-200">;</code>,{' '}
+                    <code className="font-mono text-slate-200">|</code>,{' '}
+                    <code className="font-mono text-slate-200">$()</code>) exigem sempre aprovação
+                    explícita na Inbox de Autoridade, independentemente deste limiar.
+                  </p>
+                </div>
+
+                <div className="pt-3 border-t border-slate-800/80 space-y-1.5 text-xs">
+                  <p className="font-semibold text-slate-200">
+                    Proveniência de Dados (
+                    <code className="font-mono text-cyan-300">
+                      SEED_MODE={store.seedMode || 'demo'}
+                    </code>
+                    )
+                  </p>
+                  <p className="text-[11px] text-slate-400 leading-relaxed tabular-nums">
+                    Registos marcados como <span className="text-slate-200">Demo</span> servem
+                    apenas para exploração inicial e não inflacionam poupança de tokens nem
+                    contratos HTTP por verificar. Ao ativar o{' '}
+                    <span className="text-slate-200">Modo Real</span>, todas as execuções
+                    estáticas de enxame e memórias de exemplo são purgadas.
+                  </p>
+                </div>
+              </div>
             </div>
           </section>
         </div>

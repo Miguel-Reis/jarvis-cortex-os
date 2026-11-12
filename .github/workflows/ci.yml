@@ -1,0 +1,49 @@
+name: J.A.R.V.I.S. Cortex OS CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  verify:
+    name: Typecheck, Unit/Route Tests & Build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js >=22.6
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22.x'
+          cache: 'npm'
+
+      - name: Setup Python 3.12 (Sidecar & Stdlib Core)
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: TypeScript Strict Check (tsc --noEmit)
+        run: npm run lint
+
+      - name: TypeScript Math, Persistence & Security Gate Tests
+        run: npm run test:ts
+
+      - name: Python Stdlib Sidecar & Core Suite
+        run: python -m unittest discover -s tests -v
+
+      - name: System Health Doctor (--doctor)
+        run: npm run doctor
+
+      - name: Production Frontend Bundle (Vite Build)
+        run: npm run build

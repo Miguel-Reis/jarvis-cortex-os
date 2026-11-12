@@ -78,6 +78,9 @@ export type ProjectActivityLogKind =
   | 'SCREEN_VISION'
   | 'VOICE_LIVE'
   | 'AUDIO_TRANSCRIBE'
+  | 'ARTIFACT_GENERATED'
+  | 'WEB_RESEARCH'
+  | 'BLUEPRINT_EXPORTED'
   | 'SYSTEM_STEP';
 
 export interface ProjectActivityLogEntry {
@@ -109,11 +112,81 @@ export interface ScreenCaptureSnapshot {
   visionSummary?: string;
 }
 
+export type ArtifactKind = 'HTML_PREVIEW' | 'SVG_DIAGRAM' | 'MARKDOWN_DOC' | 'CODE_MODULE';
+
+export interface ArtifactVersion {
+  version: number;
+  content: string;
+  summary: string;
+  createdAt: string;
+  author: string;
+}
+
+export interface ProjectArtifact {
+  id: string;
+  projectId: string;
+  chatId?: string;
+  title: string;
+  kind: ArtifactKind;
+  language?: string;
+  currentVersion: number;
+  versions: ArtifactVersion[];
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface GroundingSourceItem {
+  title: string;
+  uri: string;
+}
+
+export interface NormalizedScreenRegion {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
+
+export interface ProjectBlueprintBundle {
+  projectName: string;
+  generatedAt: string;
+  prdMd: string;
+  architectureMd: string;
+  tasksMd: string;
+  agentsMd: string;
+  bundleMd: string;
+}
+
 export interface StudioInlineEvent {
-  type: 'GOAL' | 'AGENT' | 'SKILL' | 'MCP' | 'SCREEN' | 'VOICE';
+  type: 'GOAL' | 'AGENT' | 'SKILL' | 'MCP' | 'SCREEN' | 'VOICE' | 'ARTIFACT' | 'WEB';
   id: string;
   title: string;
   subtitle?: string;
+}
+
+export type DataOriginSource = 'SEED' | 'REAL';
+export type SeedMode = 'demo' | 'real';
+
+export interface DoctorCheckItem {
+  id: string;
+  category: 'RUNTIME' | 'SECURITY' | 'STORAGE' | 'PROVIDERS' | 'SIDECAR';
+  label: string;
+  status: 'PASS' | 'WARN' | 'FAIL';
+  detail: string;
+}
+
+export interface DoctorReport {
+  checkedAt: string;
+  healthy: boolean;
+  nodeVersion: string;
+  storageEngine: string;
+  schemaVersion: number;
+  seedMode: SeedMode;
+  bindHost: string;
+  authRequired: boolean;
+  tokenConfigured: boolean;
+  corsOrigin: string;
+  checks: DoctorCheckItem[];
 }
 
 export interface TodayContractItem {
@@ -125,6 +198,7 @@ export interface TodayContractItem {
   evidenceHash?: string;
   lastCheckedAt?: string;
   outputSummary?: string;
+  source?: DataOriginSource;
 }
 
 export interface Q18Candidate {
@@ -256,6 +330,7 @@ export interface ChatMessage {
   engineUsed?: string;
   screenIncluded?: boolean;
   studioEvents?: StudioInlineEvent[];
+  groundingSources?: GroundingSourceItem[];
   attachments?: AttachmentItem[];
   toolCalls?: ToolCallRecord[];
   jevRoute?: JevRouteDecision;
@@ -313,6 +388,7 @@ export interface WorkflowRun {
   pendingApprovalId?: string;
   autoHealSandboxId?: string;
   autoHealSummary?: string;
+  source?: DataOriginSource;
 }
 
 export interface HeartbeatAlert {
@@ -358,6 +434,7 @@ export interface MemoryItem {
   validFrom?: string;
   validUntil?: string | null;
   supersededBy?: string | null;
+  source?: DataOriginSource;
 }
 
 export interface MemoryRankedHit {
@@ -657,6 +734,7 @@ export interface SwarmTask {
   verify1?: SwarmVerifyGateResult; // AST & Blast Radius Gate
   verify2?: SwarmVerifyGateResult; // Unit Test & AI-Defence Secret Gate
   durationMs: number;
+  source?: DataOriginSource;
 }
 
 export interface SwarmRun {
@@ -672,6 +750,7 @@ export interface SwarmRun {
   verifyGatesTotal: number;
   sandboxId?: string;
   tasks: SwarmTask[];
+  source?: DataOriginSource;
 }
 
 export interface SandboxFileSnapshot {
@@ -832,6 +911,7 @@ export interface QuotaTelemetry5h {
     microTickTokens: number;
     toolPruningTokens: number;
   };
+  source?: DataOriginSource;
 }
 
 export interface BrainLiveStatus {
@@ -870,6 +950,8 @@ export interface AppSettings {
   proactiveGlobalEnabled?: boolean;
   proactiveCadenceSec?: number;
   sidecarDirectControlEnabled?: boolean;
+  trustThreshold?: number;
+  seedMode?: SeedMode;
 }
 
 export type McpTransportType = 'HTTP_STREAMABLE' | 'SSE' | 'STDIO';
@@ -988,12 +1070,15 @@ export interface McpStandardLibraryItem {
 }
 
 export interface JarvisStoreData {
+  schemaVersion?: number;
+  seedMode?: SeedMode;
   settings: AppSettings;
   projects?: ProjectWorkspace[];
   activeProjectId?: string;
   chatThreads?: ChatThread[];
   activeChatId?: string;
   projectActivityLogs?: ProjectActivityLogEntry[];
+  projectArtifacts?: ProjectArtifact[];
   latestScreenSnapshot?: ScreenCaptureSnapshot | null;
   goals: GoalItem[];
   contracts: TodayContractItem[];

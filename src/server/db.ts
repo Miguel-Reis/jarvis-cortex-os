@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
@@ -20,7 +21,9 @@ import type {
   MemoryItem,
   PluginItem,
   ProjectActivityLogEntry,
+  ProjectArtifact,
   ProjectWorkspace,
+  SeedMode,
   SwarmLane,
   SwarmTask,
 } from '../shared/types.ts';
@@ -28,8 +31,55 @@ import { debugLog } from './debug-logger.ts';
 
 const require = createRequire(import.meta.url);
 
+export const CURRENT_SCHEMA_VERSION = 4;
+
+export const STORE_COLLECTION_KEYS: ReadonlyArray<keyof JarvisStoreData> = [
+  'schemaVersion',
+  'seedMode',
+  'settings',
+  'projects',
+  'activeProjectId',
+  'chatThreads',
+  'activeChatId',
+  'projectActivityLogs',
+  'projectArtifacts',
+  'latestScreenSnapshot',
+  'goals',
+  'contracts',
+  'candidates',
+  'decisions',
+  'routineCues',
+  'rooms',
+  'messages',
+  'workflows',
+  'workflowRuns',
+  'heartbeat',
+  'memories',
+  'graphEdges',
+  'skills',
+  'plugins',
+  'sidecarCommandQueue',
+  'channels',
+  'devices',
+  'enrollmentTokens',
+  'approvals',
+  'auditLogs',
+  'swarmRuns',
+  'sandboxes',
+  'dotsTasks',
+  'handoffs',
+  'fleetBroadcasts',
+  'promptForge',
+  'selfLearnQueue',
+  'quota5h',
+  'mcpRegistryTools',
+  'mcpRegistryResources',
+  'mcpServers',
+];
+
 interface SqliteStatementLike {
   get(...params: unknown[]): Record<string, unknown> | undefined;
+  all(...params: unknown[]): Array<Record<string, unknown>>;
   run(...params: unknown[]): unknown;
 }
 
@@ -39,9 +89,24 @@ interface SqliteDatabaseLike {
   close(): void;
 }
 
-const DATA_DIR = path.resolve(process.cwd(), 'data');
-const SQLITE_PATH = path.join(DATA_DIR, 'jarvis-v2.sqlite');
-const JSON_FALLBACK_PATH = path.join(DATA_DIR, 'jarvis-store.json');
+const DEFAULT_DATA_DIR = path.resolve(process.cwd(), 'data');
+
+function deepFreezeInPlace<T>(obj: T): T {
+  if (obj === null || typeof obj !== 'object' || Object.isFrozen(obj)) {
+    return obj;
+  }
+  Object.freeze(obj);
+  if (Array.isArray(obj)) {
+    for (const item of obj) {
+      deepFreezeInPlace(item);
+    }
+  } else {
+    for (const val of Object.values(obj as Record<string, unknown>)) {
+      deepFreezeInPlace(val);
+    }
+  }
+  return obj;
+}
 
 function buildInitialSwarmTasks(nowIso: string): SwarmTask[] {
   const lanes: SwarmLane[] = ['UI', 'API', 'TESTS', 'DOCS'];
@@ -82,17 +147,24 @@ function buildInitialSwarmTasks(nowIso: string): SwarmTask[] {
         verify2: {
           passed: true,
           checkedAt: nowIso,
-          summary: 'Testes verdes · 0 segredos AI-Defence',
-          evidenceHash: `v2-${lane.toLowerCase()}-${200 + i}`,
+          summary: '[DEMO SEED] Amostra sintética (não executada)',
+          evidenceHash: `seed-v2-${lane.toLowerCase()}-${200 + i}`,
         },
         durationMs: 16 + ((i * 5 + l * 3) % 28),
+        source: 'SEED',
       });
     }
   }
   return tasks;
 }
 
-function buildInitialSeed(): JarvisStoreData {
+export function buildInitialSeed(explicitSeedMode?: SeedMode): JarvisStoreData {
+  const resolvedSeedMode: SeedMode =
+    explicitSeedMode ?? (process.env.SEED_MODE?.toLowerCase() === 'real' ? 'real' : 'demo');
+  const defaultTrustThreshold = Math.max(
+    20,
+    Math.min(100, Number(process.env.JARVIS_TRUST_THRESHOLD || 70) || 70)
+  );
   const nowIso = new Date().toISOString();
   const yesterdayIso = new Date(Date.now() - 86_400_000).toISOString();
   const osType: 'WINDOWS' | 'LINUX' | 'MACOS' =
@@ -285,11 +357,12 @@ function buildInitialSeed(): JarvisStoreData {
     },
   ];
 
-  const memories = rawMemories.map((m) => ({
+  const memories: MemoryItem[] = rawMemories.map((m) => ({
     ...m,
     lastAccessedAt: m.updatedAt,
     simHash: computeSimHash128(`${m.topic} ${m.content}`),
     bq128Hex: computeBinaryQuantization128(`${m.topic} ${m.content}`),
+    source: 'SEED' as const,
   }));
 
   const graphEdges = [
@@ -562,19 +635,164 @@ function buildInitialSeed(): JarvisStoreData {
     },
   ];
 
+  const seedArtifacts: ProjectArtifact[] = [
+    {
+      id: 'art-web-landing-01',
+      projectId: 'proj-website-studio',
+      chatId: 'chat-web-main',
+      title: 'Hero & Tabela de Preços SaaS Interativa',
+      kind: 'HTML_PREVIEW',
+      language: 'html',
+      currentVersion: 2,
+      createdAt: nowIso,
+      updatedAt: nowIso,
+      versions: [
+        {
+          version: 1,
+          author: 'STUDIO-UI-01',
+          createdAt: nowIso,
+          summary: 'Estrutura Hero inicial minimalista com CTA primário.',
+          content: `<!DOCTYPE html>
+<html lang="pt-PT">
+<head>
+  <meta charset="UTF-8" />
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-[#0b0d11] text-slate-100 font-sans p-6">
+  <div class="max-w-lg mx-auto space-y-4">
+    <span class="text-xs font-mono text-amber-400">VERSÃO 1 · HERO BASE</span>
+    <h1 class="text-2xl font-bold tracking-tight">Automatiza operações B2B num único workspace.</h1>
+    <p class="text-sm text-slate-400">Registo rápido com OAuth e métricas de conversão em tempo real.</p>
+    <button class="px-4 py-2 rounded-lg bg-amber-400 text-slate-950 text-xs font-semibold">Criar Conta Gratuita</button>
+  </div>
+</body>
+</html>`,
+        },
+        {
+          version: 2,
+          author: 'JARVIS',
+          createdAt: nowIso,
+          summary: 'Adicionado seletor interativo Mensal / Anual (-20%) e cartões comparativos.',
+          content: `<!DOCTYPE html>
+<html lang="pt-PT">
+<head>
+  <meta charset="UTF-8" />
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-[#0b0d11] text-slate-100 font-sans antialiased p-5">
+  <div class="max-w-xl mx-auto space-y-5">
+    <div class="flex items-center justify-between border-b border-white/10 pb-3.5">
+      <div>
+        <p class="text-[11px] font-mono uppercase tracking-wider text-amber-400">SaaS Studio · v2 Live</p>
+        <h1 class="text-lg font-bold tracking-tight">Planos Transparentes &amp; Escaláveis</h1>
+      </div>
+      <button id="togglePlan" class="px-3 py-1.5 rounded-lg bg-[#171c28] border border-white/15 hover:border-amber-400/50 text-xs font-medium transition">
+        Ciclo: <span id="cycleText" class="text-amber-300 font-semibold">Mensal</span>
+      </button>
+    </div>
+    <div class="grid grid-cols-2 gap-3">
+      <div class="p-4 rounded-xl bg-[#131720] border border-white/10 space-y-2.5">
+        <p class="text-xs font-semibold text-slate-300">Starter Equipa</p>
+        <p class="text-2xl font-bold tabular-nums"><span id="p1">24€</span><span class="text-xs text-slate-400 font-normal">/mês</span></p>
+        <ul class="text-[11px] text-slate-400 space-y-1">
+          <li>• Até 5 membros ativos</li>
+          <li>• Autenticação OAuth Google/GitHub</li>
+        </ul>
+        <button class="w-full py-1.5 rounded-lg bg-white/10 hover:bg-white/15 text-xs font-semibold transition">Começar Grátis</button>
+      </div>
+      <div class="p-4 rounded-xl bg-[#171e2c] border border-amber-400/45 space-y-2.5">
+        <div class="flex items-center justify-between">
+          <p class="text-xs font-semibold text-amber-300">Growth Pro</p>
+          <span class="text-[10px] font-mono text-emerald-300">POPULAR</span>
+        </div>
+        <p class="text-2xl font-bold tabular-nums"><span id="p2">59€</span><span class="text-xs text-slate-400 font-normal">/mês</span></p>
+        <ul class="text-[11px] text-slate-300 space-y-1">
+          <li>• Membros e projetos ilimitados</li>
+          <li>• Checkout Stripe + Webhooks</li>
+        </ul>
+        <button class="w-full py-1.5 rounded-lg bg-amber-400 text-slate-950 hover:bg-amber-300 text-xs font-semibold transition">Ativar Pro</button>
+      </div>
+    </div>
+  </div>
+  <script>
+    let yearly = false;
+    document.getElementById('togglePlan').addEventListener('click', () => {
+      yearly = !yearly;
+      document.getElementById('cycleText').textContent = yearly ? 'Anual (-20%)' : 'Mensal';
+      document.getElementById('p1').textContent = yearly ? '19€' : '24€';
+      document.getElementById('p2').textContent = yearly ? '47€' : '59€';
+    });
+  </script>
+</body>
+</html>`,
+        },
+      ],
+    },
+    {
+      id: 'art-web-arch-02',
+      projectId: 'proj-website-studio',
+      chatId: 'chat-web-main',
+      title: 'Diagrama Arquitetura OAuth + Stripe Webhooks',
+      kind: 'SVG_DIAGRAM',
+      language: 'svg',
+      currentVersion: 1,
+      createdAt: nowIso,
+      updatedAt: nowIso,
+      versions: [
+        {
+          version: 1,
+          author: 'JARVIS',
+          createdAt: nowIso,
+          summary: 'Fluxo completo Cliente -> API Express -> Stripe Checkout -> Base de Dados.',
+          content: `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 300" width="100%" height="100%">
+  <rect width="720" height="300" rx="14" fill="#0b0d11" />
+  <rect x="20" y="20" width="680" height="260" rx="10" fill="#12161f" stroke="#242c3d" />
+  <text x="42" y="54" fill="#f8fafc" font-family="system-ui, sans-serif" font-size="14" font-weight="700">Fluxo SaaS: Registo OAuth &amp; Subscrição Stripe</text>
+  <rect x="42" y="96" width="175" height="125" rx="10" fill="#171d29" stroke="#e59a54" stroke-width="1.5" />
+  <text x="60" y="128" fill="#e59a54" font-family="monospace" font-size="10" font-weight="700">1. CLIENTE REACT</text>
+  <text x="60" y="152" fill="#f1f5f9" font-family="system-ui, sans-serif" font-size="12" font-weight="600">Landing &amp; Painel</text>
+  <text x="60" y="174" fill="#94a3b8" font-family="system-ui, sans-serif" font-size="11">Sessão JWT Segura</text>
+  <line x1="217" y1="158" x2="270" y2="158" stroke="#e59a54" stroke-width="2" />
+  <polygon points="270,158 262,153 262,163" fill="#e59a54" />
+  <rect x="272" y="96" width="175" height="125" rx="10" fill="#171d29" stroke="#8ea6ff" stroke-width="1.5" />
+  <text x="290" y="128" fill="#8ea6ff" font-family="monospace" font-size="10" font-weight="700">2. API NODE/TS</text>
+  <text x="290" y="152" fill="#f1f5f9" font-family="system-ui, sans-serif" font-size="12" font-weight="600">Checkout &amp; Auth</text>
+  <text x="290" y="174" fill="#94a3b8" font-family="system-ui, sans-serif" font-size="11">Assinatura HMAC</text>
+  <line x1="447" y1="158" x2="500" y2="158" stroke="#34d399" stroke-width="2" />
+  <polygon points="500,158 492,153 492,163" fill="#34d399" />
+  <rect x="502" y="96" width="175" height="125" rx="10" fill="#171d29" stroke="#34d399" stroke-width="1.5" />
+  <text x="520" y="128" fill="#34d399" font-family="monospace" font-size="10" font-weight="700">3. STRIPE + DB</text>
+  <text x="520" y="152" fill="#f1f5f9" font-family="system-ui, sans-serif" font-size="12" font-weight="600">Webhook Ativo</text>
+  <text x="520" y="174" fill="#94a3b8" font-family="system-ui, sans-serif" font-size="11">Quota &amp; Faturação</text>
+</svg>`,
+        },
+      ],
+    },
+  ];
+
   const seedPlugins: PluginItem[] = CORTEX_PLUGINS_CATALOG.map((p, idx) => ({
     ...p,
     invocationsCount: p.enabled ? 12 + idx * 5 : 0,
     lastTriggeredAt: p.enabled ? nowIso : undefined,
   }));
 
+  const hudBatPath = path.resolve(process.cwd(), 'JarvisHUD.bat');
+  const hudBatExists = fs.existsSync(hudBatPath);
+  const hudBatRealSha256 = hudBatExists
+    ? crypto.createHash('sha256').update(fs.readFileSync(hudBatPath)).digest('hex').slice(0, 16)
+    : undefined;
+
   return {
+    schemaVersion: CURRENT_SCHEMA_VERSION,
+    seedMode: resolvedSeedMode,
     settings: {
       operatorName: 'Comandante',
       organizationName: 'Jarvis Studio',
       language: 'pt-PT',
       personalityMode: 'STARK_EXECUTIVE',
       autonomyLevel: 'BALANCED_PROACTIVE',
+      trustThreshold: defaultTrustThreshold,
+      seedMode: resolvedSeedMode,
       modelProvider: 'GEMINI_STUDIO',
       preferredGeminiModel: 'gemini-3.8-flash',
       ollamaEndpoint: 'http://127.0.0.1:11434',
@@ -605,6 +823,7 @@ function buildInitialSeed(): JarvisStoreData {
     chatThreads: seedChatThreads,
     activeChatId: 'chat-web-main',
     projectActivityLogs: seedActivityLogs,
+    projectArtifacts: seedArtifacts,
     latestScreenSnapshot: null,
     goals: [
       {
@@ -688,26 +907,28 @@ function buildInitialSeed(): JarvisStoreData {
         verificationRule: 'TEST_PASS',
         verificationTarget: 'python3 -m unittest discover -s tests -v',
         status: 'PENDING',
+        source: 'SEED',
       },
       {
         id: 'contract-02',
         title: 'Confirmar Integridade dos Launchers Locais (Windows & Linux)',
         verificationRule: 'FILE_EXISTS',
         verificationTarget: 'JarvisHUD.bat',
-        status: 'VERIFIED',
-        evidenceHash: 'a94f82e1c30d77b4',
-        lastCheckedAt: nowIso,
-        outputSummary: 'Ficheiro JarvisHUD.bat verificado na raiz do workspace.',
+        status: hudBatExists ? 'VERIFIED' : 'PENDING',
+        evidenceHash: hudBatRealSha256,
+        lastCheckedAt: hudBatExists ? nowIso : undefined,
+        outputSummary: hudBatExists
+          ? `SHA-256 real (${hudBatRealSha256}) calculado do conteúdo de JarvisHUD.bat.`
+          : undefined,
+        source: hudBatExists ? 'REAL' : 'SEED',
       },
       {
         id: 'contract-03',
         title: 'Verificar Sonda HTTP /api/health do Gateway v3.0',
         verificationRule: 'HTTP_CHECK',
         verificationTarget: '/api/health',
-        status: 'VERIFIED',
-        evidenceHash: 'f31d9902b8e411ca',
-        lastCheckedAt: nowIso,
-        outputSummary: 'Endpoint /api/health operacional com latência <3ms.',
+        status: 'PENDING',
+        source: 'SEED',
       },
       {
         id: 'contract-04',
@@ -715,6 +936,7 @@ function buildInitialSeed(): JarvisStoreData {
         verificationRule: 'EXEC_SIGN',
         verificationTarget: 'TRUST_BOUNDARY_AUDIT_V3',
         status: 'PENDING',
+        source: 'SEED',
       },
     ],
     candidates: [
@@ -1134,56 +1356,42 @@ function buildInitialSeed(): JarvisStoreData {
         ],
       },
     ],
-    workflowRuns: [
-      {
-        id: 'run-seed-01',
-        workflowId: 'wf-morning-ci',
-        workflowName: 'Auditoria Matinal CI & Git',
-        triggerSource: 'CRON',
-        status: 'SUCCESS',
-        startedAt: nowIso,
-        finishedAt: nowIso,
-        totalDurationMs: 142,
-        steps: [
-          {
-            nodeId: 'n1',
-            nodeLabel: 'Cron Diário (09:00)',
-            nodeType: 'trigger',
-            status: 'SUCCESS',
-            output: 'Disparo agendado iniciado.',
-            durationMs: 2,
-            startedAt: nowIso,
-          },
-          {
-            nodeId: 'n2',
-            nodeLabel: 'Testes Unitários Core',
-            nodeType: 'shell',
-            status: 'SUCCESS',
-            output: 'Ran 15 tests in 0.08s — OK',
-            durationMs: 85,
-            startedAt: nowIso,
-          },
-          {
-            nodeId: 'n3',
-            nodeLabel: 'Estado do Repositório Git',
-            nodeType: 'shell',
-            status: 'SUCCESS',
-            output: 'Working tree inspecionada com sucesso.',
-            durationMs: 24,
-            startedAt: nowIso,
-          },
-          {
-            nodeId: 'n4',
-            nodeLabel: 'Síntese Executiva CI',
-            nodeType: 'ai',
-            status: 'SUCCESS',
-            output: 'Suite Python 100% íntegra e workspace pronto para operação.',
-            durationMs: 31,
-            startedAt: nowIso,
-          },
-        ],
-      },
-    ],
+    workflowRuns:
+      resolvedSeedMode === 'real'
+        ? []
+        : [
+            {
+              id: 'run-seed-01',
+              workflowId: 'wf-morning-ci',
+              workflowName: 'Auditoria Matinal CI & Git (Demo Seed)',
+              triggerSource: 'CRON',
+              status: 'SUCCESS',
+              startedAt: nowIso,
+              finishedAt: nowIso,
+              totalDurationMs: 142,
+              source: 'SEED',
+              steps: [
+                {
+                  nodeId: 'n1',
+                  nodeLabel: 'Cron Diário (09:00)',
+                  nodeType: 'trigger',
+                  status: 'SUCCESS',
+                  output: '[DEMO SEED] Disparo demonstrativo.',
+                  durationMs: 2,
+                  startedAt: nowIso,
+                },
+                {
+                  nodeId: 'n2',
+                  nodeLabel: 'Testes Unitários Core',
+                  nodeType: 'shell',
+                  status: 'SUCCESS',
+                  output: '[DEMO SEED] Amostra ilustrativa — execute o workflow para resultado real.',
+                  durationMs: 85,
+                  startedAt: nowIso,
+                },
+              ],
+            },
+          ],
     heartbeat: {
       enabled: true,
       intervalSeconds: 60,
@@ -1358,23 +1566,27 @@ function buildInitialSeed(): JarvisStoreData {
         status: 'VERIFIED',
       },
     ],
-    // v3.0 Seeded Swarm 48x + Orbit Agent OS Collections
-    swarmRuns: [
-      {
-        id: 'swarm-seed-48x',
-        objective: 'Verificação Integral da Arquitetura J.A.R.V.I.S. Cortex OS v3.0',
-        scale: 48,
-        status: 'VERIFIED',
-        startedAt: nowIso,
-        finishedAt: nowIso,
-        scoutSummary:
-          '[SCOUT_SHARED_MAP] Workspace indexado uma única vez por SCOUT-01 (-85% leituras redundantes) e partilhado pelas 4 lanes.',
-        rufloConvergence: 0.962,
-        verifyGatesPassed: 96,
-        verifyGatesTotal: 96,
-        tasks: seedSwarmTasks,
-      },
-    ],
+    // v4.0 Seeded Swarm 48x + Orbit Agent OS Collections (honest SEED tagging & SEED_MODE=real support)
+    swarmRuns:
+      resolvedSeedMode === 'real'
+        ? []
+        : [
+            {
+              id: 'swarm-seed-48x',
+              objective: '[DEMO SEED] Amostra Demonstrativa Swarm 48x (Despache para Verificação Real)',
+              scale: 48,
+              status: 'VERIFIED',
+              startedAt: nowIso,
+              finishedAt: nowIso,
+              scoutSummary:
+                '[DEMO SEED] Amostra estática de demonstração — clique em Despachar Swarm para indexação AST e execução real da suite.',
+              rufloConvergence: 0.962,
+              verifyGatesPassed: 96,
+              verifyGatesTotal: 96,
+              tasks: seedSwarmTasks,
+              source: 'SEED',
+            },
+          ],
     sandboxes: [],
     dotsTasks: [
       {
@@ -1444,7 +1656,7 @@ function buildInitialSeed(): JarvisStoreData {
         authorityLevel: 'ORCHESTRATOR',
         taskRef: '.dots/jev-s1-reflex-router',
         contextToon: compressFactTelegraphic(
-          'Mapa AST extraído com sucesso; acoplamento elevado entre server.ts e src/server/db.ts.'
+          'Mapa AST extraído com sucesso; routers Express desacoplados e SQLite WAL v4 por coleção ativo.'
         ),
         status: 'ACCEPTED',
       },
@@ -1525,18 +1737,19 @@ function buildInitialSeed(): JarvisStoreData {
     quota5h: {
       windowHours: 5,
       budgetTokens5h: 250_000,
-      consumedTokens5h: 14_820,
-      savedByDietTokens5h: 98_460,
-      promptsRouted5h: 19,
-      microTicks5h: 5,
+      consumedTokens5h: 0,
+      savedByDietTokens5h: 0,
+      promptsRouted5h: 0,
+      microTicks5h: 0,
       verifyGatePassRate: 100,
-      estimatedHoursSaved: 4.6,
+      estimatedHoursSaved: 0,
+      source: 'REAL',
       stageSavings: {
-        deltaCacheTokens: 28_400,
-        toonCompressionTokens: 16_920,
-        scoutMapTokens: 24_100,
-        microTickTokens: 9_840,
-        toolPruningTokens: 19_200,
+        deltaCacheTokens: 0,
+        toonCompressionTokens: 0,
+        scoutMapTokens: 0,
+        microTickTokens: 0,
+        toolPruningTokens: 0,
       },
     },
     mcpRegistryTools: buildDefaultMcpRegistryTools(nowIso),
@@ -1545,42 +1758,72 @@ function buildInitialSeed(): JarvisStoreData {
   };
 }
 
-function ensureV3Migration(state: JarvisStoreData, seed: JarvisStoreData): JarvisStoreData {
+/**
+ * Versioned schema migration (v1/v2/v3 -> v4).
+ * Runs ONLY when `(state.schemaVersion ?? 0) < CURRENT_SCHEMA_VERSION`, NEVER on reads.
+ * When `options.isBackupImport === true`, exact user collections are preserved without injecting demo seeds.
+ */
+export function migrateStoreToV4(
+  state: Partial<JarvisStoreData>,
+  seed: JarvisStoreData,
+  options: { isBackupImport?: boolean } = {}
+): JarvisStoreData {
+  const isImport = Boolean(options.isBackupImport);
   const nowIso = new Date().toISOString();
-  const migratedMemories: MemoryItem[] = (state.memories || seed.memories).map((m) => ({
+
+  const sourceMemories = Array.isArray(state.memories)
+    ? state.memories
+    : isImport
+      ? []
+      : seed.memories;
+
+  const migratedMemories: MemoryItem[] = sourceMemories.map((m) => ({
     ...m,
     tier: m.tier || (m.pinned ? 'SEMANTIC' : 'EPISODIC'),
     bq128Hex: m.bq128Hex || computeBinaryQuantization128(`${m.topic} ${m.content}`),
+    simHash: m.simHash || computeSimHash128(`${m.topic} ${m.content}`),
     accessCount: m.accessCount ?? 2,
     lastAccessedAt: m.lastAccessedAt || m.updatedAt || nowIso,
     importance: m.importance ?? (m.pinned ? 5 : 3),
     validFrom: m.validFrom || m.createdAt || nowIso,
     validUntil: m.validUntil ?? null,
     supersededBy: m.supersededBy ?? null,
+    source: m.source || 'REAL',
   }));
 
-  // Ensure at least 1 superseded bi-temporal example exists so Bi-Temporal toggle immediately showcases history
-  if (!migratedMemories.some((m) => Boolean(m.supersededBy))) {
+  // Only inject bi-temporal demo item during legacy upgrades in demo mode — NEVER on backup imports!
+  if (
+    !isImport &&
+    seed.seedMode !== 'real' &&
+    !migratedMemories.some((m) => Boolean(m.supersededBy))
+  ) {
     const legacyExample = seed.memories.find((m) => m.id === 'mem-superseded-09');
     if (legacyExample) migratedMemories.push(legacyExample);
   }
 
-  const existingRooms = state.rooms && state.rooms.length > 0 ? [...state.rooms] : [...seed.rooms];
-  for (const requiredId of ['room-sidecar', 'room-ui-web', 'room-mobile-arch']) {
-    if (!existingRooms.some((r) => r.id === requiredId)) {
-      const seedRoom = seed.rooms.find((r) => r.id === requiredId);
-      if (seedRoom) existingRooms.push(seedRoom);
+  const existingRooms =
+    Array.isArray(state.rooms) && (isImport || state.rooms.length > 0)
+      ? [...state.rooms]
+      : [...seed.rooms];
+  if (!isImport) {
+    for (const requiredId of ['room-sidecar', 'room-ui-web', 'room-mobile-arch']) {
+      if (!existingRooms.some((r) => r.id === requiredId)) {
+        const seedRoom = seed.rooms.find((r) => r.id === requiredId);
+        if (seedRoom) existingRooms.push(seedRoom);
+      }
     }
   }
 
-  let migratedProjects: ProjectWorkspace[] =
-    state.projects && state.projects.length > 0 ? [...state.projects] : [...(seed.projects || [])];
+  let migratedProjects: ProjectWorkspace[] = Array.isArray(state.projects)
+    ? [...state.projects]
+    : [...(seed.projects || [])];
 
-  const isFirstStudioUpgrade = !Array.isArray(state.chatThreads) || state.chatThreads.length === 0;
+  const isFirstStudioUpgrade =
+    !isImport && (!Array.isArray(state.chatThreads) || state.chatThreads.length === 0);
   if (isFirstStudioUpgrade && seed.projects) {
-    for (const ideaSeed of seed.projects.filter(
-      (p) => p.id === 'proj-website-studio' || p.id === 'proj-mobile-app'
-    ).reverse()) {
+    for (const ideaSeed of seed.projects
+      .filter((p) => p.id === 'proj-website-studio' || p.id === 'proj-mobile-app')
+      .reverse()) {
       if (!migratedProjects.some((p) => p.id === ideaSeed.id)) {
         migratedProjects.unshift(ideaSeed);
       }
@@ -1603,77 +1846,86 @@ function ensureV3Migration(state: JarvisStoreData, seed: JarvisStoreData): Jarvi
         : ['skill-01', 'skill-02'],
   }));
 
-  let migratedChats: ChatThread[] =
-    state.chatThreads && state.chatThreads.length > 0
-      ? [...state.chatThreads]
-      : [...(seed.chatThreads || [])];
+  const migratedChats: ChatThread[] = Array.isArray(state.chatThreads)
+    ? [...state.chatThreads]
+    : [...(seed.chatThreads || [])];
 
-  // Ensure every project has at least 1 chat thread
-  for (const proj of migratedProjects) {
-    let projChats = migratedChats.filter((c) => c.projectId === proj.id);
-    if (projChats.length === 0) {
-      const createdThread: ChatThread = {
-        id: proj.defaultChatId || `chat-${proj.id}-main`,
-        projectId: proj.id,
-        title: `Conversa Principal · ${proj.name}`,
-        createdAt: nowIso,
-        updatedAt: nowIso,
-        primaryAgentId: proj.assignedAgentIds?.[0] || 'room-exec',
-        participatingAgentIds: proj.assignedAgentIds?.length ? proj.assignedAgentIds : ['room-exec'],
-        screenAutoSendEnabled: true,
+  if (!isImport) {
+    for (const proj of migratedProjects) {
+      let projChats = migratedChats.filter((c) => c.projectId === proj.id);
+      if (projChats.length === 0) {
+        const createdThread: ChatThread = {
+          id: proj.defaultChatId || `chat-${proj.id}-main`,
+          projectId: proj.id,
+          title: `Conversa Principal · ${proj.name}`,
+          createdAt: nowIso,
+          updatedAt: nowIso,
+          primaryAgentId: proj.assignedAgentIds?.[0] || 'room-exec',
+          participatingAgentIds: proj.assignedAgentIds?.length
+            ? proj.assignedAgentIds
+            : ['room-exec'],
+          screenAutoSendEnabled: true,
+        };
+        migratedChats.push(createdThread);
+        projChats = [createdThread];
+      }
+      if (!proj.defaultChatId) {
+        proj.defaultChatId = projChats[0].id;
+      }
+    }
+  }
+
+  const migratedMessages = Array.isArray(state.messages)
+    ? [...state.messages]
+    : [...seed.messages];
+
+  const migratedGoals: GoalItem[] = (
+    Array.isArray(state.goals) ? state.goals : seed.goals
+  ).map((g) => ({
+    ...g,
+    projectId: g.projectId || 'proj-jarvis-core',
+    subtasks:
+      Array.isArray(g.subtasks) && g.subtasks.length > 0
+        ? g.subtasks
+        : [
+            {
+              id: `st-${g.id}-1`,
+              title: g.targetMetric || 'Validar critério principal do objetivo',
+              done: g.progress >= 80,
+            },
+          ],
+  }));
+
+  // Upgrade legacy fabricated contract-02/contract-03 hashes when migrating pre-v4 stores
+  const rawContracts = Array.isArray(state.contracts) ? state.contracts : seed.contracts;
+  const migratedContracts = rawContracts.map((c) => {
+    if (!isImport && c.id === 'contract-03' && c.evidenceHash === 'f31d9902b8e411ca') {
+      return {
+        ...c,
+        status: 'PENDING' as const,
+        evidenceHash: undefined,
+        lastCheckedAt: undefined,
+        outputSummary: undefined,
+        source: 'SEED' as const,
       };
-      migratedChats.push(createdThread);
-      projChats = [createdThread];
     }
-    if (!proj.defaultChatId) {
-      proj.defaultChatId = projChats[0].id;
+    if (!isImport && c.id === 'contract-02' && c.evidenceHash === 'a94f82e1c30d77b4') {
+      const seedC2 = seed.contracts.find((sc) => sc.id === 'contract-02');
+      if (seedC2) return { ...seedC2 };
     }
-  }
+    return c;
+  });
 
-  const migratedMessages =
-    state.messages && state.messages.length > 0 ? [...state.messages] : [...seed.messages];
-  if (isFirstStudioUpgrade) {
-    for (const seedMsg of seed.messages) {
-      if (seedMsg.chatId && !migratedMessages.some((m) => m.id === seedMsg.id)) {
-        migratedMessages.push(seedMsg);
-      }
-    }
-  }
-
-  let migratedGoals: GoalItem[] = (state.goals && state.goals.length > 0 ? state.goals : seed.goals).map(
-    (g) => ({
-      ...g,
-      projectId: g.projectId || 'proj-jarvis-core',
-      subtasks:
-        Array.isArray(g.subtasks) && g.subtasks.length > 0
-          ? g.subtasks
-          : [
-              {
-                id: `st-${g.id}-1`,
-                title: g.targetMetric || 'Validar critério principal do objetivo',
-                done: g.progress >= 80,
-              },
-            ],
-    })
-  );
-
-  if (isFirstStudioUpgrade) {
-    for (const sg of seed.goals) {
-      if (
-        (sg.projectId === 'proj-website-studio' || sg.projectId === 'proj-mobile-app') &&
-        !migratedGoals.some((g) => g.id === sg.id)
-      ) {
-        migratedGoals = [sg, ...migratedGoals];
-      }
-    }
-  }
+  // Upgrade legacy fabricated quota5h (98_460 fake saved tokens) on pre-v4 upgrade
+  const migratedQuota =
+    !isImport && state.quota5h?.savedByDietTokens5h === 98_460
+      ? seed.quota5h
+      : (state.quota5h ?? seed.quota5h);
 
   const resolvedActiveProjectId =
-    (isFirstStudioUpgrade
-      ? 'proj-website-studio'
-      : state.activeProjectId && migratedProjects.some((p) => p.id === state.activeProjectId)
-        ? state.activeProjectId
-        : migratedProjects[0]?.id) || 'proj-website-studio';
+    (state.activeProjectId && migratedProjects.some((p) => p.id === state.activeProjectId)
+      ? state.activeProjectId
+      : migratedProjects[0]?.id) || 'proj-website-studio';
 
   const activeProjChats = migratedChats.filter((c) => c.projectId === resolvedActiveProjectId);
   const resolvedActiveChatId =
@@ -1681,74 +1933,139 @@ function ensureV3Migration(state: JarvisStoreData, seed: JarvisStoreData): Jarvi
       ? state.activeChatId
       : activeProjChats[0]?.id || migratedChats[0]?.id || 'chat-web-main';
 
-  const migratedActivityLogs: ProjectActivityLogEntry[] =
-    state.projectActivityLogs && state.projectActivityLogs.length > 0
-      ? state.projectActivityLogs
-      : seed.projectActivityLogs || [];
-
   return {
     ...seed,
     ...state,
-    settings: { ...seed.settings, ...(state.settings ?? {}) },
+    schemaVersion: CURRENT_SCHEMA_VERSION,
+    seedMode: state.seedMode ?? seed.seedMode,
+    settings: {
+      ...seed.settings,
+      ...(state.settings ?? {}),
+      trustThreshold: state.settings?.trustThreshold ?? seed.settings.trustThreshold ?? 70,
+      seedMode: state.settings?.seedMode ?? state.seedMode ?? seed.seedMode,
+    },
     projects: migratedProjects,
     activeProjectId: resolvedActiveProjectId,
     chatThreads: migratedChats,
     activeChatId: resolvedActiveChatId,
-    projectActivityLogs: migratedActivityLogs,
+    projectActivityLogs: Array.isArray(state.projectActivityLogs)
+      ? state.projectActivityLogs
+      : seed.projectActivityLogs || [],
+    projectArtifacts: Array.isArray(state.projectArtifacts)
+      ? state.projectArtifacts
+      : seed.projectArtifacts || [],
     latestScreenSnapshot: state.latestScreenSnapshot ?? null,
     goals: migratedGoals,
+    contracts: migratedContracts,
     messages: migratedMessages,
     rooms: existingRooms,
-    plugins:
-      state.plugins && state.plugins.length > 0 ? state.plugins : seed.plugins,
+    plugins: Array.isArray(state.plugins) ? state.plugins : seed.plugins,
     sidecarCommandQueue: state.sidecarCommandQueue ?? [],
     memories: migratedMemories,
-    swarmRuns: state.swarmRuns && state.swarmRuns.length > 0 ? state.swarmRuns : seed.swarmRuns,
+    graphEdges: Array.isArray(state.graphEdges) ? state.graphEdges : seed.graphEdges,
+    workflows: Array.isArray(state.workflows) ? state.workflows : seed.workflows,
+    workflowRuns: Array.isArray(state.workflowRuns) ? state.workflowRuns : seed.workflowRuns,
+    swarmRuns: Array.isArray(state.swarmRuns) ? state.swarmRuns : seed.swarmRuns,
     sandboxes: state.sandboxes ?? seed.sandboxes,
-    dotsTasks: state.dotsTasks && state.dotsTasks.length > 0 ? state.dotsTasks : seed.dotsTasks,
-    handoffs: state.handoffs && state.handoffs.length > 0 ? state.handoffs : seed.handoffs,
-    fleetBroadcasts:
-      state.fleetBroadcasts && state.fleetBroadcasts.length > 0
-        ? state.fleetBroadcasts
-        : seed.fleetBroadcasts,
-    promptForge:
-      state.promptForge && state.promptForge.length > 0 ? state.promptForge : seed.promptForge,
+    dotsTasks: Array.isArray(state.dotsTasks) ? state.dotsTasks : seed.dotsTasks,
+    handoffs: Array.isArray(state.handoffs) ? state.handoffs : seed.handoffs,
+    fleetBroadcasts: Array.isArray(state.fleetBroadcasts)
+      ? state.fleetBroadcasts
+      : seed.fleetBroadcasts,
+    promptForge: Array.isArray(state.promptForge) ? state.promptForge : seed.promptForge,
     selfLearnQueue: state.selfLearnQueue ?? seed.selfLearnQueue,
-    quota5h: state.quota5h ?? seed.quota5h,
-    mcpRegistryTools:
-      state.mcpRegistryTools && state.mcpRegistryTools.length > 0
-        ? state.mcpRegistryTools
-        : seed.mcpRegistryTools,
-    mcpRegistryResources:
-      state.mcpRegistryResources && state.mcpRegistryResources.length > 0
-        ? state.mcpRegistryResources
-        : seed.mcpRegistryResources,
-    mcpServers: (state.mcpServers ?? seed.mcpServers ?? []).map((s) => ({
-      ...s,
-      jevEligible: s.jevEligible ?? true,
-    })),
+    quota5h: migratedQuota,
+    mcpRegistryTools: Array.isArray(state.mcpRegistryTools)
+      ? state.mcpRegistryTools
+      : seed.mcpRegistryTools,
+    mcpRegistryResources: Array.isArray(state.mcpRegistryResources)
+      ? state.mcpRegistryResources
+      : seed.mcpRegistryResources,
+    mcpServers: (Array.isArray(state.mcpServers) ? state.mcpServers : seed.mcpServers ?? []).map(
+      (s) => ({
+        ...s,
+        jevEligible: s.jevEligible ?? true,
+      })
+    ),
   };
 }
 
-class JarvisDatabase {
-  private sqliteDb: SqliteDatabaseLike | null = null;
-  private storageEngine: 'node:sqlite' | 'json-transactional' = 'json-transactional';
-  private cache: JarvisStoreData;
+export interface JarvisDatabaseOptions {
+  dataDir?: string;
+  debounceMs?: number;
+  seedMode?: SeedMode;
+  freezeReads?: boolean;
+  registerShutdownHooks?: boolean;
+}
 
-  constructor() {
-    fs.mkdirSync(DATA_DIR, { recursive: true });
+export class JarvisDatabase {
+  private readonly dataDir: string;
+  private readonly sqlitePath: string;
+  private readonly jsonFallbackPath: string;
+  private readonly debounceMs: number;
+  private readonly seedMode?: SeedMode;
+  private readonly freezeReads: boolean;
+
+  private sqliteDb: SqliteDatabaseLike | null = null;
+  private selectAllV4Stmt: SqliteStatementLike | null = null;
+  private upsertV4Stmt: SqliteStatementLike | null = null;
+  private storageEngine: 'node:sqlite' | 'json-transactional' = 'json-transactional';
+
+  private cache: JarvisStoreData;
+  private frozenSnapshot: JarvisStoreData | null = null;
+  private lastKeySerialized = new Map<string, string>();
+  private dirtyPayloads = new Map<string, string>();
+  private flushTimer: ReturnType<typeof setTimeout> | null = null;
+  private isClosed = false;
+
+  constructor(options: JarvisDatabaseOptions = {}) {
+    this.dataDir = options.dataDir ?? DEFAULT_DATA_DIR;
+    this.sqlitePath = path.join(this.dataDir, 'jarvis-v2.sqlite');
+    this.jsonFallbackPath = path.join(this.dataDir, 'jarvis-store.json');
+    this.debounceMs = options.debounceMs ?? 250;
+    this.seedMode = options.seedMode;
+    this.freezeReads =
+      options.freezeReads ?? process.env.JARVIS_FREEZE_STATE === '1';
+
+    fs.mkdirSync(this.dataDir, { recursive: true });
     this.initSqliteIfAvailable();
     this.cache = this.loadOrSeed();
+
+    if (options.registerShutdownHooks !== false) {
+      const flushOnExit = () => {
+        try {
+          this.flushSync({ writeJsonMirror: true });
+        } catch {
+          // Ignore exit flush errors
+        }
+      };
+      process.once('beforeExit', flushOnExit);
+      process.once('SIGINT', () => {
+        flushOnExit();
+        process.exit(0);
+      });
+      process.once('SIGTERM', () => {
+        flushOnExit();
+        process.exit(0);
+      });
+    }
   }
 
   private initSqliteIfAvailable(): void {
     try {
-      const sqliteMod = require('node:sqlite') as { DatabaseSync?: new (p: string) => SqliteDatabaseLike };
+      const sqliteMod = require('node:sqlite') as {
+        DatabaseSync?: new (p: string) => SqliteDatabaseLike;
+      };
       if (sqliteMod && typeof sqliteMod.DatabaseSync === 'function') {
-        const dbConn = new sqliteMod.DatabaseSync(SQLITE_PATH);
+        const dbConn = new sqliteMod.DatabaseSync(this.sqlitePath);
         dbConn.exec(`
           PRAGMA journal_mode = WAL;
           PRAGMA synchronous = NORMAL;
+          CREATE TABLE IF NOT EXISTS jarvis_collections_v4 (
+            collection_key TEXT PRIMARY KEY,
+            payload_json TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+          );
           CREATE TABLE IF NOT EXISTS jarvis_kv_store (
             collection_key TEXT PRIMARY KEY,
             payload_json TEXT NOT NULL,
@@ -1756,115 +2073,317 @@ class JarvisDatabase {
           );
         `);
         this.sqliteDb = dbConn;
+        this.selectAllV4Stmt = dbConn.prepare(
+          'SELECT collection_key, payload_json FROM jarvis_collections_v4'
+        );
+        this.upsertV4Stmt = dbConn.prepare(
+          `INSERT INTO jarvis_collections_v4 (collection_key, payload_json, updated_at)
+           VALUES (?, ?, ?)
+           ON CONFLICT(collection_key) DO UPDATE SET
+             payload_json = excluded.payload_json,
+             updated_at = excluded.updated_at`
+        );
         this.storageEngine = 'node:sqlite';
-        debugLog('INFO', 'DB', 'SQLite WAL storage initialized (node:sqlite)');
+        debugLog('INFO', 'DB', 'SQLite WAL per-collection v4 storage initialized (node:sqlite)');
       }
     } catch (err) {
       this.sqliteDb = null;
       this.storageEngine = 'json-transactional';
-      debugLog('DEBUG', 'DB', `SQLite unavailable, using json-transactional mirror (${(err as Error).message})`);
+      debugLog(
+        'DEBUG',
+        'DB',
+        `SQLite unavailable, using json-transactional mirror (${(err as Error).message})`
+      );
     }
+  }
+
+  private primeAllCollectionsForPersistence(data: JarvisStoreData): void {
+    this.cache = data;
+    this.frozenSnapshot = null;
+    this.lastKeySerialized.clear();
+    this.dirtyPayloads.clear();
+    for (const key of STORE_COLLECTION_KEYS) {
+      const val = data[key];
+      const serialized = JSON.stringify(val === undefined ? null : val);
+      this.lastKeySerialized.set(key, serialized);
+      this.dirtyPayloads.set(key, serialized);
+    }
+    this.flushSync({ writeJsonMirror: true });
   }
 
   private loadOrSeed(): JarvisStoreData {
     const t0 = performance.now();
-    const seed = buildInitialSeed();
+    const seed = buildInitialSeed(this.seedMode);
 
-    if (this.sqliteDb) {
+    // 1. Fast path: per-collection SQLite WAL v4 table
+    if (this.sqliteDb && this.selectAllV4Stmt) {
       try {
-        const row = this.sqliteDb
+        const rows = this.selectAllV4Stmt.all();
+        if (rows.length > 0) {
+          const assembled: Record<string, unknown> = {};
+          for (const r of rows) {
+            const k = String(r.collection_key);
+            const rawJson = String(r.payload_json);
+            assembled[k] = JSON.parse(rawJson);
+            this.lastKeySerialized.set(k, rawJson);
+          }
+          const loadedVersion = Number(assembled.schemaVersion ?? 0);
+          if (loadedVersion >= CURRENT_SCHEMA_VERSION) {
+            const ready = { ...seed, ...(assembled as Partial<JarvisStoreData>) } as JarvisStoreData;
+            debugLog(
+              'INFO',
+              'DB',
+              `Loaded v${loadedVersion} state from ${rows.length} SQLite WAL collections (zero migration)`,
+              { durationMs: performance.now() - t0 }
+            );
+            return ready;
+          }
+          const migrated = migrateStoreToV4(assembled as Partial<JarvisStoreData>, seed);
+          this.primeAllCollectionsForPersistence(migrated);
+          return migrated;
+        }
+      } catch (err) {
+        debugLog('WARN', 'DB', `SQLite v4 collection read warning: ${(err as Error).message}`);
+      }
+
+      // 2. Legacy v2/v3 single-blob upgrade path (`jarvis_kv_store.root_state_v2`)
+      try {
+        const legacyRow = this.sqliteDb
           .prepare('SELECT payload_json FROM jarvis_kv_store WHERE collection_key = ?')
           .get('root_state_v2');
-        if (row && typeof row.payload_json === 'string') {
-          const parsed = JSON.parse(row.payload_json) as Partial<JarvisStoreData>;
-          const migrated = ensureV3Migration(parsed as JarvisStoreData, seed);
-          this.persist(migrated);
+        if (legacyRow && typeof legacyRow.payload_json === 'string') {
+          const parsed = JSON.parse(legacyRow.payload_json) as Partial<JarvisStoreData>;
+          const migrated = migrateStoreToV4(parsed, seed);
+          this.primeAllCollectionsForPersistence(migrated);
           debugLog(
             'INFO',
             'DB',
-            `Loaded & migrated state from SQLite (${migrated.memories.length} memories, ${migrated.projects?.length ?? 0} projects)`,
+            `Upgraded legacy root_state_v2 blob to v4 per-collection SQLite WAL`,
             { durationMs: performance.now() - t0 }
           );
           return migrated;
         }
       } catch (err) {
-        debugLog('WARN', 'DB', `SQLite state read fallback: ${(err as Error).message}`);
+        debugLog('WARN', 'DB', `Legacy SQLite state read fallback: ${(err as Error).message}`);
       }
     }
 
-    if (fs.existsSync(JSON_FALLBACK_PATH)) {
+    // 3. JSON fallback mirror path
+    if (fs.existsSync(this.jsonFallbackPath)) {
       try {
-        const raw = fs.readFileSync(JSON_FALLBACK_PATH, 'utf-8');
+        const raw = fs.readFileSync(this.jsonFallbackPath, 'utf-8');
         const parsed = JSON.parse(raw) as Partial<JarvisStoreData>;
-        const migrated = ensureV3Migration(parsed as JarvisStoreData, seed);
-        this.persist(migrated);
-        debugLog(
-          'INFO',
-          'DB',
-          `Loaded & migrated state from JSON mirror (${migrated.memories.length} memories, ${migrated.projects?.length ?? 0} projects)`,
-          { durationMs: performance.now() - t0 }
-        );
-        return migrated;
+        const stateObj =
+          (parsed.schemaVersion ?? 0) >= CURRENT_SCHEMA_VERSION
+            ? ({ ...seed, ...parsed } as JarvisStoreData)
+            : migrateStoreToV4(parsed, seed);
+        this.primeAllCollectionsForPersistence(stateObj);
+        return stateObj;
       } catch (err) {
-        debugLog('WARN', 'DB', `JSON mirror corrupted, re-seeding clean state: ${(err as Error).message}`);
+        debugLog(
+          'WARN',
+          'DB',
+          `JSON mirror corrupted, re-seeding clean state: ${(err as Error).message}`
+        );
       }
     }
 
-    this.persist(seed);
-    debugLog('INFO', 'DB', `Initialized fresh v3.0 seed state (${seed.memories.length} memories)`, {
-      durationMs: performance.now() - t0,
-    });
+    // 4. Fresh seed state
+    this.primeAllCollectionsForPersistence(seed);
+    debugLog(
+      'INFO',
+      'DB',
+      `Initialized fresh v4 (${seed.seedMode}) state (${seed.memories.length} memories)`,
+      { durationMs: performance.now() - t0 }
+    );
     return seed;
   }
 
-  private persist(data: JarvisStoreData): void {
+  private scheduleDebouncedFlush(): void {
+    if (this.isClosed || this.dirtyPayloads.size === 0) return;
+    if (this.debounceMs <= 0) {
+      this.flushSync();
+      return;
+    }
+    if (this.flushTimer) return;
+    this.flushTimer = setTimeout(() => {
+      this.flushTimer = null;
+      this.flushSync();
+    }, this.debounceMs);
+    if (typeof this.flushTimer.unref === 'function') {
+      this.flushTimer.unref();
+    }
+  }
+
+  public flushSync(options: { writeJsonMirror?: boolean } = {}): number {
+    if (this.flushTimer) {
+      clearTimeout(this.flushTimer);
+      this.flushTimer = null;
+    }
+    const dirtyCount = this.dirtyPayloads.size;
+    if (dirtyCount === 0 && !options.writeJsonMirror) {
+      return 0;
+    }
+
     const t0 = performance.now();
-    const serialized = JSON.stringify(data, null, 2);
     const nowIso = new Date().toISOString();
 
-    if (this.sqliteDb) {
+    if (this.sqliteDb && this.upsertV4Stmt && dirtyCount > 0) {
       try {
-        this.sqliteDb
-          .prepare(
-            `INSERT INTO jarvis_kv_store (collection_key, payload_json, updated_at)
-             VALUES (?, ?, ?)
-             ON CONFLICT(collection_key) DO UPDATE SET
-               payload_json = excluded.payload_json,
-               updated_at = excluded.updated_at`
-          )
-          .run('root_state_v2', serialized, nowIso);
+        this.sqliteDb.exec('BEGIN IMMEDIATE');
+        for (const [key, payloadJson] of this.dirtyPayloads.entries()) {
+          this.upsertV4Stmt.run(key, payloadJson, nowIso);
+        }
+        this.sqliteDb.exec('COMMIT');
       } catch (err) {
-        debugLog('WARN', 'DB', `SQLite persist warning: ${(err as Error).message}`);
+        try {
+          this.sqliteDb.exec('ROLLBACK');
+        } catch {
+          // Ignore rollback failure
+        }
+        debugLog('WARN', 'DB', `SQLite v4 batch transaction warning: ${(err as Error).message}`);
       }
     }
 
-    const tmpPath = `${JSON_FALLBACK_PATH}.tmp`;
-    fs.writeFileSync(tmpPath, serialized, 'utf-8');
-    fs.renameSync(tmpPath, JSON_FALLBACK_PATH);
-    debugLog('DEBUG', 'DB', `State persisted (${this.storageEngine} · ${serialized.length} bytes)`, {
-      durationMs: performance.now() - t0,
-    });
+    // Write JSON mirror when SQLite is absent OR when explicitly requested (seed/import/shutdown)
+    if (!this.sqliteDb || options.writeJsonMirror) {
+      const tmpPath = `${this.jsonFallbackPath}.${process.pid}.tmp`;
+      fs.writeFileSync(tmpPath, JSON.stringify(this.cache, null, 2), 'utf-8');
+      fs.renameSync(tmpPath, this.jsonFallbackPath);
+    }
+
+    this.dirtyPayloads.clear();
+    debugLog(
+      'DEBUG',
+      'DB',
+      `Flushed ${dirtyCount} dirty collection(s) (${this.storageEngine})`,
+      { durationMs: performance.now() - t0 }
+    );
+    return dirtyCount;
+  }
+
+  public close(): void {
+    this.flushSync({ writeJsonMirror: true });
+    this.isClosed = true;
+    if (this.sqliteDb) {
+      try {
+        this.sqliteDb.close();
+      } catch {
+        // Ignore close errors
+      }
+      this.sqliteDb = null;
+    }
   }
 
   public getEngineName(): string {
     return this.storageEngine;
   }
 
+  public getRegisteredCollectionCount(): number {
+    return STORE_COLLECTION_KEYS.length;
+  }
+
+  /**
+   * Side-effect-free read of application state.
+   * When `JARVIS_FREEZE_STATE=1` (or `freezeReads: true`), returns a deep-frozen clone
+   * so accidental mutations outside `db.update()` fail fast with a `TypeError`.
+   */
   public getState(): JarvisStoreData {
+    if (this.freezeReads || process.env.JARVIS_FREEZE_STATE === '1') {
+      if (!this.frozenSnapshot) {
+        this.frozenSnapshot = deepFreezeInPlace(structuredClone(this.cache));
+      }
+      return this.frozenSnapshot;
+    }
     return this.cache;
   }
 
   public update(mutator: (draft: JarvisStoreData) => void): JarvisStoreData {
-    mutator(this.cache);
-    this.persist(this.cache);
+    const touchedKeys = new Set<keyof JarvisStoreData>();
+    const proxy = new Proxy(this.cache, {
+      get(target, prop, receiver) {
+        if (typeof prop === 'string') {
+          const val = Reflect.get(target, prop, receiver);
+          if (val !== null && typeof val === 'object') {
+            touchedKeys.add(prop as keyof JarvisStoreData);
+          }
+          return val;
+        }
+        return Reflect.get(target, prop, receiver);
+      },
+      set(target, prop, value, receiver) {
+        if (typeof prop === 'string') {
+          touchedKeys.add(prop as keyof JarvisStoreData);
+        }
+        return Reflect.set(target, prop, value, receiver);
+      },
+    });
+
+    mutator(proxy);
+    this.frozenSnapshot = null;
+
+    for (const key of touchedKeys) {
+      if (!STORE_COLLECTION_KEYS.includes(key)) continue;
+      const val = this.cache[key];
+      const nextSerialized = JSON.stringify(val === undefined ? null : val);
+      if (this.lastKeySerialized.get(key) !== nextSerialized) {
+        this.lastKeySerialized.set(key, nextSerialized);
+        this.dirtyPayloads.set(key, nextSerialized);
+      }
+    }
+
+    this.scheduleDebouncedFlush();
     return this.cache;
   }
 
+  /**
+   * Exact backup import without re-injecting superseded demo seeds or sample projects.
+   */
   public replaceAll(nextData: Partial<JarvisStoreData>): JarvisStoreData {
-    const seed = buildInitialSeed();
-    this.cache = ensureV3Migration(nextData as JarvisStoreData, seed);
-    this.persist(this.cache);
+    const seed = buildInitialSeed(this.seedMode);
+    this.cache = migrateStoreToV4(nextData, seed, { isBackupImport: true });
+    this.frozenSnapshot = null;
+    this.primeAllCollectionsForPersistence(this.cache);
     return this.cache;
+  }
+
+  /**
+   * Purges synthetic demo seeds (`source === 'SEED'`) from Swarm runs, Workflow runs,
+   * and resets unverified demo contract hashes, switching the store to `seedMode: 'real'`.
+   */
+  public purgeDemoSeeds(): {
+    removedSwarmRuns: number;
+    removedWorkflowRuns: number;
+    removedMemories: number;
+  } {
+    let removedSwarmRuns = 0;
+    let removedWorkflowRuns = 0;
+    let removedMemories = 0;
+
+    this.update((draft) => {
+      draft.seedMode = 'real';
+      draft.settings.seedMode = 'real';
+
+      const beforeSwarm = (draft.swarmRuns || []).length;
+      draft.swarmRuns = (draft.swarmRuns || []).filter((r) => r.source !== 'SEED');
+      removedSwarmRuns = beforeSwarm - draft.swarmRuns.length;
+
+      const beforeWf = (draft.workflowRuns || []).length;
+      draft.workflowRuns = (draft.workflowRuns || []).filter((r) => r.source !== 'SEED');
+      removedWorkflowRuns = beforeWf - draft.workflowRuns.length;
+
+      const beforeMem = draft.memories.length;
+      draft.memories = draft.memories.filter((m) => m.source !== 'SEED');
+      removedMemories = beforeMem - draft.memories.length;
+
+      const remainingIds = new Set(draft.memories.map((m) => m.id));
+      draft.graphEdges = draft.graphEdges.filter(
+        (e) => remainingIds.has(e.source) && remainingIds.has(e.target)
+      );
+    });
+    this.flushSync({ writeJsonMirror: true });
+
+    return { removedSwarmRuns, removedWorkflowRuns, removedMemories };
   }
 
   public appendAudit(
@@ -1939,4 +2458,5 @@ class JarvisDatabase {
 }
 
 export const db = new JarvisDatabase();
+
 

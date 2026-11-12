@@ -5,6 +5,7 @@ import {
   findShortestGraphPath,
   pruneMcpToolsForIntent,
   searchMemories4WayRRF,
+  validateSafeOutboundUrl,
 } from '../shared/cortex-math.ts';
 import {
   buildDefaultMcpRegistryResources,
@@ -755,22 +756,12 @@ export async function handleMcpJsonRpc(
   }
 }
 
-function isBlockedSsrfUrl(rawUrl: string): boolean {
-  try {
-    const parsed = new URL(rawUrl);
-    if (!['http:', 'https:'].includes(parsed.protocol)) return true;
-    const host = parsed.hostname.toLowerCase();
-    if (
-      host === '169.254.169.254' ||
-      host === 'metadata.google.internal' ||
-      host.startsWith('169.254.')
-    ) {
-      return true;
-    }
-    return false;
-  } catch {
-    return true;
-  }
+function checkMcpProbeUrl(rawUrl: string, activePort = 3000): { allowed: boolean; reason: string } {
+  const verdict = validateSafeOutboundUrl(rawUrl, {
+    allowLocalPorts: [activePort, 3000, 8765, 8766, 11434],
+    allowPrivateNetworks: process.env.JARVIS_ALLOW_PRIVATE_NET_PROBES === '1',
+  });
+  return { allowed: verdict.allowed, reason: verdict.reason };
 }
 
 export async function probeExternalMcpServer(
@@ -822,33 +813,47 @@ export async function probeExternalMcpServer(
       targetUrl = targetUrl.replace(':3000/api/mcp', `:${activePort}/api/mcp`);
     }
 
-    if (isBlockedSsrfUrl(targetUrl)) {
+    const probeCheck = checkMcpProbeUrl(targetUrl, activePort);
+    if (!probeCheck.allowed) {
       healthStatus = 'OFFLINE';
-      lastError = 'URL bloqueado pelo filtro de segurança SSRF.';
+      lastError = probeCheck.reason;
     } else {
+      const localAuthHeaders: Record<string, string> = {};
+      if (process.env.JARVIS_API_TOKEN?.trim() && targetUrl.includes(`:${activePort}/api/mcp`)) {
+        localAuthHeaders.Authorization = `Bearer ${process.env.JARVIS_API_TOKEN.trim()}`;
+      }
       try {
-        // Send JSON-RPC 2.0 ping heartbeat followed by tools/list discovery
         const pingRes = await fetch(targetUrl, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+          headers: {
+            'Content-Type': 'application/json',
+            Accept: 'application/json',
+            ...localAuthHeaders,
+          },
           body: JSON.stringify({
             jsonrpc: '2.0',
             id: Date.now(),
             method: 'ping',
             params: {},
           }),
+          redirect: 'error',
           signal: AbortSignal.timeout(1800),
         });
 
         const initRes = await fetch(targetUrl, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+          headers: {
+            'Content-Type': 'application/json',
+            Accept: 'application/json',
+            ...localAuthHeaders,
+          },
           body: JSON.stringify({
             jsonrpc: '2.0',
             id: Date.now() + 1,
             method: 'tools/list',
             params: {},
           }),
+          redirect: 'error',
           signal: AbortSignal.timeout(2500),
         });
 
@@ -879,14 +884,16 @@ export async function probeExternalMcpServer(
   } else if (srv.transport === 'SSE') {
     lastRpcMethod = 'SSE Handshake GET';
     const targetUrl = (srv.endpointUrl || '').trim();
-    if (isBlockedSsrfUrl(targetUrl)) {
+    const sseCheck = checkMcpProbeUrl(targetUrl, activePort);
+    if (!sseCheck.allowed) {
       healthStatus = 'OFFLINE';
-      lastError = 'URL SSE bloqueado pelo filtro de segurança SSRF.';
+      lastError = sseCheck.reason;
     } else {
       try {
         const sseRes = await fetch(targetUrl, {
           method: 'GET',
           headers: { Accept: 'text/event-stream' },
+          redirect: 'error',
           signal: AbortSignal.timeout(2500),
         });
         if (sseRes.ok) {

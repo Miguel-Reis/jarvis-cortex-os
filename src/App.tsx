@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { Suspense, useCallback, useEffect, useMemo, useState } from 'react';
 import {
   ArrowLeft,
   Blocks,
@@ -12,6 +12,7 @@ import {
   Cpu,
   FolderGit2,
   Globe,
+  KeyRound,
   Layers,
   LayoutDashboard,
   Menu,
@@ -30,7 +31,7 @@ import {
   Workflow as WorkflowIcon,
   X,
 } from 'lucide-react';
-import { apiJson } from './lib/api';
+import { apiJson, loginOperatorToken } from './lib/api';
 import { t, type NavSectionId } from './lib/i18n';
 import { ToastProvider, useToast } from './components/ToastContext';
 import { CommandPalette } from './components/CommandPalette';
@@ -40,8 +41,11 @@ import { StudioWorkspaceView } from './components/studio/StudioWorkspaceView';
 import { BriefView } from './components/views/BriefView';
 import { BrainView } from './components/views/BrainView';
 import { ChatRoomsView } from './components/views/ChatRoomsView';
-import { SwarmView } from './components/views/SwarmView';
 import { OrbitView } from './components/views/OrbitView';
+
+const SwarmView = React.lazy(() =>
+  import('./components/views/SwarmView').then((m) => ({ default: m.SwarmView }))
+);
 import { McpGatewayView } from './components/views/McpGatewayView';
 import { WorkflowsView } from './components/views/WorkflowsView';
 import { WorkspaceView } from './components/views/WorkspaceView';
@@ -146,6 +150,12 @@ const InnerApp: React.FC = () => {
   const [creatingProj, setCreatingProj] = useState(false);
   const [bulkTogglingProactive, setBulkTogglingProactive] = useState(false);
 
+  // Operator Token Authentication Modal (A-01)
+  const [authDialogOpen, setAuthDialogOpen] = useState(false);
+  const [operatorTokenInput, setOperatorTokenInput] = useState('');
+  const [authSubmitting, setAuthSubmitting] = useState(false);
+  const [authError, setAuthError] = useState<string | null>(null);
+
   const refreshBootstrap = useCallback(async () => {
     try {
       const data = await apiJson<BootstrapPayload>('/api/bootstrap');
@@ -161,6 +171,36 @@ const InnerApp: React.FC = () => {
       setLoading(false);
     }
   }, []);
+
+  useEffect(() => {
+    const onAuthRequired = () => {
+      setAuthDialogOpen(true);
+    };
+    window.addEventListener('jarvis:auth-required', onAuthRequired);
+    return () => window.removeEventListener('jarvis:auth-required', onAuthRequired);
+  }, []);
+
+  const handleOperatorTokenSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!operatorTokenInput.trim() || authSubmitting) return;
+    setAuthSubmitting(true);
+    setAuthError(null);
+    try {
+      await loginOperatorToken(operatorTokenInput);
+      setOperatorTokenInput('');
+      setAuthDialogOpen(false);
+      await refreshBootstrap();
+      pushToast({
+        title: 'Sessão de operador autenticada',
+        detail: 'Credencial validada pelo Security Gate.',
+        tone: 'success',
+      });
+    } catch (err) {
+      setAuthError((err as Error).message);
+    } finally {
+      setAuthSubmitting(false);
+    }
+  };
 
   useEffect(() => {
     refreshBootstrap();
@@ -558,16 +598,63 @@ const InnerApp: React.FC = () => {
   if (errorMsg || !boot) {
     return (
       <div className="min-h-screen studio-canvas flex items-center justify-center p-6">
-        <div className="max-w-md studio-card rounded-xl p-6 space-y-4">
-          <h1 className="text-base font-semibold text-slate-100">Falha de Ligação ao Servidor</h1>
+        <div className="max-w-md w-full studio-card rounded-xl p-6 space-y-4">
+          <h1 className="text-base font-semibold text-slate-100">
+            {authDialogOpen ? 'Autenticação de Operador Necessária' : 'Falha de Ligação ao Servidor'}
+          </h1>
           <p className="text-xs text-slate-400">{errorMsg || 'Resposta vazia do servidor.'}</p>
-          <button
-            type="button"
-            onClick={refreshBootstrap}
-            className="px-4 py-2 text-xs font-semibold bg-[#e59a54] text-slate-950 rounded-lg"
-          >
-            Tentar Novamente
-          </button>
+
+          {authDialogOpen ? (
+            <form onSubmit={handleOperatorTokenSubmit} className="space-y-3 pt-1">
+              <label htmlFor="boot-operator-token" className="block text-xs text-slate-300">
+                Token de Operador (`JARVIS_API_TOKEN`)
+              </label>
+              <input
+                id="boot-operator-token"
+                type="password"
+                required
+                value={operatorTokenInput}
+                onChange={(e) => setOperatorTokenInput(e.target.value)}
+                placeholder="Introduz o token configurado no servidor..."
+                className="w-full px-3 py-2 text-xs font-mono bg-[#0b0d11] border border-white/12 rounded-lg text-slate-100 focus:outline-none focus:border-[#e59a54]"
+              />
+              {authError && <p className="text-xs text-rose-400">{authError}</p>}
+              <div className="flex items-center gap-2">
+                <button
+                  type="submit"
+                  disabled={authSubmitting}
+                  className="px-4 py-2 text-xs font-semibold bg-[#e59a54] text-slate-950 rounded-lg hover:bg-[#eba868] disabled:opacity-50"
+                >
+                  {authSubmitting ? 'A validar...' : 'Autenticar Sessão'}
+                </button>
+                <button
+                  type="button"
+                  onClick={refreshBootstrap}
+                  className="px-3 py-2 text-xs text-slate-300 bg-[#141821] border border-white/10 rounded-lg"
+                >
+                  Tentar Novamente
+                </button>
+              </div>
+            </form>
+          ) : (
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={refreshBootstrap}
+                className="px-4 py-2 text-xs font-semibold bg-[#e59a54] text-slate-950 rounded-lg"
+              >
+                Tentar Novamente
+              </button>
+              <button
+                type="button"
+                onClick={() => setAuthDialogOpen(true)}
+                className="px-3 py-2 text-xs text-slate-300 bg-[#141821] border border-white/10 rounded-lg inline-flex items-center gap-1.5"
+              >
+                <KeyRound className="w-3.5 h-3.5 text-[#e59a54]" />
+                Inserir Token
+              </button>
+            </div>
+          )}
         </div>
       </div>
     );
@@ -1209,10 +1296,23 @@ const InnerApp: React.FC = () => {
                 )}
 
                 {activeSection === 'swarm' && (
-                  <SwarmView
-                    onRefreshBootstrap={refreshBootstrap}
-                    onOpenWorkspaceFile={(fp) => handleNavigate('workspace', fp)}
-                  />
+                  <Suspense
+                    fallback={
+                      <div className="p-8 rounded-xl bg-[#0d1117] border border-slate-800 text-center space-y-2">
+                        <p className="text-sm font-semibold text-slate-200 font-display">
+                          A carregar motor espacial 3D do Enxame 48x...
+                        </p>
+                        <p className="text-xs text-slate-400">
+                          Módulo WebGL / Three.js carregado sob pedido para arranque leve.
+                        </p>
+                      </div>
+                    }
+                  >
+                    <SwarmView
+                      onRefreshBootstrap={refreshBootstrap}
+                      onOpenWorkspaceFile={(fp) => handleNavigate('workspace', fp)}
+                    />
+                  </Suspense>
                 )}
 
                 {activeSection === 'orbit' && (
@@ -1708,6 +1808,74 @@ const InnerApp: React.FC = () => {
         onClose={() => setWizardOpen(false)}
         onSave={handleWizardSave}
       />
+
+      {authDialogOpen && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-label="Autenticação de Operador"
+          className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80"
+          onClick={() => setAuthDialogOpen(false)}
+        >
+          <form
+            onSubmit={handleOperatorTokenSubmit}
+            onClick={(e) => e.stopPropagation()}
+            className="w-full max-w-md studio-card rounded-xl p-6 space-y-4"
+          >
+            <div className="flex items-center justify-between gap-3">
+              <div className="flex items-center gap-2">
+                <KeyRound className="w-4 h-4 text-[#e59a54]" />
+                <h2 className="text-base font-semibold text-slate-100 font-display">
+                  Autenticação de Operador
+                </h2>
+              </div>
+              <button
+                type="button"
+                onClick={() => setAuthDialogOpen(false)}
+                aria-label="Fechar janela de autenticação"
+                className="text-slate-400 hover:text-slate-100"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+            <p className="text-xs text-slate-400">
+              O Security Gate exige `JARVIS_API_TOKEN` para autorizar mutações e exportações neste
+              endereço.
+            </p>
+            <div>
+              <label htmlFor="modal-operator-token" className="block text-xs text-slate-300 mb-1">
+                Token Bearer (`JARVIS_API_TOKEN`)
+              </label>
+              <input
+                id="modal-operator-token"
+                type="password"
+                required
+                value={operatorTokenInput}
+                onChange={(e) => setOperatorTokenInput(e.target.value)}
+                placeholder="Introduz o token secreto..."
+                className="w-full px-3 py-2 text-xs font-mono bg-[#0b0d11] border border-white/12 rounded-lg text-slate-100 focus:outline-none focus:border-[#e59a54]"
+              />
+            </div>
+            {authError && <p className="text-xs text-rose-400">{authError}</p>}
+            <div className="flex justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setAuthDialogOpen(false)}
+                className="px-3.5 py-2 text-xs text-slate-300 bg-[#141821] rounded-lg"
+              >
+                Cancelar
+              </button>
+              <button
+                type="submit"
+                disabled={authSubmitting}
+                className="px-4 py-2 text-xs font-semibold bg-[#e59a54] text-slate-950 rounded-lg hover:bg-[#eba868] disabled:opacity-50"
+              >
+                {authSubmitting ? 'A validar...' : 'Validar Token'}
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
     </div>
   );
 };

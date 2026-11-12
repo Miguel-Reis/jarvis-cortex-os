@@ -1,5 +1,6 @@
 import type {
   ArchitecturalDriftItem,
+  ArtifactKind,
   AutonomyLevel,
   ChannelConfig,
   CoChangeEdge,
@@ -21,8 +22,11 @@ import type {
   MemoryItem,
   MemoryRankedHit,
   MemoryTier,
+  NormalizedScreenRegion,
   ProactiveInsight,
   ProjectActivityLogEntry,
+  ProjectArtifact,
+  ProjectBlueprintBundle,
   ProjectWorkspace,
   Q18Candidate,
   Room,
@@ -880,10 +884,13 @@ const INJECTION_RULES: { id: string; regex: RegExp; weight: number }[] = [
   { id: 'IGNORE_PT_DIRECTIVES', regex: /ignora\s+(todas\s+as\s+)?(instru[cç][oõ]es|regras)\s+(anteriores|acima)/i, weight: 85 },
   { id: 'CANARY_TOKEN_TRIGGER', regex: /jarvis[_-]?canary|reveal\s+system\s+prompt|system\s+override\s+root/i, weight: 90 },
   { id: 'EXFILTRATE_SECRETS', regex: /(cat|type|Get-Content)\s+.*\.env|curl\s+.*(GEMINI_API_KEY|SECRET|TOKEN)/i, weight: 95 },
-  { id: 'DESTRUCTIVE_SHELL', regex: /rm\s+-rf\s+\/|Format-Volume|del\s+\/f\s+\/s\s+\/q\s+c:\\/i, weight: 100 },
+  { id: 'DESTRUCTIVE_SHELL', regex: /rm\s+-rf\s+(\/|~|\*|\.)|Format-Volume|del\s+\/f\s+\/s\s+\/q\s+c:\\|mkfs\./i, weight: 100 },
+  { id: 'ENCODED_OBFUSCATION', regex: /base64\s+(-d|--decode)\s*\|\s*(sh|bash|pwsh|powershell)|eval\s*\(\s*atob/i, weight: 95 },
+  { id: 'REMOTE_PIPE_EXEC', regex: /(curl|wget|Invoke-WebRequest)\s+[^\n|]+\|\s*(sh|bash|zsh|pwsh|powershell|python3?|node)/i, weight: 100 },
 ];
 
-export function detectPromptInjection(input: string): InjectionScanResult {
+export function detectPromptInjection(input: string, threshold = 70): InjectionScanResult {
+  const safeThreshold = Math.min(100, Math.max(20, Number.isFinite(threshold) ? threshold : 70));
   const matchedRules: string[] = [];
   let score = 0;
 
@@ -895,7 +902,7 @@ export function detectPromptInjection(input: string): InjectionScanResult {
   }
 
   return {
-    blocked: score >= 70,
+    blocked: score >= safeThreshold,
     riskScore: score,
     matchedRules,
     sanitizedPreview: input.slice(0, 180),
@@ -1280,60 +1287,33 @@ export function validateMcpServerAuthorityGate(params: {
   // 2. Transport-Specific Security Inspection
   if (transport === 'HTTP_STREAMABLE' || transport === 'SSE') {
     const cleanUrl = endpointUrl.trim();
-    try {
-      const parsed = new URL(cleanUrl);
-      const host = parsed.hostname.toLowerCase();
-      const isLoopback = host === '127.0.0.1' || host === 'localhost' || host === '::1';
-      const isMetadataSsrf =
-        host === '169.254.169.254' ||
-        host === 'metadata.google.internal' ||
-        host.startsWith('169.254.') ||
-        host === '0.0.0.0';
-
-      if (!['http:', 'https:'].includes(parsed.protocol)) {
-        hardBlocked = true;
-        riskScore = Math.min(100, riskScore + 90);
-        checks.push({
-          id: 'TRANSPORT_PROTOCOL',
-          label: 'Protocolo de Transporte HTTP/SSE',
-          status: 'FAIL',
-          detail: `Protocolo '${parsed.protocol}' proibido. Usa apenas http:// (loopback) ou https://.`,
-        });
-      } else if (isMetadataSsrf) {
-        hardBlocked = true;
-        riskScore = Math.min(100, riskScore + 95);
-        checks.push({
-          id: 'SSRF_BOUNDARY',
-          label: 'Proteção Anti-SSRF Cloud Metadata',
-          status: 'FAIL',
-          detail: `Destino '${host}' bloqueado pela Fronteira de Confiança (proteção SSRF).`,
-        });
-      } else if (parsed.protocol === 'http:' && !isLoopback) {
-        riskScore = Math.min(100, riskScore + 25);
-        checks.push({
-          id: 'TLS_POSTURE',
-          label: 'Encriptação de Transporte TLS',
-          status: 'WARN',
-          detail: `Endpoint remoto sem TLS (${host}). Recomenda-se HTTPS para tráfego externo.`,
-        });
-      } else {
-        checks.push({
-          id: 'SSRF_BOUNDARY',
-          label: 'Proteção Anti-SSRF & Transporte',
-          status: 'PASS',
-          detail: isLoopback
-            ? `Loopback local seguro confirmado (${host}).`
-            : `Ligação encriptada HTTPS validada (${host}).`,
-        });
-      }
-    } catch {
+    const ssrfVerdict = validateSafeOutboundUrl(cleanUrl, {
+      allowLocalPorts: [3000, 8765, 8766, 11434],
+      allowAnyLoopbackPort: true,
+    });
+    if (!ssrfVerdict.allowed) {
       hardBlocked = true;
-      riskScore = Math.min(100, riskScore + 85);
+      riskScore = Math.min(100, riskScore + 95);
       checks.push({
-        id: 'URL_SYNTAX',
-        label: 'Validação Sintática de Endpoint',
+        id: ssrfVerdict.code === 'INVALID_PROTOCOL' ? 'TRANSPORT_PROTOCOL' : 'SSRF_BOUNDARY',
+        label: 'Proteção Anti-SSRF & Transporte',
         status: 'FAIL',
-        detail: 'URL de endpoint inválido ou em falta.',
+        detail: ssrfVerdict.reason,
+      });
+    } else if (ssrfVerdict.warning) {
+      riskScore = Math.min(100, riskScore + 25);
+      checks.push({
+        id: 'TLS_POSTURE',
+        label: 'Encriptação de Transporte TLS',
+        status: 'WARN',
+        detail: ssrfVerdict.warning,
+      });
+    } else {
+      checks.push({
+        id: 'SSRF_BOUNDARY',
+        label: 'Proteção Anti-SSRF & Transporte',
+        status: 'PASS',
+        detail: ssrfVerdict.reason,
       });
     }
   } else {
@@ -2656,9 +2636,922 @@ export function extractPcm16FromWavOrRawBase64(
   };
 }
 
+// ============================================================================
+// Studio Enhancements: URL Context Extraction, Screen Region Crop,
+// Cross-Project HippoRAG Memory Reuse, Interactive Artifacts & Blueprint Export
+// ============================================================================
 
+/**
+ * Extracts up to 20 deduplicated HTTP/HTTPS URLs from a user prompt for Gemini `urlContext`.
+ */
+export function extractUrlsFromPrompt(text: string, maxUrls = 20): string[] {
+  if (!text) return [];
+  const matches = text.match(/https?:\/\/[^\s<>"'`)\]]+/gi) || [];
+  const seen = new Set<string>();
+  const out: string[] = [];
 
+  for (const raw of matches) {
+    const cleaned = raw.replace(/[.,;:!?]+$/, '');
+    try {
+      const parsed = new URL(cleaned);
+      if (parsed.protocol === 'http:' || parsed.protocol === 'https:') {
+        const href = parsed.toString();
+        if (!seen.has(href)) {
+          seen.add(href);
+          out.push(href);
+          if (out.length >= maxUrls) break;
+        }
+      }
+    } catch {
+      // Ignore malformed URLs
+    }
+  }
+  return out;
+}
 
+/**
+ * Clamps a normalized screen crop region into `[0..1]` and guarantees minimum 4% width/height.
+ */
+export function normalizeScreenRegionBox(box: NormalizedScreenRegion): NormalizedScreenRegion {
+  const minSize = 0.04;
+  const rawW = Number.isFinite(box.w) ? Math.abs(box.w) : 0.25;
+  const rawH = Number.isFinite(box.h) ? Math.abs(box.h) : 0.25;
+  const w = Math.max(minSize, Math.min(1, rawW));
+  const h = Math.max(minSize, Math.min(1, rawH));
 
+  const rawX = Number.isFinite(box.x) ? box.x : 0;
+  const rawY = Number.isFinite(box.y) ? box.y : 0;
+  const x = Math.max(0, Math.min(1 - w, rawX));
+  const y = Math.max(0, Math.min(1 - h, rawY));
 
+  return {
+    x: Number(x.toFixed(4)),
+    y: Number(y.toFixed(4)),
+    w: Number(w.toFixed(4)),
+    h: Number(h.toFixed(4)),
+  };
+}
 
+/**
+ * Surfaces reusable architectural decisions, preferences, and stack facts from OTHER projects
+ * (or global semantic memory) that match the active project's stack or category.
+ */
+export function findCrossProjectReusableMemories(params: {
+  activeProject: ProjectWorkspace;
+  projects?: ProjectWorkspace[];
+  memories: MemoryItem[];
+  limit?: number;
+}): MemoryItem[] {
+  const { activeProject, memories, limit = 3 } = params;
+  const stackTokens = `${activeProject.techStack} ${activeProject.ideaCategory || ''} ${activeProject.ideaBrief || ''}`
+    .toLowerCase()
+    .split(/[^a-z0-9à-ÿ+#.-]+/i)
+    .filter((tok) => tok.length >= 3);
+  const tokenSet = new Set(stackTokens);
+
+  const scored: { mem: MemoryItem; score: number }[] = [];
+  for (const mem of memories) {
+    if (mem.supersededBy) continue;
+    // Focus on reusable architectural / preference / fact memories
+    if (!['PREFERENCE', 'DECISION', 'FACT', 'COMMITMENT'].includes(mem.category)) continue;
+
+    // Skip if already explicitly tagged exclusively for this exact project ID
+    if (mem.tags?.includes(`applied:${activeProject.id}`)) continue;
+
+    const hay = `${mem.topic} ${mem.content} ${(mem.tags || []).join(' ')}`.toLowerCase();
+    let overlap = 0;
+    for (const tok of tokenSet) {
+      if (hay.includes(tok)) overlap += 1;
+    }
+
+    let score = overlap * 2 + (mem.pinned ? 3 : 0) + (mem.importance ?? 3) * 0.5;
+    if (mem.category === 'PREFERENCE' || mem.category === 'DECISION') {
+      score += 2.5;
+    }
+    if (score >= 3.5) {
+      scored.push({ mem, score });
+    }
+  }
+
+  scored.sort((a, b) => b.score - a.score);
+  return scored.slice(0, Math.max(1, limit)).map((s) => s.mem);
+}
+
+/**
+ * Builds a complete 4-file Antigravity / Cursor / VS Code Starter Blueprint
+ * (`PRD.md`, `ARCHITECTURE.md`, `TASKS.md`, `AGENTS.md`) from the active Studio workspace.
+ */
+export function buildAntigravityProjectBlueprint(params: {
+  project: ProjectWorkspace;
+  goals: GoalItem[];
+  agents: Room[];
+  skills: SkillItem[];
+  artifacts?: ProjectArtifact[];
+  memories?: MemoryItem[];
+  generatedAt?: string;
+}): ProjectBlueprintBundle {
+  const {
+    project,
+    goals,
+    agents,
+    skills,
+    artifacts = [],
+    memories = [],
+    generatedAt = new Date().toISOString(),
+  } = params;
+
+  const projGoals = goals.filter(
+    (g) => !g.projectId || g.projectId === project.id
+  );
+  const activeSkills = skills.filter(
+    (s) => s.enabled && (!project.activeSkillIds || project.activeSkillIds.includes(s.id))
+  );
+  const projArtifacts = artifacts.filter((a) => a.projectId === project.id);
+  const reusableMemories = findCrossProjectReusableMemories({
+    activeProject: project,
+    memories,
+    limit: 5,
+  });
+
+  const prdMd = [
+    `# PRD — ${project.name}`,
+    ``,
+    `- **Categoria**: \`${project.ideaCategory || 'CUSTOM'}\``,
+    `- **Stack Principal**: \`${project.techStack}\``,
+    `- **Caminho / Branch**: \`${project.rootPath}\` (\`${project.gitBranch}\`)`,
+    `- **Exportado em**: \`${generatedAt.slice(0, 19).replace('T', ' ')} UTC\``,
+    ``,
+    `## 1. Visão & Resumo do Produto`,
+    project.ideaBrief || project.description || 'Projeto planeado no J.A.R.V.I.S. Studio.',
+    ``,
+    `## 2. Objetivos Estruturados (Goals) & Critérios de Sucesso`,
+    projGoals.length > 0
+      ? projGoals
+          .map(
+            (g, i) =>
+              `### ${i + 1}. ${g.title} (${g.status} · ${g.progress}%)\n- **Categoria**: ${g.category}\n- **Meta Verificável**: ${g.targetMetric}\n- **Prazo Alvo**: ${g.deadline}`
+          )
+          .join('\n\n')
+      : '_Nenhum Goal registado ainda. Usa o J.A.R.V.I.S. Studio para gerar os primeiros objetivos._',
+    ``,
+    `## 3. Artefactos & Protótipos Validados (${projArtifacts.length})`,
+    projArtifacts.length > 0
+      ? projArtifacts
+          .map(
+            (a) =>
+              `- **${a.title}** (\`${a.kind}\` · v${a.currentVersion}) — ${
+                a.versions[a.versions.length - 1]?.summary || 'Artefacto interativo'
+              }`
+          )
+          .join('\n')
+      : '- Sem artefactos anexados.',
+  ].join('\n');
+
+  const architectureMd = [
+    `# ARCHITECTURE — ${project.name}`,
+    ``,
+    `## 1. Stack Tecnológica & Convenções`,
+    `- **Stack**: ${project.techStack}`,
+    `- **Diretório Raiz**: \`${project.rootPath}\``,
+    `- **Saúde Atual do Projeto**: ${project.healthScore}%`,
+    ``,
+    `## 2. Decisões Arquiteturais & Memória Semântica (HippoRAG)`,
+    reusableMemories.length > 0
+      ? reusableMemories
+          .map((m) => `- **[${m.category}] ${m.topic}**: ${m.content}`)
+          .join('\n')
+      : `- Modularidade estrita entre lógica pura testável (\`src/shared/\`) e componentes visuais (\`src/components/\`).`,
+    ``,
+    `## 3. Skills Estilo Antigravity Ativas (${activeSkills.length})`,
+    activeSkills.length > 0
+      ? activeSkills
+          .map(
+            (s) =>
+              `- **${s.name}** (\`${s.slug}\`, comando \`${s.quickCommand}\`): ${s.description}`
+          )
+          .join('\n')
+      : `- Skills padrão de auditoria AST e curadoria bi-temporal.`,
+  ].join('\n');
+
+  const tasksMd = [
+    `# TASKS — Plano de Execução (${project.name})`,
+    ``,
+    projGoals.length > 0
+      ? projGoals
+          .map((g) => {
+            const header = `## [${g.status === 'COMPLETED' ? 'x' : ' '}] ${g.title} (${g.progress}%)`;
+            const subs =
+              g.subtasks && g.subtasks.length > 0
+                ? g.subtasks
+                    .map((st) => `- [${st.done ? 'x' : ' '}] ${st.title}`)
+                    .join('\n')
+                : `- [ ] Concluir critério: ${g.targetMetric}`;
+            return `${header}\n${subs}`;
+          })
+          .join('\n\n')
+      : `- [ ] Definir arquitetura inicial de ${project.name}\n- [ ] Implementar fluxos críticos e testes unitários`,
+  ].join('\n');
+
+  const agentsMd = [
+    `# AGENTS.md — Regras de Agentes & Sub-Agentes (${project.name})`,
+    ``,
+    `## 1. Princípios de Engenharia`,
+    `- Responder sempre em **Português de Portugal (PT-PT)**.`,
+    `- Separar regras de negócio e cálculos puros dos componentes de interface para cobertura de testes determinísticos.`,
+    `- Validar compilação TypeScript e testes unitários antes de cada entrega.`,
+    ``,
+    `## 2. Equipa de Agentes Alocada (${agents.length})`,
+    agents.length > 0
+      ? agents
+          .map(
+            (ag) =>
+              `### ${ag.name}${ag.callsign ? ` (\`${ag.callsign}\`)` : ''}\n- **Papel**: ${ag.roleTitle}\n- **Responsabilidade**: ${ag.description}\n- **Ferramentas Autorizadas**: \`${(ag.allowedTools || []).join(', ')}\``
+          )
+          .join('\n\n')
+      : `- **Jarvis (Coordenador)**: Planeamento executivo, Goals e revisão arquitetural.`,
+  ].join('\n');
+
+  const bundleMd = [
+    prdMd,
+    '\n---\n',
+    architectureMd,
+    '\n---\n',
+    tasksMd,
+    '\n---\n',
+    agentsMd,
+  ].join('\n');
+
+  return {
+    projectName: project.name,
+    generatedAt,
+    prdMd,
+    architectureMd,
+    tasksMd,
+    agentsMd,
+    bundleMd,
+  };
+}
+
+/**
+ * Generates a clean deterministic interactive Artifact (`HTML_PREVIEW`, `SVG_DIAGRAM`, `MARKDOWN_DOC`, or `CODE_MODULE`)
+ * when requested in offline/local mode or via quick artifact generator fallback.
+ */
+export function buildDeterministicArtifactFromPrompt(params: {
+  prompt: string;
+  project?: ProjectWorkspace;
+  preferredKind?: ArtifactKind;
+}): {
+  title: string;
+  kind: ArtifactKind;
+  language: string;
+  content: string;
+  summary: string;
+} {
+  const { prompt, project, preferredKind } = params;
+  const lower = prompt.toLowerCase();
+  const projName = project?.name || 'Projeto Studio';
+
+  const resolvedKind: ArtifactKind =
+    preferredKind ||
+    (lower.includes('svg') || lower.includes('diagrama') || lower.includes('fluxograma') || lower.includes('arquitetura visual')
+      ? 'SVG_DIAGRAM'
+      : lower.includes('markdown') || lower.includes('prd') || lower.includes('especificação') || lower.includes('documento')
+        ? 'MARKDOWN_DOC'
+        : lower.includes('typescript') || lower.includes('python') || lower.includes('função') || lower.includes('api route') || lower.includes('hook')
+          ? 'CODE_MODULE'
+          : 'HTML_PREVIEW');
+
+  if (resolvedKind === 'SVG_DIAGRAM') {
+    const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 360" width="100%" height="100%">
+  <rect width="760" height="360" rx="16" fill="#0b0d11" />
+  <rect x="24" y="24" width="712" height="312" rx="12" fill="#12161f" stroke="#242c3d" stroke-width="1.5" />
+  <text x="48" y="62" fill="#f8fafc" font-family="system-ui, sans-serif" font-size="16" font-weight="700">Arquitetura Modular — ${projName}</text>
+  <text x="48" y="84" fill="#94a3b8" font-family="monospace" font-size="11">Fluxo Cliente ⇄ API Gateway ⇄ Motor de Dados &amp; Verificação</text>
+  <rect x="48" y="130" width="185" height="120" rx="12" fill="#171d29" stroke="#e59a54" stroke-width="1.5" />
+  <text x="70" y="166" fill="#e59a54" font-family="monospace" font-size="11" font-weight="600">01 · FRONTEND UI</text>
+  <text x="70" y="192" fill="#f1f5f9" font-family="system-ui, sans-serif" font-size="13" font-weight="600">Interface Reativa</text>
+  <text x="70" y="214" fill="#94a3b8" font-family="system-ui, sans-serif" font-size="11"> Estados &amp; PWA Offline</text>
+  <line x1="233" y1="190" x2="287" y2="190" stroke="#e59a54" stroke-width="2" />
+  <polygon points="287,190 279,185 279,195" fill="#e59a54" />
+  <rect x="288" y="130" width="185" height="120" rx="12" fill="#171d29" stroke="#8ea6ff" stroke-width="1.5" />
+  <text x="310" y="166" fill="#8ea6ff" font-family="monospace" font-size="11" font-weight="600">02 · API &amp; AGENTES</text>
+  <text x="310" y="192" fill="#f1f5f9" font-family="system-ui, sans-serif" font-size="13" font-weight="600">Serviços &amp; Auth</text>
+  <text x="310" y="214" fill="#94a3b8" font-family="system-ui, sans-serif" font-size="11">Validação &amp; Webhooks</text>
+  <line x1="473" y1="190" x2="527" y2="190" stroke="#34d399" stroke-width="2" />
+  <polygon points="527,190 519,185 519,195" fill="#34d399" />
+  <rect x="528" y="130" width="184" height="120" rx="12" fill="#171d29" stroke="#34d399" stroke-width="1.5" />
+  <text x="548" y="166" fill="#34d399" font-family="monospace" font-size="11" font-weight="600">03 · PERSISTÊNCIA</text>
+  <text x="548" y="192" fill="#f1f5f9" font-family="system-ui, sans-serif" font-size="13" font-weight="600">Dados &amp; Telemetria</text>
+  <text x="548" y="214" fill="#94a3b8" font-family="system-ui, sans-serif" font-size="11">SQLite WAL / Cloud DB</text>
+</svg>`;
+    return {
+      title: `Diagrama de Arquitetura · ${projName}`,
+      kind: 'SVG_DIAGRAM',
+      language: 'svg',
+      content: svg,
+      summary: `Diagrama SVG vetorial gerado para "${prompt.slice(0, 64)}".`,
+    };
+  }
+
+  if (resolvedKind === 'MARKDOWN_DOC') {
+    const md = `# Especificação Funcional — ${projName}\n\n## Objetivo\n${prompt}\n\n## Requisitos Principais\n- Arquitetura limpa com estados de carregamento, vazio e erro explícitos.\n- Acessibilidade nativa por teclado e contraste elevado.\n- Cobertura de testes unitários para regras críticas.\n\n## Critérios de Aceitação\n- [ ] Fluxo principal validado ponta a ponta\n- [ ] Zero erros de consola e latência sub-100ms nas interações locais`;
+    return {
+      title: `Especificação · ${projName}`,
+      kind: 'MARKDOWN_DOC',
+      language: 'markdown',
+      content: md,
+      summary: `Documento técnico estruturado para "${prompt.slice(0, 64)}".`,
+    };
+  }
+
+  if (resolvedKind === 'CODE_MODULE') {
+    const code = `export interface PlanTier {\n  id: string;\n  name: string;\n  monthlyEur: number;\n  annualDiscountPct: number;\n}\n\nexport function calculateEffectiveMonthlyPrice(tier: PlanTier, annualBilling: boolean): number {\n  if (!annualBilling) return tier.monthlyEur;\n  const factor = Math.max(0, Math.min(1, 1 - tier.annualDiscountPct / 100));\n  return Number((tier.monthlyEur * factor).toFixed(2));\n}\n`;
+    return {
+      title: `Módulo TypeScript · ${projName}`,
+      kind: 'CODE_MODULE',
+      language: 'typescript',
+      content: code,
+      summary: `Módulo TypeScript tipado gerado para "${prompt.slice(0, 64)}".`,
+    };
+  }
+
+  const html = `<!DOCTYPE html>
+<html lang="pt-PT">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-[#0b0d11] text-slate-100 font-sans antialiased p-6">
+  <div class="max-w-xl mx-auto space-y-6">
+    <header class="flex items-center justify-between border-b border-white/10 pb-4">
+      <div>
+        <p class="text-xs uppercase tracking-wider text-amber-400 font-semibold">${projName}</p>
+        <h1 class="text-xl font-bold tracking-tight mt-0.5">Protótipo Interativo em Direto</h1>
+      </div>
+      <button id="billingToggle" class="px-3 py-1.5 rounded-lg bg-white/10 hover:bg-white/15 text-xs font-medium transition">
+        Faturação: <span id="billingLabel" class="text-amber-300 font-semibold">Mensal</span>
+      </button>
+    </header>
+    <p class="text-sm text-slate-300 leading-relaxed">${prompt.replace(/[<>&]/g, '')}</p>
+    <div class="grid grid-cols-2 gap-3">
+      <div class="p-4 rounded-xl bg-[#141821] border border-white/10 space-y-2">
+        <p class="text-xs text-slate-400 font-medium">Plano Starter</p>
+        <p class="text-2xl font-bold tabular-nums"><span id="priceStarter">19€</span><span class="text-xs text-slate-400 font-normal">/mês</span></p>
+        <button class="w-full py-2 rounded-lg bg-white/10 hover:bg-white/15 text-xs font-semibold transition">Começar Agora</button>
+      </div>
+      <div class="p-4 rounded-xl bg-[#181f2e] border border-amber-400/40 space-y-2">
+        <p class="text-xs text-amber-300 font-medium">Plano Studio Pro</p>
+        <p class="text-2xl font-bold tabular-nums"><span id="pricePro">49€</span><span class="text-xs text-slate-400 font-normal">/mês</span></p>
+        <button class="w-full py-2 rounded-lg bg-amber-400 text-slate-950 hover:bg-amber-300 text-xs font-semibold transition">Selecionar Pro</button>
+      </div>
+    </div>
+  </div>
+  <script>
+    let annual = false;
+    document.getElementById('billingToggle').addEventListener('click', () => {
+      annual = !annual;
+      document.getElementById('billingLabel').textContent = annual ? 'Anual (-20%)' : 'Mensal';
+      document.getElementById('priceStarter').textContent = annual ? '15€' : '19€';
+      document.getElementById('pricePro').textContent = annual ? '39€' : '49€';
+    });
+  </script>
+</body>
+</html>`;
+
+  return {
+    title: `Protótipo UI · ${projName}`,
+    kind: 'HTML_PREVIEW',
+    language: 'html',
+    content: html,
+    summary: `Protótipo HTML/Tailwind interativo para "${prompt.slice(0, 64)}".`,
+  };
+}
+
+// ============================================================================
+// Architectural Security Hardening (A-04, A-05, A-08) & Vault Intelligence (§7)
+// ============================================================================
+
+/**
+ * A-05: Strict boundary-aware path containment check (browser & Node pure logic).
+ * Prevents prefix bypasses where root "/app" falsely matched "/app-evil/secret".
+ */
+export function isPathInsideWorkspace(workspaceRoot: string, candidateAbsPath: string): boolean {
+  const normalizeSlashes = (p: string) =>
+    p.replace(/\\/g, '/').replace(/\/+/g, '/').replace(/\/$/, '');
+
+  const rootNorm = normalizeSlashes(workspaceRoot.trim());
+  const candNorm = normalizeSlashes(candidateAbsPath.trim());
+  if (!rootNorm || !candNorm) return false;
+  if (candNorm.includes('\0')) return false;
+
+  // Collapse any '.' or '..' segments canonically
+  const resolveSegments = (fullPath: string): string => {
+    const isWinDrive = /^[A-Za-z]:/.test(fullPath);
+    const prefix = isWinDrive ? fullPath.slice(0, 2).toLowerCase() : fullPath.startsWith('/') ? '' : '';
+    const rawParts = (isWinDrive ? fullPath.slice(2) : fullPath).split('/');
+    const stack: string[] = [];
+    for (const part of rawParts) {
+      if (!part || part === '.') continue;
+      if (part === '..') {
+        stack.pop();
+      } else {
+        stack.push(isWinDrive ? part.toLowerCase() : part);
+      }
+    }
+    return `${prefix}/${stack.join('/')}`;
+  };
+
+  const canonicalRoot = resolveSegments(rootNorm);
+  const canonicalCand = resolveSegments(candNorm);
+
+  if (canonicalCand === canonicalRoot) return true;
+  const rootWithSep = canonicalRoot === '/' ? '/' : `${canonicalRoot}/`;
+  return canonicalCand.startsWith(rootWithSep);
+}
+
+/**
+ * A-04: Structured Shell Command Analyzer & Tokenizer.
+ * Parses commands without shell operators (`;`, `|`, `&&`, `$()`, `` ` ``, `>`, `<`)
+ * into `[executable, ...args]` so `execFile` runs with `shell: false`.
+ * Flags shell interpolation operators so they always require explicit operator review.
+ */
+export interface ShellSafetyAnalysis {
+  canUseExecFile: boolean;
+  executable: string;
+  args: string[];
+  hasShellOperators: boolean;
+  detectedOperators: string[];
+  riskAdjustment: number;
+}
+
+export function analyzeShellCommandSafety(rawCommand: string): ShellSafetyAnalysis {
+  const trimmed = rawCommand.trim();
+  if (!trimmed) {
+    return {
+      canUseExecFile: false,
+      executable: '',
+      args: [],
+      hasShellOperators: false,
+      detectedOperators: [],
+      riskAdjustment: 0,
+    };
+  }
+
+  const detectedOperators: string[] = [];
+  if (/[;\n\r]/.test(trimmed)) detectedOperators.push(';');
+  if (/&&|\|\|/.test(trimmed)) detectedOperators.push('&&/||');
+  if (/(?<!\|)\|(?!\|)/.test(trimmed)) detectedOperators.push('|');
+  if (/\$\(|`/.test(trimmed)) detectedOperators.push('$()/`');
+  if (/[><]/.test(trimmed)) detectedOperators.push('>/</redirect');
+
+  const hasShellOperators = detectedOperators.length > 0;
+  if (hasShellOperators) {
+    return {
+      canUseExecFile: false,
+      executable: '',
+      args: [],
+      hasShellOperators: true,
+      detectedOperators,
+      riskAdjustment: Math.min(45, detectedOperators.length * 20),
+    };
+  }
+
+  // Tokenize respecting single and double quotes without shell interpolation
+  const tokens: string[] = [];
+  let current = '';
+  let quote: '"' | "'" | null = null;
+  for (let i = 0; i < trimmed.length; i++) {
+    const ch = trimmed[i];
+    if (quote) {
+      if (ch === quote) {
+        quote = null;
+      } else {
+        current += ch;
+      }
+    } else if (ch === '"' || ch === "'") {
+      quote = ch;
+    } else if (/\s/.test(ch)) {
+      if (current.length > 0) {
+        tokens.push(current);
+        current = '';
+      }
+    } else {
+      current += ch;
+    }
+  }
+  if (quote !== null) {
+    return {
+      canUseExecFile: false,
+      executable: '',
+      args: [],
+      hasShellOperators: true,
+      detectedOperators: ['UNCLOSED_QUOTE'],
+      riskAdjustment: 25,
+    };
+  }
+  if (current.length > 0) tokens.push(current);
+
+  const [executable = '', ...args] = tokens;
+  const validBin = /^[A-Za-z0-9._/\\:-]+$/.test(executable) && !executable.includes('..');
+
+  return {
+    canUseExecFile: Boolean(executable) && validBin,
+    executable: validBin ? executable : '',
+    args: validBin ? args : [],
+    hasShellOperators: false,
+    detectedOperators: [],
+    riskAdjustment: 0,
+  };
+}
+
+/**
+ * A-08: Unified Anti-SSRF Outbound URL Validator used by both HTTP_CHECK contracts
+ * and MCP External Server Probes.
+ * Blocks cloud metadata (169.254.0.0/16), 0.0.0.0, RFC1918 private networks (10/8,
+ * 172.16/12, 192.168/16), IPv6 link-local/ULA, and non-allowlisted loopback targets.
+ */
+export interface SafeOutboundUrlVerdict {
+  allowed: boolean;
+  code: 'OK' | 'INVALID_SYNTAX' | 'INVALID_PROTOCOL' | 'BLOCKED_METADATA' | 'BLOCKED_LOOPBACK' | 'BLOCKED_PRIVATE_NET';
+  reason: string;
+  warning?: string;
+}
+
+export function validateSafeOutboundUrl(
+  rawUrl: string,
+  options?: {
+    allowLocalPorts?: number[];
+    allowAnyLoopbackPort?: boolean;
+    allowPrivateNetworks?: boolean;
+  }
+): SafeOutboundUrlVerdict {
+  const clean = (rawUrl || '').trim();
+  if (!clean) {
+    return {
+      allowed: false,
+      code: 'INVALID_SYNTAX',
+      reason: 'URL de destino em falta ou vazio.',
+    };
+  }
+
+  let parsed: URL;
+  try {
+    parsed = new URL(clean);
+  } catch {
+    return {
+      allowed: false,
+      code: 'INVALID_SYNTAX',
+      reason: 'URL de endpoint sintaticamente inválido.',
+    };
+  }
+
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    return {
+      allowed: false,
+      code: 'INVALID_PROTOCOL',
+      reason: `Protocolo '${parsed.protocol}' proibido. Usa apenas http:// (loopback autorizado) ou https://.`,
+    };
+  }
+
+  const host = parsed.hostname.toLowerCase().replace(/^\[|\]$/g, '');
+
+  // 1. Cloud Metadata & Unspecified Bind Addresses (Hard Block Always)
+  if (
+    host === '169.254.169.254' ||
+    host === 'metadata.google.internal' ||
+    host === 'metadata' ||
+    host.startsWith('169.254.') ||
+    host === '0.0.0.0' ||
+    host === '::' ||
+    host.startsWith('fe80:')
+  ) {
+    return {
+      allowed: false,
+      code: 'BLOCKED_METADATA',
+      reason: `Destino '${host}' bloqueado pela proteção Anti-SSRF (Cloud Metadata / Link-Local).`,
+    };
+  }
+
+  // 2. Loopback Range (127.0.0.0/8, localhost, ::1)
+  const isIpv4Loopback = /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(host);
+  const isLoopback = isIpv4Loopback || host === 'localhost' || host === '::1';
+  if (isLoopback) {
+    // Block non-standard 127.x.y.z aliases (e.g. 127.0.0.2) unless 127.0.0.1 / localhost / ::1
+    if (isIpv4Loopback && host !== '127.0.0.1') {
+      return {
+        allowed: false,
+        code: 'BLOCKED_LOOPBACK',
+        reason: `Endereço loopback alternativo '${host}' bloqueado por prevenção SSRF.`,
+      };
+    }
+    if (options?.allowAnyLoopbackPort) {
+      return {
+        allowed: true,
+        code: 'OK',
+        reason: `Loopback local autorizado (${host}).`,
+      };
+    }
+    const effectivePort = parsed.port
+      ? Number(parsed.port)
+      : parsed.protocol === 'https:'
+        ? 443
+        : 80;
+    const allowedPorts = options?.allowLocalPorts || [];
+    if (allowedPorts.includes(effectivePort)) {
+      return {
+        allowed: true,
+        code: 'OK',
+        reason: `Sonda local autorizada em ${host}:${effectivePort}.`,
+      };
+    }
+    return {
+      allowed: false,
+      code: 'BLOCKED_LOOPBACK',
+      reason: `Porta loopback ${host}:${effectivePort} bloqueada (apenas portas locais autorizadas são permitidas).`,
+    };
+  }
+
+  // 3. RFC1918 Private IPv4 & IPv6 Unique Local (10/8, 172.16/12, 192.168/16, fc00::/7)
+  const ipv4Match = host.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  const isPrivateIpv4 = Boolean(
+    ipv4Match &&
+      (Number(ipv4Match[1]) === 10 ||
+        (Number(ipv4Match[1]) === 172 && Number(ipv4Match[2]) >= 16 && Number(ipv4Match[2]) <= 31) ||
+        (Number(ipv4Match[1]) === 192 && Number(ipv4Match[2]) === 168))
+  );
+  const isPrivateIpv6 = host.startsWith('fc') || host.startsWith('fd');
+
+  if ((isPrivateIpv4 || isPrivateIpv6) && !options?.allowPrivateNetworks) {
+    return {
+      allowed: false,
+      code: 'BLOCKED_PRIVATE_NET',
+      reason: `Rede interna privada '${host}' bloqueada por omissão contra SSRF (define JARVIS_ALLOW_PRIVATE_NET_PROBES=1 para permitir).`,
+    };
+  }
+
+  const warning =
+    parsed.protocol === 'http:'
+      ? `Endpoint remoto sem TLS (${host}). Recomenda-se HTTPS para tráfego externo.`
+      : undefined;
+
+  return {
+    allowed: true,
+    code: 'OK',
+    reason: `Ligação externa validada (${host}).`,
+    warning,
+  };
+}
+
+/**
+ * §7 Recommended Addition 1: Automatic Entity Extraction & Graph Edge Inference on Memory Ingest.
+ * Extracts code files, ports, architectural technologies, and commitments from new memories
+ * and automatically links them to existing active memories that share entities or strong BQ similarity.
+ */
+const KNOWN_TECH_ENTITIES = [
+  'typescript',
+  'python',
+  'sqlite',
+  'postgres',
+  'postgresql',
+  'react',
+  'tailwind',
+  'express',
+  'vite',
+  'hipporag',
+  'ebbinghaus',
+  'mcp',
+  'sidecar',
+  'webrtc',
+  'oauth',
+  'stripe',
+  'docker',
+  'playwright',
+  'threejs',
+  'gemini',
+  'ollama',
+  'openrouter',
+];
+
+export function extractMemoryEntities(text: string): {
+  entities: string[];
+  hasCommitment: boolean;
+} {
+  const found = new Set<string>();
+  const clean = text || '';
+
+  // 1. Source file references (e.g. server.ts, db.ts, cortex-math.ts, app.py)
+  const fileMatches = clean.match(/\b[A-Za-z0-9_-]+\.(?:ts|tsx|js|mjs|py|json|md|sql|sh|bat)\b/g) || [];
+  for (const f of fileMatches) {
+    found.add(f.toLowerCase());
+  }
+
+  // 2. Port numbers (e.g. :3000, porta 5432, port 8765)
+  const portMatches = clean.match(/(?::|\bporta\s+|\bport\s+)(3000|5432|6379|8000|8080|8765|8766|11434)\b/gi) || [];
+  for (const pm of portMatches) {
+    const num = pm.replace(/\D+/g, '');
+    if (num) found.add(`port:${num}`);
+  }
+
+  // 3. Known technology & subsystem keywords
+  const lower = clean.toLowerCase();
+  for (const tech of KNOWN_TECH_ENTITIES) {
+    const re = new RegExp(`\\b${tech}\\b`, 'i');
+    if (re.test(lower)) {
+      found.add(tech);
+    }
+  }
+
+  // 4. Capitalized CamelCase / PascalCase module identifiers (e.g. JarvisDatabase, BrainBridge)
+  const camelMatches = clean.match(/\b[A-Z][a-z0-9]+(?:[A-Z][a-zA-Z0-9]+)+\b/g) || [];
+  for (const cm of camelMatches.slice(0, 6)) {
+    found.add(cm.toLowerCase());
+  }
+
+  const hasCommitment =
+    /\b(vou\s+\w+|iremos\s+\w+|i\s+will\s+\w+|we\s+will\s+\w+|todo:|fixme:|obrigat[oó]rio)\b/i.test(clean);
+
+  return {
+    entities: Array.from(found).slice(0, 10),
+    hasCommitment,
+  };
+}
+
+export function extractEntitiesAndInferEdges(params: {
+  newMemory: MemoryItem;
+  existingMemories: MemoryItem[];
+  existingEdges: GraphEdge[];
+  maxInferredEdges?: number;
+}): { enrichedTags: string[]; inferredEdges: GraphEdge[]; extractedEntities: string[] } {
+  const { newMemory, existingMemories, existingEdges, maxInferredEdges = 4 } = params;
+  const combinedText = `${newMemory.topic} ${newMemory.content}`;
+  const { entities, hasCommitment } = extractMemoryEntities(combinedText);
+
+  const tagSet = new Set<string>((newMemory.tags || []).map((t) => t.trim()).filter(Boolean));
+  for (const ent of entities.slice(0, 5)) {
+    tagSet.add(ent);
+  }
+  if (hasCommitment) tagSet.add('compromisso');
+
+  const newBq = newMemory.bq128Hex || computeBinaryQuantization128(combinedText);
+  const candidates: { targetId: string; weight: number; relation: string }[] = [];
+
+  const alreadyLinked = new Set<string>();
+  for (const e of existingEdges) {
+    if (e.source === newMemory.id) alreadyLinked.add(e.target);
+    if (e.target === newMemory.id) alreadyLinked.add(e.source);
+  }
+
+  for (const other of existingMemories) {
+    if (other.id === newMemory.id || other.supersededBy || other.validUntil) continue;
+    if (alreadyLinked.has(other.id)) continue;
+
+    const otherEntities = extractMemoryEntities(`${other.topic} ${other.content}`).entities;
+    const shared = entities.filter((e) => otherEntities.includes(e) || (other.tags || []).includes(e));
+
+    const otherBq = other.bq128Hex || computeBinaryQuantization128(`${other.topic} ${other.content}`);
+    const bqSim = hammingSimilarity128(newBq, otherBq);
+
+    if (shared.length > 0) {
+      const weight = Number(Math.min(0.98, 0.72 + shared.length * 0.08).toFixed(2));
+      candidates.push({
+        targetId: other.id,
+        weight,
+        relation: `ENTIDADE_${shared[0].toUpperCase().replace(/[^A-Z0-9]/g, '_')}`,
+      });
+    } else if (bqSim >= 0.72) {
+      candidates.push({
+        targetId: other.id,
+        weight: Number(bqSim.toFixed(2)),
+        relation: 'SIMILARIDADE_SEMANTICA',
+      });
+    }
+  }
+
+  candidates.sort((a, b) => b.weight - a.weight);
+  const inferredEdges: GraphEdge[] = candidates.slice(0, maxInferredEdges).map((c, idx) => ({
+    id: `edge-auto-${Date.now()}-${idx}-${c.targetId.slice(-4)}`,
+    source: newMemory.id,
+    target: c.targetId,
+    relation: c.relation,
+    weight: c.weight,
+  }));
+
+  return {
+    enrichedTags: Array.from(tagSet),
+    inferredEdges,
+    extractedEntities: entities,
+  };
+}
+
+/**
+ * §7 Recommended Addition 2: Scheduled Memory Vault Compaction & Ebbinghaus Pruning.
+ * 1. Auto-supersedes near-duplicate active memories (128-bit BQ similarity >= duplicateBqThreshold, default 0.92).
+ * 2. Prunes unpinned WORKING-tier memories untouched for > workingMaxAgeDays (default 7 days).
+ * 3. Decays importance by 1 step on unpinned EPISODIC memories whose Ebbinghaus retention fell below 0.20.
+ */
+export interface MemoryCompactionResult {
+  memories: MemoryItem[];
+  edges: GraphEdge[];
+  duplicatesSuperseded: number;
+  workingPruned: number;
+  importanceDecayed: number;
+}
+
+export function compactMemoryVault(params: {
+  memories: MemoryItem[];
+  edges: GraphEdge[];
+  nowMs?: number;
+  workingMaxAgeDays?: number;
+  duplicateBqThreshold?: number;
+}): MemoryCompactionResult {
+  const nowMs = params.nowMs ?? Date.now();
+  const nowIso = new Date(nowMs).toISOString();
+  const workingMaxAgeDays = Math.max(1, params.workingMaxAgeDays ?? 7);
+  const duplicateThreshold = params.duplicateBqThreshold ?? 0.92;
+
+  const cloned: MemoryItem[] = params.memories.map((m) => ({
+    ...m,
+    bq128Hex: m.bq128Hex || computeBinaryQuantization128(`${m.topic} ${m.content}`),
+  }));
+  const nextEdges: GraphEdge[] = [...params.edges];
+
+  let duplicatesSuperseded = 0;
+  let workingPruned = 0;
+  let importanceDecayed = 0;
+
+  // Sort active memories newest/highest-importance first so the canonical survivor supersedes older duplicates
+  const activeIndices = cloned
+    .map((m, idx) => ({ m, idx }))
+    .filter(({ m }) => !m.supersededBy && !m.validUntil)
+    .sort((a, b) => {
+      if (a.m.pinned !== b.m.pinned) return a.m.pinned ? -1 : 1;
+      const tA = Date.parse(a.m.updatedAt || a.m.createdAt || nowIso) || 0;
+      const tB = Date.parse(b.m.updatedAt || b.m.createdAt || nowIso) || 0;
+      return tB - tA;
+    });
+
+  for (let i = 0; i < activeIndices.length; i++) {
+    const survivor = cloned[activeIndices[i].idx];
+    if (survivor.supersededBy || survivor.validUntil) continue;
+
+    for (let j = i + 1; j < activeIndices.length; j++) {
+      const candidate = cloned[activeIndices[j].idx];
+      if (candidate.supersededBy || candidate.validUntil || candidate.pinned) continue;
+
+      const sim = hammingSimilarity128(survivor.bq128Hex!, candidate.bq128Hex!);
+      if (sim >= duplicateThreshold) {
+        candidate.validUntil = nowIso;
+        candidate.supersededBy = survivor.id;
+        candidate.updatedAt = nowIso;
+        duplicatesSuperseded += 1;
+        nextEdges.push({
+          id: `edge-compact-${nowMs}-${candidate.id.slice(-4)}`,
+          source: survivor.id,
+          target: candidate.id,
+          relation: 'COMPACTED_DUPLICATE',
+          weight: sim,
+        });
+      }
+    }
+  }
+
+  const prunedIds = new Set<string>();
+  const keptMemories: MemoryItem[] = [];
+
+  for (const mem of cloned) {
+    if (!mem.pinned && !mem.supersededBy && !mem.validUntil && mem.tier === 'WORKING') {
+      const refIso = mem.lastAccessedAt || mem.updatedAt || mem.createdAt;
+      const refMs = refIso ? Date.parse(refIso) : nowMs;
+      const ageDays = Number.isFinite(refMs) ? (nowMs - refMs) / 86_400_000 : 0;
+      if (ageDays > workingMaxAgeDays) {
+        prunedIds.add(mem.id);
+        workingPruned += 1;
+        continue;
+      }
+    }
+
+    if (!mem.pinned && !mem.supersededBy && !mem.validUntil && mem.tier === 'EPISODIC') {
+      const { retentionScore } = computeEbbinghausRetention(mem, nowMs);
+      const currentImp = mem.importance ?? 3;
+      if (retentionScore < 0.2 && currentImp > 1) {
+        mem.importance = currentImp - 1;
+        importanceDecayed += 1;
+      }
+    }
+
+    keptMemories.push(mem);
+  }
+
+  const filteredEdges = nextEdges.filter(
+    (e) => !prunedIds.has(e.source) && !prunedIds.has(e.target)
+  );
+
+  return {
+    memories: keptMemories,
+    edges: filteredEdges,
+    duplicatesSuperseded,
+    workingPruned,
+    importanceDecayed,
+  };
+}

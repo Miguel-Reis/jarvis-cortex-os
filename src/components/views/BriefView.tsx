@@ -463,7 +463,7 @@ export const BriefView: React.FC<BriefViewProps> = ({
                 className="text-cyan-300 hover:text-cyan-200 inline-flex items-center gap-1 whitespace-nowrap"
               >
                 <Brain className="w-3.5 h-3.5" />
-                Nativo 100% · -{(store.quota5h?.savedByDietTokens5h ?? 98460).toLocaleString('pt-PT')} tok
+                Nativo 100% · {(store.quota5h?.savedByDietTokens5h ?? 0).toLocaleString('pt-PT')} tok poupados
                 <ArrowUpRight className="w-3 h-3" />
               </button>
             </div>
@@ -545,7 +545,9 @@ export const BriefView: React.FC<BriefViewProps> = ({
             </div>
             <p className="text-base font-semibold text-slate-100 font-display tabular-nums">
               {store.routineCues.length} Padrões ·{' '}
-              {store.swarmRuns?.[0] ? `${store.swarmRuns[0].scale}x Ativo` : '48x Pronto'}
+              {store.swarmRuns?.[0]
+                ? `${store.swarmRuns[0].scale}x ${store.swarmRuns[0].source === 'SEED' ? 'Demo' : 'Verificado'}`
+                : '48x Pronto'}
             </p>
             <p className="text-xs text-slate-400 truncate">
               Conversão em Workflows Cron DAG e atalhos para Swarm 3D / Orbit
@@ -805,7 +807,8 @@ export const BriefView: React.FC<BriefViewProps> = ({
                           </button>
                         </div>
                         <p className="text-xs font-mono text-slate-400 tabular-nums break-all">
-                          {contract.verificationRule} · {contract.verificationTarget}
+                          {contract.verificationRule} · {contract.verificationTarget} ·{' '}
+                          {contract.source === 'REAL' ? 'Real' : 'Demo'}
                           {contract.evidenceHash ? ` · SHA ${contract.evidenceHash}` : ''}
                         </p>
                         {contract.outputSummary && (

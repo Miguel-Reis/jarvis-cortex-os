@@ -1,9 +1,11 @@
-import { FunctionDeclaration, GoogleGenAI, ThinkingLevel, Type } from '@google/genai';
+import { type FunctionDeclaration, GoogleGenAI, ThinkingLevel, Type } from '@google/genai';
 import {
+  buildDeterministicArtifactFromPrompt,
   buildDeterministicWorkflowFromPrompt,
   computeGoalProgressFromSubtasks,
   detectPromptInjection,
   extractDeterministicPlanFromPrompt,
+  extractUrlsFromPrompt,
   isLocalOpenAiCompatibleEndpoint,
   normalizeGeminiModelId,
   rankQ18Actions,
@@ -12,15 +14,18 @@ import {
 } from '../shared/cortex-math.ts';
 import { STANDARD_SKILLS_LIBRARY } from '../shared/skills-plugins-catalog.ts';
 import type {
+  ArtifactKind,
   AttachmentItem,
   ChatMessage,
   GoalItem,
   GoalSubtask,
+  GroundingSourceItem,
   JevRouteDecision,
   LanguageCode,
   MemoryCategory,
   PersonalityMode,
   ProjectActivityLogEntry,
+  ProjectArtifact,
   Room,
   ScreenCaptureSnapshot,
   SkillItem,
@@ -125,6 +130,7 @@ type LanguageModeAlias = LanguageCode;
 
 const STUDIO_CORE_TOOL_NAMES = new Set([
   'upsert_project_goal',
+  'upsert_project_artifact',
   'spawn_project_subagent',
   'activate_antigravity_skill',
   'call_mcp_gateway_tool',
@@ -170,6 +176,37 @@ export const AGENT_TOOL_DECLARATIONS: FunctionDeclaration[] = [
         },
       },
       required: ['title'],
+    },
+  },
+  {
+    name: 'upsert_project_artifact',
+    description:
+      'Generate or update an interactive Studio Artifact (live HTML/Tailwind UI preview, SVG architecture diagram, Markdown technical spec, or TypeScript/Python code module) inside the right-hand Artifacts panel with automatic version history.',
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        title: {
+          type: Type.STRING,
+          description: 'Concise title of the artifact (reusing an existing title creates v2, v3, etc.).',
+        },
+        kind: {
+          type: Type.STRING,
+          description: 'One of HTML_PREVIEW, SVG_DIAGRAM, MARKDOWN_DOC, CODE_MODULE.',
+        },
+        content: {
+          type: Type.STRING,
+          description: 'Complete self-contained HTML document, SVG markup, Markdown, or source code.',
+        },
+        summary: {
+          type: Type.STRING,
+          description: '1-sentence summary of what was created or changed in this version.',
+        },
+        language: {
+          type: Type.STRING,
+          description: 'Optional language identifier (html, svg, markdown, typescript, python).',
+        },
+      },
+      required: ['title', 'kind', 'content'],
     },
   },
   {
@@ -530,6 +567,119 @@ export async function executeAgentTool(
         durationMs,
       },
       rawResult: { created: wasCreated, goal: goalObj },
+    };
+  }
+
+  if (name === 'upsert_project_artifact') {
+    const cleanTitle = String(args.title || 'Artefacto Interativo').trim();
+    const validKinds: ArtifactKind[] = ['HTML_PREVIEW', 'SVG_DIAGRAM', 'MARKDOWN_DOC', 'CODE_MODULE'];
+    const rawKind = String(args.kind || 'HTML_PREVIEW').toUpperCase() as ArtifactKind;
+    const kind: ArtifactKind = validKinds.includes(rawKind) ? rawKind : 'HTML_PREVIEW';
+    const content = String(args.content || '').trim();
+    const summary = String(args.summary || 'Versão gerada no Estúdio Jarvis.').trim();
+    const language = String(
+      args.language ||
+        (kind === 'HTML_PREVIEW'
+          ? 'html'
+          : kind === 'SVG_DIAGRAM'
+            ? 'svg'
+            : kind === 'MARKDOWN_DOC'
+              ? 'markdown'
+              : 'typescript')
+    ).trim();
+
+    const targetProjectId =
+      studioCtx?.projectId || db.getState().activeProjectId || 'proj-website-studio';
+    const targetChatId = studioCtx?.chatId || db.getState().activeChatId || 'chat-web-main';
+    const author = studioCtx?.actor || 'JARVIS';
+
+    let savedArtifact: ProjectArtifact | null = null;
+    let isNewArtifact = false;
+
+    db.update((draft) => {
+      if (!draft.projectArtifacts) draft.projectArtifacts = [];
+      const existing = draft.projectArtifacts.find(
+        (a) =>
+          a.projectId === targetProjectId &&
+          a.title.toLowerCase() === cleanTitle.toLowerCase()
+      );
+
+      if (existing) {
+        const nextVer = existing.versions.length + 1;
+        existing.kind = kind;
+        existing.language = language;
+        existing.currentVersion = nextVer;
+        existing.updatedAt = nowIso;
+        existing.versions.push({
+          version: nextVer,
+          content,
+          summary,
+          createdAt: nowIso,
+          author,
+        });
+        savedArtifact = { ...existing, versions: [...existing.versions] };
+      } else {
+        isNewArtifact = true;
+        const created: ProjectArtifact = {
+          id: `art-${Date.now()}-${Math.random().toString(36).slice(2, 5)}`,
+          projectId: targetProjectId,
+          chatId: targetChatId,
+          title: cleanTitle,
+          kind,
+          language,
+          currentVersion: 1,
+          createdAt: nowIso,
+          updatedAt: nowIso,
+          versions: [
+            {
+              version: 1,
+              content,
+              summary,
+              createdAt: nowIso,
+              author,
+            },
+          ],
+        };
+        draft.projectArtifacts.unshift(created);
+        savedArtifact = { ...created };
+      }
+    });
+
+    const durationMs = Math.max(1, Date.now() - t0);
+    const artObj = savedArtifact!;
+    const summaryText = isNewArtifact
+      ? `Artefacto criado: "${artObj.title}" (v1 · ${artObj.kind})`
+      : `Artefacto atualizado: "${artObj.title}" (v${artObj.currentVersion})`;
+
+    if (studioCtx) {
+      emitStudioActivity({
+        projectId: studioCtx.projectId,
+        chatId: studioCtx.chatId,
+        actor: studioCtx.actor,
+        kind: 'ARTIFACT_GENERATED',
+        status: 'SUCCESS',
+        summary: summaryText,
+        detail: summary,
+        durationMs,
+      });
+      studioCtx.studioEventsOut.push({
+        type: 'ARTIFACT',
+        id: artObj.id,
+        title: artObj.title,
+        subtitle: `v${artObj.currentVersion} · Abrir no separador Artefactos`,
+      });
+    }
+
+    return {
+      record: {
+        id,
+        name,
+        args: { title: cleanTitle, kind, summary },
+        status: 'SUCCESS',
+        outputSummary: summaryText,
+        durationMs,
+      },
+      rawResult: { created: isNewArtifact, artifact: artObj },
     };
   }
 
@@ -1387,6 +1537,40 @@ async function runDeterministicReActTurn(params: {
     );
   }
 
+  const asksForArtifact =
+    lower.includes('artefacto') ||
+    lower.includes('protótipo') ||
+    lower.includes('prototipo') ||
+    lower.includes('diagrama svg') ||
+    lower.includes('preview html') ||
+    lower.includes('landing page interativa');
+
+  if (asksForArtifact) {
+    const detArt = buildDeterministicArtifactFromPrompt({
+      prompt: userText,
+      project: activeProject,
+    });
+    const { record, rawResult } = await executeAgentTool(
+      'upsert_project_artifact',
+      {
+        title: detArt.title,
+        kind: detArt.kind,
+        content: detArt.content,
+        summary: detArt.summary,
+        language: detArt.language,
+      },
+      activePort,
+      studioCtx
+    );
+    toolCalls.push(record);
+    const createdArt = rawResult.artifact as ProjectArtifact | undefined;
+    if (createdArt) {
+      sections.push(
+        `- **Artefacto Interativo Gerado**: **${createdArt.title}** (\`v${createdArt.currentVersion}\`) disponível para pré-visualização ao vivo no separador **Artefactos** à direita.`
+      );
+    }
+  }
+
   if (sections.length === 0) {
     const { record } = await executeAgentTool(
       'call_mcp_gateway_tool',
@@ -1423,6 +1607,7 @@ export async function runAgentChatTurn(params: {
   userText: string;
   attachments?: AttachmentItem[];
   screenFrame?: IncomingScreenFrame;
+  enableWebGrounding?: boolean;
   activePort?: number;
 }): Promise<{ userMessage: ChatMessage; assistantMessage: ChatMessage; blockedByCanary: boolean }> {
   const {
@@ -1432,6 +1617,7 @@ export async function runAgentChatTurn(params: {
     userText,
     attachments = [],
     screenFrame,
+    enableWebGrounding = false,
     activePort = 3000,
   } = params;
 
@@ -1632,6 +1818,10 @@ export async function runAgentChatTurn(params: {
     }
   });
 
+  const promptUrls = extractUrlsFromPrompt(userText);
+  const useWebTools = Boolean(enableWebGrounding || promptUrls.length > 0);
+  const groundingSourcesOut: GroundingSourceItem[] = [];
+
   const provider = freshState.settings.modelProvider;
   const ai = provider === 'GEMINI_STUDIO' ? getGeminiClient() : null;
   let replyText = '';
@@ -1658,12 +1848,15 @@ export async function runAgentChatTurn(params: {
       ? `Skills Antigravity Ativas no Projeto: ${projectSkills.map((s) => `${s.name} (${s.quickCommand})`).join(', ')}.`
       : '',
     compressedContextBlock ? `Memória Relevante:\n${compressedContextBlock}` : '',
-    'REGRAS DE ESTÚDIO AGÊNTICO (MUITO IMPORTANTE):\n1. Sempre que o utilizador apresentar uma ideia, pedir para planear funcionalidades (ex: fazer um website, criar uma app, autenticação, pagamentos, UI, API) ou atualizar o rumo do projeto, invoca proativamente `upsert_project_goal` (com 2 a 4 subtasks claras) e, se fizer sentido ter ajuda especializada, invoca `spawn_project_subagent` e/ou `activate_antigravity_skill`.\n2. Se for fornecida uma imagem do ecrã em tempo real (`inlineData`), observa atentamente o que está no ecrã do utilizador (código, design, browser, erros ou janelas) e responde diretamente sobre o que estás a ver.\n3. Se o utilizador perguntar o que está no ecrã dele e não houver imagem anexada no turno, invoca `capture_and_inspect_sidecar_screen`.',
+    useWebTools
+      ? 'PESQUISA WEB & URL CONTEXT ATIVOS: Usa a pesquisa Google em direto e/ou leitura dos URLs fornecidos para validar factos atuais, documentação oficial, preços ou referências antes de responder.'
+      : '',
+    'REGRAS DE ESTÚDIO AGÊNTICO (MUITO IMPORTANTE):\n1. Sempre que o utilizador apresentar uma ideia, pedir para planear funcionalidades (ex: fazer um website, criar uma app, autenticação, pagamentos, UI, API) ou atualizar o rumo do projeto, invoca proativamente `upsert_project_goal` (com 2 a 4 subtasks claras) e, se fizer sentido ter ajuda especializada, invoca `spawn_project_subagent` e/ou `activate_antigravity_skill`.\n2. Sempre que o utilizador pedir um protótipo visual, landing page, componente UI, diagrama SVG, especificação Markdown ou módulo de código, invoca `upsert_project_artifact` para renderizar o resultado ao vivo no painel Artefactos.\n3. Se for fornecida uma imagem do ecrã em tempo real (`inlineData`), observa atentamente o que está no ecrã do utilizador (código, design, browser, erros ou janelas) e responde diretamente sobre o que estás a ver.\n4. Se o utilizador perguntar o que está no ecrã dele e não houver imagem anexada no turno, invoca `capture_and_inspect_sidecar_screen`.',
   ]
     .filter(Boolean)
     .join('\n\n');
 
-  if (ai && (!jevDecision.microTick || Boolean(screenFrame))) {
+  if (ai && (!jevDecision.microTick || Boolean(screenFrame) || useWebTools)) {
     try {
       const modelName = normalizeGeminiModelId(
         room.modelOverride || freshState.settings.preferredGeminiModel
@@ -1715,32 +1908,80 @@ export async function runAgentChatTurn(params: {
         (d) => d.name && allowedSet.has(d.name)
       );
 
+      const buildToolsConfig = (withWeb: boolean) => {
+        const toolsArr: Record<string, unknown>[] = [];
+        if (filteredDecls.length > 0) {
+          toolsArr.push({ functionDeclarations: filteredDecls });
+        }
+        if (withWeb) {
+          toolsArr.push({ googleSearch: {} });
+          if (promptUrls.length > 0) {
+            toolsArr.push({ urlContext: {} });
+          }
+        }
+        return {
+          systemInstruction,
+          tools: toolsArr.length > 0 ? (toolsArr as never) : undefined,
+          toolConfig:
+            withWeb && filteredDecls.length > 0
+              ? ({ includeServerSideToolInvocations: true } as never)
+              : undefined,
+        };
+      };
+
       let activeGeminiModel = modelName;
+      let webEnabledThisTurn = useWebTools;
+
       for (let step = 0; step < 4; step++) {
         let response;
         try {
           response = await ai.models.generateContent({
             model: activeGeminiModel,
             contents: contents as never,
-            config: {
-              systemInstruction,
-              tools: filteredDecls.length > 0 ? [{ functionDeclarations: filteredDecls }] : undefined,
-            },
+            config: buildToolsConfig(webEnabledThisTurn),
           });
         } catch (stepErr) {
           const errStr = (stepErr as Error).message || '';
-          if (activeGeminiModel !== 'gemini-3.1-flash-lite' && /503|UNAVAILABLE|overloaded|high demand/i.test(errStr)) {
+          if (
+            activeGeminiModel !== 'gemini-3.1-flash-lite' &&
+            /503|UNAVAILABLE|overloaded|high demand/i.test(errStr)
+          ) {
             activeGeminiModel = 'gemini-3.1-flash-lite';
             response = await ai.models.generateContent({
               model: activeGeminiModel,
               contents: contents as never,
-              config: {
-                systemInstruction,
-                tools: filteredDecls.length > 0 ? [{ functionDeclarations: filteredDecls }] : undefined,
-              },
+              config: buildToolsConfig(webEnabledThisTurn),
+            });
+          } else if (webEnabledThisTurn) {
+            webEnabledThisTurn = false;
+            response = await ai.models.generateContent({
+              model: activeGeminiModel,
+              contents: contents as never,
+              config: buildToolsConfig(false),
             });
           } else {
             throw stepErr;
+          }
+        }
+
+        // Collect verified Google Search / URL Context grounding citations
+        const gChunks = (
+          response.candidates?.[0] as {
+            groundingMetadata?: {
+              groundingChunks?: { web?: { uri?: string; title?: string } }[];
+            };
+          }
+        )?.groundingMetadata?.groundingChunks;
+
+        if (Array.isArray(gChunks)) {
+          for (const ch of gChunks) {
+            const uri = ch.web?.uri?.trim();
+            if (uri && !groundingSourcesOut.some((s) => s.uri === uri)) {
+              groundingSourcesOut.push({
+                uri,
+                title: ch.web?.title?.trim() || uri,
+              });
+            }
           }
         }
 
@@ -1775,8 +2016,38 @@ export async function runAgentChatTurn(params: {
         }
 
         replyText = (response.text ?? '').trim();
-        engineUsed = `GEMINI (${activeGeminiModel})`;
+        engineUsed = `GEMINI (${activeGeminiModel}${webEnabledThisTurn ? ' + Web' : ''})`;
         break;
+      }
+
+      if (useWebTools) {
+        for (const u of promptUrls) {
+          if (!groundingSourcesOut.some((s) => s.uri === u)) {
+            groundingSourcesOut.push({ uri: u, title: u });
+          }
+        }
+        emitStudioActivity({
+          projectId: targetProjectId,
+          chatId: targetChatId,
+          actor: studioCtx.actor,
+          kind: 'WEB_RESEARCH',
+          status: 'SUCCESS',
+          summary: `Pesquisa Web & URL em direto (${groundingSourcesOut.length} fonte(s) verificadas)`,
+          detail:
+            groundingSourcesOut
+              .slice(0, 3)
+              .map((s) => s.title)
+              .join(' · ') || 'Google Search Grounding consultado',
+          durationMs: Math.max(1, Math.round(performance.now() - turnStart)),
+        });
+        if (groundingSourcesOut.length > 0) {
+          studioEventsOut.push({
+            type: 'WEB',
+            id: `web-${Date.now()}`,
+            title: `Pesquisa Web Verificada (${groundingSourcesOut.length} fontes)`,
+            subtitle: groundingSourcesOut[0].title,
+          });
+        }
       }
 
       if (!replyText) {
@@ -1924,6 +2195,7 @@ export async function runAgentChatTurn(params: {
     engineUsed,
     screenIncluded: Boolean(screenFrame),
     studioEvents: studioEventsOut.length > 0 ? studioEventsOut : undefined,
+    groundingSources: groundingSourcesOut.length > 0 ? groundingSourcesOut : undefined,
     toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
     jevRoute: jevDecision,
   };
@@ -1979,6 +2251,7 @@ export async function analyzeLiveScreenFrame(params: {
   projectId?: string;
   chatId?: string;
   prompt?: string;
+  regionLabel?: string;
   screenFrame?: IncomingScreenFrame;
   activePort?: number;
 }): Promise<{
@@ -2004,7 +2277,9 @@ export async function analyzeLiveScreenFrame(params: {
       mimeType: params.screenFrame.mimeType,
       dataBase64: params.screenFrame.dataBase64,
       activeWindowTitle:
-        params.screenFrame.activeWindowTitle || 'Stream em Direto do Ecrã',
+        params.regionLabel
+          ? `Zona selecionada (${params.regionLabel}) · ${params.screenFrame.activeWindowTitle || 'Ecrã'}`
+          : params.screenFrame.activeWindowTitle || 'Stream em Direto do Ecrã',
     };
   } else {
     snapshot = await captureSidecarDesktopScreen('dev-local-host', activePort);
@@ -2017,11 +2292,14 @@ export async function analyzeLiveScreenFrame(params: {
   if (ai && RASTER_VISION_MIMES.has(snapshot.mimeType.toLowerCase())) {
     try {
       const modelName = normalizeGeminiModelId(state.settings.preferredGeminiModel);
-      const askPrompt =
-        params.prompt?.trim() ||
-        `Observa este ecrã em tempo real no contexto do projeto "${
-          activeProject?.name || 'Estúdio Jarvis'
-        }". Resume em 3 pontos curtos (PT-PT) o que está visível e sugere 1 melhoria ou próximo passo útil.`;
+      const regionPrefix = params.regionLabel
+        ? `[Foco na zona recortada pelo utilizador: ${params.regionLabel}] `
+        : '';
+      const askPrompt = params.prompt?.trim()
+        ? `${regionPrefix}${params.prompt.trim()}`
+        : `${regionPrefix}Observa este recorte/ecrã em tempo real no contexto do projeto "${
+            activeProject?.name || 'Estúdio Jarvis'
+          }". Resume em 3 pontos curtos (PT-PT) o que está visível e sugere 1 melhoria ou próximo passo útil.`;
 
       const res = await ai.models.generateContent({
         model: modelName,
@@ -2060,11 +2338,13 @@ export async function analyzeLiveScreenFrame(params: {
       .slice(0, 3)
       .map((p) => `${p.name} (${p.cpuPercent}% CPU)`)
       .join(', ');
-    analysis = `Ecrã capturado (${snapshot.width}×${snapshot.height}, fonte: ${
+    analysis = `${
+      params.regionLabel ? `Zona marcada (${params.regionLabel}) inspecionada` : 'Ecrã capturado'
+    } (${snapshot.width}×${snapshot.height}, fonte: ${
       snapshot.source === 'BROWSER_STREAM' ? 'Stream do Navegador' : 'Sidecar Nativo'
-    }). Janelas ativas: ${winList || snapshot.activeWindowTitle || hostSnap.hostname}. Processos em destaque: ${procList}. Tudo pronto para apoiar o projeto "${
-      activeProject?.name || 'Ativo'
-    }".`;
+    }).${params.prompt ? ` Pedido analisado: "${params.prompt}".` : ''} Janelas ativas: ${
+      winList || snapshot.activeWindowTitle || hostSnap.hostname
+    }. Processos: ${procList}.`;
   }
 
   snapshot.visionSummary = analysis;
@@ -2078,7 +2358,9 @@ export async function analyzeLiveScreenFrame(params: {
     actor: 'Visão Jarvis',
     kind: 'SCREEN_VISION',
     status: 'SUCCESS',
-    summary: `Inspeção visual do ecrã (${snapshot.source === 'BROWSER_STREAM' ? 'Stream WebRTC' : 'Sidecar'})`,
+    summary: params.regionLabel
+      ? `Inspeção de zona recortada (${params.regionLabel})`
+      : `Inspeção visual do ecrã (${snapshot.source === 'BROWSER_STREAM' ? 'Stream WebRTC' : 'Sidecar'})`,
     detail: analysis.slice(0, 220),
     durationMs: Math.max(1, Math.round(performance.now() - t0)),
   });
