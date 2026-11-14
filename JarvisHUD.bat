@@ -17,12 +17,11 @@ if not exist ".git" goto :skip_git
 where git >nul 2>nul
 if errorlevel 1 goto :skip_git
 echo [0/3] A sincronizar automaticamente com GitHub [origin/main]...
-if exist ".git\rebase-merge" git rebase --abort >nul 2>nul
-if exist ".git\rebase-apply" git rebase --abort >nul 2>nul
-git pull --rebase --autostash origin main
-if errorlevel 1 (
-  git rebase --abort >nul 2>nul
-  git pull --no-rebase --autostash origin main
+git rebase --abort >nul 2>nul
+git merge --abort >nul 2>nul
+git fetch origin main
+if not errorlevel 1 (
+  git reset --hard origin/main
 )
 :skip_git
 
