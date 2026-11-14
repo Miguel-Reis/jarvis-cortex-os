@@ -13,6 +13,8 @@ echo   Jarvis Gateway: http://localhost:8766  ^|  Antigravity Brain: :8765
 echo   Debug Mode:     FULL TRACE ENABLED     ^|  Log: logs\jarvis-debug.log
 echo ============================================================================
 
+powershell -NoProfile -Command "$c = Get-NetTCPConnection -LocalPort 8766 -State Listen -ErrorAction SilentlyContinue; if ($c) { foreach ($p in ($c.OwningProcess | Select-Object -Unique)) { if ($p -gt 0) { Stop-Process -Id $p -Force -ErrorAction SilentlyContinue } } }" >nul 2>nul
+
 if not exist ".git" goto :skip_git
 where git >nul 2>nul
 if errorlevel 1 goto :skip_git
@@ -47,8 +49,6 @@ if "%NEED_NPM_INSTALL%"=="1" (
 ) else (
   echo [1/3] Dependencias Node.js v4.0 verificadas.
 )
-
-powershell -NoProfile -Command "$c = Get-NetTCPConnection -LocalPort 8766 -State Listen -ErrorAction SilentlyContinue; if ($c) { foreach ($p in ($c.OwningProcess | Select-Object -Unique)) { if ($p -gt 0) { Stop-Process -Id $p -Force -ErrorAction SilentlyContinue } } }" >nul 2>nul
 
 echo [2/3] A aguardar arranque da porta 8766 para abrir o navegador automaticamente...
 start "" powershell -NoProfile -WindowStyle Hidden -Command "for($i=0;$i -lt 60;$i++){try{$r=Invoke-WebRequest -UseBasicParsing http://localhost:8766/api/health -TimeoutSec 1; if($r.StatusCode -eq 200){Start-Process 'http://localhost:8766'; break}}catch{}; Start-Sleep -Milliseconds 500}"
