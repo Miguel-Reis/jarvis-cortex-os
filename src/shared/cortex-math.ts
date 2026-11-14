@@ -2300,25 +2300,28 @@ export function extractDeterministicPlanFromPrompt(params: {
 // ============================================================================
 
 const DEPRECATED_GEMINI_MODELS = new Set([
+  'gemini-pro',
+  'gemini-pro-vision',
+  'gemini-1.0-pro',
   'gemini-1.5-flash',
   'gemini-1.5-pro',
-  'gemini-pro',
-  'gemini-2.0-flash',
-  'gemini-2.0-pro',
-  'gemini-2.0-flash-thinking',
-  'gemini-2.5-flash',
 ]);
 
 /**
  * Ensures the configured Gemini model is a supported @google/genai model,
- * migrating legacy/deprecated identifiers cleanly to 'gemini-3.8-flash'.
+ * stripping optional 'models/' prefixes and migrating retired 1.x identifiers
+ * while preserving any 2.x, 2.5, 3.x, or 4.x model available on the user's API key.
  */
 export function normalizeGeminiModelId(rawModel?: string): string {
-  const clean = (rawModel || '').trim();
-  if (!clean) return 'gemini-3.8-flash';
+  const clean = (rawModel || '').trim().replace(/^models\//i, '');
+  if (!clean) return 'gemini-2.5-flash';
   const lower = clean.toLowerCase();
-  if (DEPRECATED_GEMINI_MODELS.has(lower) || lower.startsWith('gemini-1.5-') || lower.startsWith('gemini-2.0-')) {
-    return 'gemini-3.8-flash';
+  if (
+    DEPRECATED_GEMINI_MODELS.has(lower) ||
+    lower.startsWith('gemini-1.0-') ||
+    lower.startsWith('gemini-1.5-')
+  ) {
+    return 'gemini-2.5-flash';
   }
   return clean;
 }

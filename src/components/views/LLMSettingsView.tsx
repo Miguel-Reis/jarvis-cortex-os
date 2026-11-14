@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import {
   Activity,
   Check,
@@ -50,38 +50,6 @@ interface LLMSettingsViewProps {
   onRefreshBootstrap: () => Promise<void>;
   embedded?: boolean;
 }
-
-const GEMINI_MODEL_OPTIONS: {
-  id: string;
-  label: string;
-  summary: string;
-}[] = [
-  {
-    id: 'gemini-4-argon',
-    label: 'gemini-4-argon (Gemini 4 — Reasoning / Preview)',
-    summary: 'Modelo Gemini 4 de nova geração para raciocínio profundo e orquestração complexa (requer acesso na API).',
-  },
-  {
-    id: 'gemini-4-pro',
-    label: 'gemini-4-pro (Gemini 4 Pro — Máxima Capacidade)',
-    summary: 'Modelo Gemini 4 Pro para síntese avançada, código e planeamento agêntico (requer acesso na API).',
-  },
-  {
-    id: 'gemini-4-flash',
-    label: 'gemini-4-flash (Gemini 4 Flash — Rápido)',
-    summary: 'Modelo Gemini 4 de baixa latência para chat contínuo, visão e execução de tools (requer acesso na API).',
-  },
-  {
-    id: 'gemini-3.8-flash',
-    label: 'gemini-3.8-flash (Recomendado Estável)',
-    summary: 'Multimodal (visão do ecrã em direto), 18 tools agênticas, rápido e elegível no escalão gratuito.',
-  },
-  {
-    id: 'gemini-3.1-flash-lite',
-    label: 'gemini-3.1-flash-lite (Ultra-Económico)',
-    summary: 'Latência mínima e quotas diárias mais amplas para tarefas rápidas de texto e triagem.',
-  },
-];
 
 const OPENAI_COMPAT_PRESETS: {
   label: string;
@@ -195,36 +163,20 @@ export const LLMSettingsView: React.FC<LLMSettingsViewProps> = ({
   const isLocalOpenAi = isLocalOpenAiCompatibleEndpoint(openRouterUrlDraft);
   const externalBrainOnline = Boolean(brain8765?.httpOnline || brain8765?.sqliteWalDetected);
 
-  const mergedGeminiOptions = useMemo(() => {
-    const seen = new Set<string>();
-    const combined: { id: string; label: string; summary: string }[] = [];
-
-    for (const preset of GEMINI_MODEL_OPTIONS) {
-      seen.add(preset.id);
-      combined.push(preset);
-    }
-    for (const apiModel of geminiDiscovered) {
-      if (seen.has(apiModel.id)) continue;
-      seen.add(apiModel.id);
-      combined.push({
+  const apiGeminiOptions = useMemo(
+    () =>
+      geminiDiscovered.map((apiModel) => ({
         id: apiModel.id,
         label:
           apiModel.displayName && apiModel.displayName !== apiModel.id
-            ? `${apiModel.id} — ${apiModel.displayName} [API]`
-            : `${apiModel.id} [API]`,
-        summary: apiModel.description || 'Modelo descoberto diretamente na tua GEMINI_API_KEY.',
-      });
-    }
-    const trimmedDraft = geminiModelDraft.trim();
-    if (trimmedDraft && !seen.has(trimmedDraft)) {
-      combined.push({
-        id: trimmedDraft,
-        label: `${trimmedDraft} (Personalizado)`,
-        summary: 'ID de modelo personalizado introduzido manualmente.',
-      });
-    }
-    return combined;
-  }, [geminiDiscovered, geminiModelDraft]);
+            ? `${apiModel.id} — ${apiModel.displayName}`
+            : apiModel.id,
+        summary:
+          apiModel.description ||
+          'Modelo ativo e verificado diretamente na tua GEMINI_API_KEY.',
+      })),
+    [geminiDiscovered]
+  );
 
   const costEstimate = useMemo(
     () =>
@@ -268,30 +220,44 @@ export const LLMSettingsView: React.FC<LLMSettingsViewProps> = ({
     }
   };
 
-  const discoverGeminiModels = async (silentToast = false) => {
+  const discoverGeminiModels = async (silentToast = false, forceRefresh = true) => {
     setLoadingGeminiModels(true);
     try {
+      const endpoint = forceRefresh
+        ? '/api/settings/gemini-models?refresh=1'
+        : '/api/settings/gemini-models';
       const res = await apiJson<{
         ok: boolean;
         models: { id: string; displayName: string; description?: string }[];
         detail: string;
-      }>('/api/settings/gemini-models');
+        activeModel?: string;
+      }>(endpoint);
       setGeminiDiscoveryNote(res.detail);
+      setLiveEnvStatus((prev) => ({ ...prev, geminiConfigured: res.ok }));
       if (res.ok && res.models.length > 0) {
         setGeminiDiscovered(res.models);
+        setGeminiModelDraft((prev) => {
+          if (res.models.some((m) => m.id === prev)) return prev;
+          return res.activeModel && res.models.some((m) => m.id === res.activeModel)
+            ? res.activeModel
+            : res.models[0].id;
+        });
         if (!silentToast) {
           pushToast({
-            title: `${res.models.length} modelos Gemini descobertos`,
+            title: `${res.models.length} modelos disponíveis na tua API`,
             detail: res.detail,
             tone: 'success',
           });
         }
-      } else if (!silentToast) {
-        pushToast({
-          title: 'Descoberta de modelos Gemini',
-          detail: res.detail,
-          tone: res.ok ? 'info' : 'error',
-        });
+      } else {
+        setGeminiDiscovered([]);
+        if (!silentToast) {
+          pushToast({
+            title: 'Descoberta de modelos Gemini',
+            detail: res.detail,
+            tone: res.ok ? 'info' : 'error',
+          });
+        }
       }
     } catch (err) {
       const msg = (err as Error).message;
@@ -307,6 +273,11 @@ export const LLMSettingsView: React.FC<LLMSettingsViewProps> = ({
       setLoadingGeminiModels(false);
     }
   };
+
+  useEffect(() => {
+    void discoverGeminiModels(true, false);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const runProviderProbe = async (
     targetProvider: ModelProviderType,
@@ -857,7 +828,10 @@ export const LLMSettingsView: React.FC<LLMSettingsViewProps> = ({
                 <span>Editaste o ambiente do servidor?</span>
                 <button
                   type="button"
-                  onClick={() => runProviderProbe(activeProvider)}
+                  onClick={async () => {
+                    await discoverGeminiModels(true, true);
+                    await runProviderProbe(activeProvider);
+                  }}
                   className="font-medium text-[#e59a54] hover:text-[#eba868] whitespace-nowrap"
                 >
                   Recarregar & Verificar
@@ -865,51 +839,66 @@ export const LLMSettingsView: React.FC<LLMSettingsViewProps> = ({
               </div>
             </div>
 
-            {/* Gemini Model Selection */}
+            {/* Gemini Model Selection — Strictly API-Verified Models */}
             <div className="space-y-2">
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <label
                   htmlFor="llm-gemini-model-select"
                   className="block text-xs font-medium text-slate-300"
                 >
-                  Modelo Gemini (@google/genai)
+                  Modelos Disponíveis na tua API (@google/genai)
                 </label>
                 <button
                   type="button"
-                  onClick={() => discoverGeminiModels(false)}
+                  onClick={() => discoverGeminiModels(false, true)}
                   disabled={loadingGeminiModels}
                   className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-[#0b0d11] border border-white/10 text-[11px] font-medium text-[#e59a54] hover:border-[#e59a54]/60 disabled:opacity-50 transition-colors whitespace-nowrap"
                 >
                   <RefreshCw className={`w-3 h-3 ${loadingGeminiModels ? 'animate-spin' : ''}`} />
-                  {loadingGeminiModels ? 'A consultar API...' : 'Descobrir Modelos da API'}
+                  {loadingGeminiModels ? 'A consultar API...' : 'Atualizar Lista da API'}
                 </button>
               </div>
               <select
                 id="llm-gemini-model-select"
-                value={geminiModelDraft}
-                onChange={(e) => setGeminiModelDraft(e.target.value)}
-                className="w-full px-3 py-2 text-xs font-mono bg-[#0b0d11] border border-white/10 rounded-lg text-slate-100 focus:outline-none focus:border-[#e59a54]"
+                value={apiGeminiOptions.length > 0 ? geminiModelDraft : ''}
+                disabled={loadingGeminiModels || apiGeminiOptions.length === 0}
+                onChange={async (e) => {
+                  const chosen = e.target.value;
+                  setGeminiModelDraft(chosen);
+                  if (chosen) {
+                    await persistSettings(
+                      { preferredGeminiModel: chosen },
+                      `Modelo Gemini ativo: ${chosen}`
+                    );
+                  }
+                }}
+                className="w-full px-3 py-2 text-xs font-mono bg-[#0b0d11] border border-white/10 rounded-lg text-slate-100 focus:outline-none focus:border-[#e59a54] disabled:opacity-60"
               >
-                {mergedGeminiOptions.map((opt) => (
-                  <option key={opt.id} value={opt.id}>
-                    {opt.label}
+                {apiGeminiOptions.length === 0 ? (
+                  <option value="">
+                    {loadingGeminiModels
+                      ? 'A consultar modelos compatíveis na tua GEMINI_API_KEY...'
+                      : 'Nenhum modelo carregado — configura GEMINI_API_KEY no .env e clica Atualizar'}
                   </option>
-                ))}
+                ) : (
+                  apiGeminiOptions.map((opt) => (
+                    <option key={opt.id} value={opt.id}>
+                      {opt.label}
+                    </option>
+                  ))
+                )}
               </select>
-              <input
-                id="llm-gemini-model-custom"
-                type="text"
-                value={geminiModelDraft}
-                onChange={(e) => setGeminiModelDraft(e.target.value)}
-                placeholder="Ou escreve qualquer ID exato da tua API (ex: gemini-4-argon)"
-                className="w-full px-3 py-1.5 text-xs font-mono bg-[#0b0d11] border border-white/10 rounded-lg text-slate-200 placeholder:text-slate-500 focus:outline-none focus:border-[#e59a54]"
-              />
-              <p className="text-[11px] text-slate-400">
-                {mergedGeminiOptions.find((o) => o.id === geminiModelDraft)?.summary ||
-                  'Modelo personalizado selecionado.'}
-              </p>
+              {apiGeminiOptions.length > 0 && (
+                <p className="text-[11px] text-slate-400">
+                  {apiGeminiOptions.find((o) => o.id === geminiModelDraft)?.summary}
+                </p>
+              )}
               {geminiDiscoveryNote && (
-                <p className="text-[11px] text-emerald-400/90 font-mono">
+                <p
+                  className={`text-[11px] font-mono ${
+                    apiGeminiOptions.length > 0 ? 'text-emerald-400/90' : 'text-amber-400/90'
+                  }`}
+                >
                   {geminiDiscoveryNote}
                 </p>
               )}

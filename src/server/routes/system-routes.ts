@@ -9,6 +9,7 @@ import { db } from '../db.ts';
 import { runSystemDoctor } from '../doctor.ts';
 import {
   listAvailableGeminiModels,
+  resolveUsableGeminiModel,
   testModelProviderConnection,
 } from '../gemini-engine.ts';
 import { audit, respondError, respondOk } from '../http-helpers.ts';
@@ -240,10 +241,20 @@ export function createSystemRouter(ctx: SystemRouterContext): express.Router {
     respondOk(res, result);
   });
 
-  router.get('/api/settings/gemini-models', async (_req, res) => {
+  router.get('/api/settings/gemini-models', async (req, res) => {
     ctx.reloadDotEnv();
-    const result = await listAvailableGeminiModels();
-    respondOk(res, result);
+    const forceRefresh = req.query.refresh === '1' || req.query.refresh === 'true';
+    const prevModel = db.getState().settings.preferredGeminiModel;
+    const result = await listAvailableGeminiModels(forceRefresh);
+    let activeModel = prevModel;
+    if (result.ok && result.models.length > 0) {
+      const resolved = await resolveUsableGeminiModel(prevModel, false);
+      activeModel = resolved.model;
+      if (activeModel !== prevModel) {
+        ctx.broadcastSse('state_updated', { section: 'settings' });
+      }
+    }
+    respondOk(res, { ...result, activeModel });
   });
 
   router.get('/api/backup/export', (_req, res) => {

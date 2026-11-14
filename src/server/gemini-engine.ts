@@ -1858,9 +1858,13 @@ export async function runAgentChatTurn(params: {
 
   if (ai && (!jevDecision.microTick || Boolean(screenFrame) || useWebTools)) {
     try {
-      const modelName = normalizeGeminiModelId(
+      const resolvedRoomModel = await resolveUsableGeminiModel(
         room.modelOverride || freshState.settings.preferredGeminiModel
       );
+      const modelName = resolvedRoomModel.model;
+      const fallbackApiModel = resolvedRoomModel.discovered.find(
+        (m) => m.id !== modelName && /flash|lite/i.test(m.id)
+      )?.id;
       const recentHistory = freshState.messages
         .filter((m) => (m.chatId ? m.chatId === targetChatId : m.roomId === room.id))
         .slice(-8)
@@ -1943,10 +1947,11 @@ export async function runAgentChatTurn(params: {
         } catch (stepErr) {
           const errStr = (stepErr as Error).message || '';
           if (
-            activeGeminiModel !== 'gemini-3.1-flash-lite' &&
-            /503|UNAVAILABLE|overloaded|high demand/i.test(errStr)
+            fallbackApiModel &&
+            activeGeminiModel !== fallbackApiModel &&
+            /503|UNAVAILABLE|overloaded|high demand|404|NOT_FOUND/i.test(errStr)
           ) {
-            activeGeminiModel = 'gemini-3.1-flash-lite';
+            activeGeminiModel = fallbackApiModel;
             response = await ai.models.generateContent({
               model: activeGeminiModel,
               contents: contents as never,
@@ -2291,7 +2296,9 @@ export async function analyzeLiveScreenFrame(params: {
 
   if (ai && RASTER_VISION_MIMES.has(snapshot.mimeType.toLowerCase())) {
     try {
-      const modelName = normalizeGeminiModelId(state.settings.preferredGeminiModel);
+      const { model: modelName } = await resolveUsableGeminiModel(
+        state.settings.preferredGeminiModel
+      );
       const regionPrefix = params.regionLabel
         ? `[Foco na zona recortada pelo utilizador: ${params.regionLabel}] `
         : '';
@@ -2388,6 +2395,9 @@ export async function synthesizeBriefText(customContext?: string): Promise<strin
   }
 
   try {
+    const { model: modelName } = await resolveUsableGeminiModel(
+      state.settings.preferredGeminiModel
+    );
     const prompt = customContext
       ? `${customContext}\nResponde em 2 a 3 frases executivas concisas (${state.settings.language}).`
       : `Gera um Briefing Executivo matinal de 3 frases (${state.settings.language}) para ${state.settings.operatorName}:
@@ -2398,7 +2408,7 @@ export async function synthesizeBriefText(customContext?: string): Promise<strin
 - Aprovações na Inbox: ${pendingApprovals}`;
 
     const res = await ai.models.generateContent({
-      model: 'gemini-3.8-flash',
+      model: modelName,
       contents: prompt,
       config: {
         systemInstruction: getPersonalityDirective(state.settings.personalityMode, state.settings.language),
@@ -2425,8 +2435,11 @@ export async function generateWorkflowFromNaturalLanguage(prompt: string): Promi
   }
 
   try {
+    const { model: modelName } = await resolveUsableGeminiModel(
+      state.settings.preferredGeminiModel
+    );
     const res = await ai.models.generateContent({
-      model: 'gemini-3.8-flash',
+      model: modelName,
       contents: `Converte esta descrição de automação num grafo DAG de workflow J.A.R.V.I.S. (${state.settings.language}): "${prompt}"`,
       config: {
         responseMimeType: 'application/json',
@@ -2528,13 +2541,69 @@ export interface ProviderConnectivityResult {
   envKeysStatus: { geminiConfigured: boolean; openRouterConfigured: boolean };
 }
 
-export async function listAvailableGeminiModels(): Promise<{
+export interface DiscoveredGeminiModel {
+  id: string;
+  displayName: string;
+  description?: string;
+}
+
+let cachedGeminiModels: {
+  keyFingerprint: string;
+  expiresAt: number;
+  models: DiscoveredGeminiModel[];
+  detail: string;
+} | null = null;
+
+function isUsableGeminiChatModel(id: string, supportedActions: string[]): boolean {
+  const lower = id.toLowerCase();
+  if (!lower.startsWith('gemini-')) return false;
+  if (lower.startsWith('gemini-1.0') || lower.startsWith('gemini-1.5')) return false;
+
+  // Must support unary generateContent when actions metadata is present
+  if (supportedActions.length > 0 && !supportedActions.includes('generateContent')) {
+    return false;
+  }
+
+  // Exclude single-modality / non-chat endpoints that fail on standard text & tool calling
+  const excludedTokens = [
+    'embedding',
+    '-tts',
+    'native-audio',
+    '-live',
+    'live-',
+    'image-generation',
+    '-image',
+    'aqa',
+    'robotics',
+    'computer-use',
+    'learnlm',
+  ];
+  if (excludedTokens.some((tok) => lower.includes(tok))) {
+    return false;
+  }
+  return true;
+}
+
+function pickBestDiscoveredGeminiModel(models: DiscoveredGeminiModel[]): string {
+  if (models.length === 0) return 'gemini-2.5-flash';
+  const nonLiteFlash = models.find(
+    (m) => /flash/i.test(m.id) && !/lite/i.test(m.id) && !/-\d{2}-\d{2}$/.test(m.id)
+  );
+  if (nonLiteFlash) return nonLiteFlash.id;
+  const anyPro = models.find((m) => /pro/i.test(m.id) && !/-\d{2}-\d{2}$/.test(m.id));
+  if (anyPro) return anyPro.id;
+  return models[0].id;
+}
+
+export async function listAvailableGeminiModels(forceRefresh = false): Promise<{
   ok: boolean;
-  models: { id: string; displayName: string; description?: string }[];
+  models: DiscoveredGeminiModel[];
   detail: string;
 }> {
+  const rawKey = process.env.GEMINI_API_KEY?.trim() || '';
   const ai = getGeminiClient();
-  if (!ai || !process.env.GEMINI_API_KEY?.trim()) {
+  if (!ai || !rawKey) {
+    cachedGeminiModels = null;
     return {
       ok: false,
       models: [],
@@ -2542,36 +2611,64 @@ export async function listAvailableGeminiModels(): Promise<{
     };
   }
 
+  const keyFp = `${rawKey.slice(0, 6)}:${rawKey.length}`;
+  if (
+    !forceRefresh &&
+    cachedGeminiModels &&
+    cachedGeminiModels.keyFingerprint === keyFp &&
+    cachedGeminiModels.expiresAt > Date.now()
+  ) {
+    return {
+      ok: true,
+      models: cachedGeminiModels.models,
+      detail: cachedGeminiModels.detail,
+    };
+  }
+
   try {
     const fetchModels = async () => {
       const pager = await ai.models.list({ config: { pageSize: 100 } });
-      const items: { id: string; displayName: string; description?: string }[] = [];
+      const seen = new Set<string>();
+      const items: DiscoveredGeminiModel[] = [];
       for await (const mdl of pager) {
         const rawName = String(mdl.name || '');
-        const id = rawName.replace(/^models\//, '').trim();
-        if (!id || !id.toLowerCase().includes('gemini')) continue;
-        const actions = (mdl.supportedActions || []) as string[];
-        if (actions.length > 0 && !actions.some((a) => a.toLowerCase().includes('generate'))) {
-          continue;
-        }
+        const id = rawName.replace(/^models\//i, '').trim();
+        if (!id || seen.has(id)) continue;
+        const actions = ((mdl.supportedActions || []) as string[]).map((a) => String(a));
+        if (!isUsableGeminiChatModel(id, actions)) continue;
+        seen.add(id);
         items.push({
           id,
           displayName: String(mdl.displayName || id),
           description: mdl.description ? String(mdl.description) : undefined,
         });
       }
-      items.sort((a, b) => b.id.localeCompare(a.id, undefined, { numeric: true }));
+      items.sort((a, b) => {
+        const aDated = /-\d{2}-\d{2}$|-\d{3}$/.test(a.id) ? 1 : 0;
+        const bDated = /-\d{2}-\d{2}$|-\d{3}$/.test(b.id) ? 1 : 0;
+        const verCmp = b.id.localeCompare(a.id, undefined, { numeric: true });
+        if (verCmp !== 0 && a.id.slice(0, 10) !== b.id.slice(0, 10)) return verCmp;
+        if (aDated !== bDated) return aDated - bDated;
+        return verCmp;
+      });
       return items;
     };
 
     const timeoutPromise = new Promise<never>((_, reject) =>
-      setTimeout(() => reject(new Error('TIMEOUT_LIST_MODELS')), 4500)
+      setTimeout(() => reject(new Error('TIMEOUT_LIST_MODELS')), 5500)
     );
     const models = await Promise.race([fetchModels(), timeoutPromise]);
+    const detail = `${models.length} modelo(s) ativos e compatíveis na tua GEMINI_API_KEY.`;
+    cachedGeminiModels = {
+      keyFingerprint: keyFp,
+      expiresAt: Date.now() + 60_000,
+      models,
+      detail,
+    };
     return {
       ok: true,
       models,
-      detail: `${models.length} modelo(s) Gemini descobertos na tua API Key.`,
+      detail,
     };
   } catch (err) {
     return {
@@ -2580,6 +2677,27 @@ export async function listAvailableGeminiModels(): Promise<{
       detail: `Não foi possível listar modelos da API: ${(err as Error).message}`,
     };
   }
+}
+
+export async function resolveUsableGeminiModel(
+  preferredModel?: string,
+  forceRefresh = false
+): Promise<{ model: string; discovered: DiscoveredGeminiModel[] }> {
+  const normalized = normalizeGeminiModelId(preferredModel);
+  const listed = await listAvailableGeminiModels(forceRefresh);
+  if (!listed.ok || listed.models.length === 0) {
+    return { model: normalized, discovered: [] };
+  }
+  if (listed.models.some((m) => m.id === normalized)) {
+    return { model: normalized, discovered: listed.models };
+  }
+  const best = pickBestDiscoveredGeminiModel(listed.models);
+  if (db.getState().settings.preferredGeminiModel !== best) {
+    db.update((draft) => {
+      draft.settings.preferredGeminiModel = best;
+    });
+  }
+  return { model: best, discovered: listed.models };
 }
 
 export async function testModelProviderConnection(params?: {
@@ -2625,7 +2743,7 @@ export async function testModelProviderConnection(params?: {
   }
 
   if (provider === 'GEMINI_STUDIO') {
-    const targetModel = normalizeGeminiModelId(
+    const requestedModel = normalizeGeminiModelId(
       params?.preferredGeminiModel || state.settings.preferredGeminiModel
     );
     const ai = getGeminiClient();
@@ -2634,14 +2752,19 @@ export async function testModelProviderConnection(params?: {
         ok: false,
         provider,
         latencyMs: Math.max(1, Math.round(performance.now() - t0)),
-        modelUsed: targetModel,
+        modelUsed: requestedModel,
         endpointUsed: '@google/genai Server SDK',
+        discoveredModels: [],
         detail:
-          'GEMINI_API_KEY não detetada no servidor. Associa a chave em Settings > Secrets (ou no ficheiro .env local). Enquanto ausente, o Motor Determinístico Local assume sem interrupções.',
+          'GEMINI_API_KEY não detetada no servidor. Associa a chave no ficheiro .env local e recarrega. Enquanto ausente, o Motor Determinístico Local assume sem interrupções.',
         fallbackReady: true,
         envKeysStatus,
       };
     }
+
+    const resolved = await resolveUsableGeminiModel(requestedModel, true);
+    const targetModel = resolved.model;
+    const discoveredIds = resolved.discovered.map((m) => m.id);
 
     const pingGeminiWithTimeout = async (mdl: string, timeoutMs: number) => {
       let timer: ReturnType<typeof setTimeout> | undefined;
@@ -2649,10 +2772,6 @@ export async function testModelProviderConnection(params?: {
         const callPromise = ai.models.generateContent({
           model: mdl,
           contents: 'Responde apenas com a palavra: OPERACIONAL',
-          config:
-            mdl === 'gemini-3.8-flash'
-              ? { thinkingConfig: { thinkingLevel: ThinkingLevel.LOW } }
-              : undefined,
         });
         const timeoutPromise = new Promise<never>((_, reject) => {
           timer = setTimeout(() => reject(new Error('TIMEOUT_503_SPIKE')), timeoutMs);
@@ -2664,10 +2783,7 @@ export async function testModelProviderConnection(params?: {
     };
 
     try {
-      const [res, listed] = await Promise.all([
-        pingGeminiWithTimeout(targetModel, 4800),
-        listAvailableGeminiModels().catch(() => ({ ok: false, models: [], detail: '' })),
-      ]);
+      const res = await pingGeminiWithTimeout(targetModel, 5000);
       const sample = (res.text ?? '').trim().slice(0, 80) || 'OPERACIONAL';
       const latencyMs = Math.max(1, Math.round(performance.now() - t0));
       return {
@@ -2677,30 +2793,28 @@ export async function testModelProviderConnection(params?: {
         modelUsed: targetModel,
         endpointUsed: '@google/genai Server SDK',
         sampleOutput: sample,
-        discoveredModels: listed.models.map((m) => m.id),
-        detail: `Round-trip real concluído com sucesso em ${targetModel} (${latencyMs}ms). Visão multimodal e 18 tools ativas.`,
+        discoveredModels: discoveredIds,
+        detail: `Round-trip real concluído com sucesso em ${targetModel} (${latencyMs}ms). ${discoveredIds.length} modelo(s) disponíveis na tua API.`,
         fallbackReady: true,
         envKeysStatus,
       };
     } catch (err) {
       const rawMsg = (err as Error).message || 'Erro de rede ou autenticação';
-      // Automatic failover check to gemini-3.1-flash-lite on temporary 503 high-demand spikes
-      if (
-        targetModel !== 'gemini-3.1-flash-lite' &&
-        /503|UNAVAILABLE|high demand|TIMEOUT_503_SPIKE/i.test(rawMsg)
-      ) {
+      const altModel = discoveredIds.find((id) => id !== targetModel && /flash|lite/i.test(id));
+      if (altModel && /503|UNAVAILABLE|high demand|TIMEOUT_503_SPIKE/i.test(rawMsg)) {
         try {
-          const fallbackRes = await pingGeminiWithTimeout('gemini-3.1-flash-lite', 4200);
+          const fallbackRes = await pingGeminiWithTimeout(altModel, 4200);
           const sample = (fallbackRes.text ?? '').trim().slice(0, 80) || 'OPERACIONAL';
           const latencyMs = Math.max(1, Math.round(performance.now() - t0));
           return {
             ok: true,
             provider,
             latencyMs,
-            modelUsed: 'gemini-3.1-flash-lite (failover 503)',
+            modelUsed: `${altModel} (failover 503)`,
             endpointUsed: '@google/genai Server SDK',
             sampleOutput: sample,
-            detail: `Ligação Gemini operacional via failover rápido para gemini-3.1-flash-lite (${latencyMs}ms) devido a pico temporário de procura em ${targetModel}.`,
+            discoveredModels: discoveredIds,
+            detail: `Ligação Gemini operacional via failover rápido para ${altModel} (${latencyMs}ms) devido a pico temporário de procura em ${targetModel}.`,
             fallbackReady: true,
             envKeysStatus,
           };
@@ -2713,14 +2827,13 @@ export async function testModelProviderConnection(params?: {
       let hint = `Serviço Gemini temporariamente indisponível para ${targetModel}.`;
       if (/403|PERMISSION_DENIED|400|API_KEY_INVALID/i.test(rawMsg)) {
         hint =
-          'Chave recusada (400/403). Verifica a GEMINI_API_KEY em Settings > Secrets ou no .env do servidor.';
+          'Chave recusada (400/403). Verifica a GEMINI_API_KEY no ficheiro .env do servidor.';
       } else if (/429|RESOURCE_EXHAUSTED/i.test(rawMsg)) {
-        hint =
-          'Quota temporariamente atingida (429). No escalão gratuito aguarda alguns segundos ou seleciona gemini-3.1-flash-lite / chave com faturação em Settings > Secrets.';
+        hint = `Quota temporariamente atingida (429) em ${targetModel}. Seleciona outro modelo disponível na lista da tua API ou aguarda alguns segundos.`;
       } else if (/503|UNAVAILABLE|high demand|TIMEOUT_503_SPIKE/i.test(rawMsg)) {
-        hint = `Pico temporário de procura nos servidores Gemini (503) para ${targetModel}. Tenta novamente em instantes ou usa gemini-3.1-flash-lite.`;
+        hint = `Pico temporário de procura nos servidores Gemini (503) para ${targetModel}.`;
       } else if (/404|NOT_FOUND/i.test(rawMsg)) {
-        hint = `Modelo "${targetModel}" não encontrado (404). Seleciona gemini-3.8-flash ou gemini-3.1-flash-lite.`;
+        hint = `Modelo "${targetModel}" não disponível nesta chave (404). Escolhe um dos modelos listados pela tua API.`;
       }
       return {
         ok: false,
@@ -2728,6 +2841,7 @@ export async function testModelProviderConnection(params?: {
         latencyMs,
         modelUsed: targetModel,
         endpointUsed: '@google/genai Server SDK',
+        discoveredModels: discoveredIds,
         detail: `${hint} O fallback determinístico local permanece pronto.`,
         fallbackReady: true,
         envKeysStatus,

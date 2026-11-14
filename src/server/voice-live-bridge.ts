@@ -19,6 +19,7 @@ import {
   executeAgentTool,
   getGeminiClient,
   getPersonalityDirective,
+  resolveUsableGeminiModel,
   type StudioExecutionContext,
 } from './gemini-engine.ts';
 
@@ -91,11 +92,20 @@ export async function transcribeAudioServerSide(
       ? 'Transcreve fielmente este áudio falado em Português de Portugal (PT-PT), preservando termos técnicos em inglês (como React, TypeScript, MCP, HippoRAG, Sidecar, SQLite, Goals, API, Stripe, Tailwind). Devolve APENAS o texto transcrito limpo e pontuado, sem aspas nem comentários adicionais. Se o áudio contiver apenas silêncio ou ruído sem fala, devolve uma string vazia.'
       : 'Accurately transcribe this spoken audio in English, preserving software engineering terminology. Return ONLY the clean punctuated transcript with no extra commentary. If there is only silence or background noise, return an empty string.';
 
-  const candidateModels: { id: string; prompt: string; raceMs: number }[] = [
-    { id: 'gemini-3.5-transcribe', prompt: 'Transcribe this audio.', raceMs: 7000 },
-    { id: 'gemini-3.1-flash-lite', prompt: instructionPrompt, raceMs: 11000 },
-    { id: 'gemini-3.8-flash', prompt: instructionPrompt, raceMs: 11000 },
-  ];
+  const resolvedStt = await resolveUsableGeminiModel(state.settings.preferredGeminiModel);
+  const sttModelIds = Array.from(
+    new Set([
+      resolvedStt.model,
+      ...resolvedStt.discovered.filter((m) => /flash/i.test(m.id)).map((m) => m.id),
+    ])
+  ).slice(0, 3);
+  const candidateModels: { id: string; prompt: string; raceMs: number }[] = sttModelIds.map(
+    (id) => ({
+      id,
+      prompt: instructionPrompt,
+      raceMs: 11000,
+    })
+  );
 
   let lastErrMsg = '';
 

@@ -841,12 +841,12 @@ test('computeGoalProgressFromSubtasks & extractDeterministicPlanFromPrompt gener
 });
 
 test('normalizeGeminiModelId, isLocalOpenAiCompatibleEndpoint & estimateMonthlyLlmCostEur compute safe models and Token Diet ROI', () => {
-  assert.equal(normalizeGeminiModelId('gemini-1.5-flash'), 'gemini-3.8-flash');
-  assert.equal(normalizeGeminiModelId('gemini-2.0-flash'), 'gemini-3.8-flash');
-  assert.equal(normalizeGeminiModelId('gemini-2.5-flash'), 'gemini-3.8-flash');
-  assert.equal(normalizeGeminiModelId(''), 'gemini-3.8-flash');
-  assert.equal(normalizeGeminiModelId('gemini-3.1-flash-lite'), 'gemini-3.1-flash-lite');
-  assert.equal(normalizeGeminiModelId('gemini-3.8-flash'), 'gemini-3.8-flash');
+  assert.equal(normalizeGeminiModelId('gemini-1.5-flash'), 'gemini-2.5-flash');
+  assert.equal(normalizeGeminiModelId('models/gemini-2.5-pro'), 'gemini-2.5-pro');
+  assert.equal(normalizeGeminiModelId('gemini-2.5-flash'), 'gemini-2.5-flash');
+  assert.equal(normalizeGeminiModelId(''), 'gemini-2.5-flash');
+  assert.equal(normalizeGeminiModelId('gemini-3-flash-preview'), 'gemini-3-flash-preview');
+  assert.equal(normalizeGeminiModelId('gemini-4-pro'), 'gemini-4-pro');
 
   assert.equal(isLocalOpenAiCompatibleEndpoint('http://127.0.0.1:1234/v1'), true);
   assert.equal(isLocalOpenAiCompatibleEndpoint('http://localhost:8000/v1'), true);
