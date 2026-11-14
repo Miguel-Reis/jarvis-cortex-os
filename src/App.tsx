@@ -1,10 +1,13 @@
-import React, { Suspense, useCallback, useEffect, useMemo, useState } from 'react';
+import React, { Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ArrowLeft,
+  Ban,
+  Bell,
   Blocks,
   Bot,
   Boxes,
   Brain,
+  Check,
   ChevronDown,
   ChevronRight,
   Clock,
@@ -24,6 +27,7 @@ import {
   Plus,
   Radar,
   Server,
+  ShieldAlert,
   ShieldCheck,
   Smartphone,
   Sparkles,
@@ -32,6 +36,7 @@ import {
   X,
 } from 'lucide-react';
 import { apiJson, loginOperatorToken } from './lib/api';
+import { markViiAudio } from './lib/audio-dsp';
 import { t, type NavSectionId } from './lib/i18n';
 import { ToastProvider, useToast } from './components/ToastContext';
 import { CommandPalette } from './components/CommandPalette';
@@ -54,22 +59,27 @@ import { SkillsChannelsView } from './components/views/SkillsChannelsView';
 import { DevicesSidecarView } from './components/views/DevicesSidecarView';
 import { AuthoritySettingsView } from './components/views/AuthoritySettingsView';
 import { LLMSettingsView } from './components/views/LLMSettingsView';
-import type {
-  AppSettings,
-  BrainLiveStatus,
-  ChatMessage,
-  ChatThread,
-  GraphNodeComputed,
-  JarvisStoreData,
-  LanguageCode,
-  OSTelemetry,
-  ProjectIdeaCategory,
-  ProjectWorkspace,
+import {
+  GENERAL_CHAT_PROJECT_ID,
+  type AppSettings,
+  type ApprovalRequest,
+  type BrainLiveStatus,
+  type ChatMessage,
+  type ChatThread,
+  type GraphNodeComputed,
+  type JarvisStoreData,
+  type LanguageCode,
+  type OSTelemetry,
+  type ProjectIdeaCategory,
+  type ProjectWorkspace,
 } from './shared/types';
 import {
   computeProjectProactiveFrequency,
   computeProjectsPortfolioSummary,
+  formatApprovalRequesterBadge,
   getVisibleSidebarIds,
+  isGeneralUnlinkedChat,
+  resolveProjectAgentsList,
 } from './shared/cortex-math';
 
 interface BootstrapPayload {
@@ -156,6 +166,19 @@ const InnerApp: React.FC = () => {
   const [authSubmitting, setAuthSubmitting] = useState(false);
   const [authError, setAuthError] = useState<string | null>(null);
 
+  // Direct Project Agent responder selection & Real-Time Authorization Notification state
+  const [preferredResponderId, setPreferredResponderId] = useState<string | undefined>(undefined);
+  const [decidingApprovalId, setDecidingApprovalId] = useState<string | null>(null);
+  const seenApprovalIdsRef = useRef<Set<string>>(new Set());
+  const initialApprovalsSeededRef = useRef<boolean>(false);
+  const [desktopNotifPermission, setDesktopNotifPermission] = useState<
+    NotificationPermission | 'unsupported'
+  >(() =>
+    typeof window !== 'undefined' && 'Notification' in window
+      ? window.Notification.permission
+      : 'unsupported'
+  );
+
   const refreshBootstrap = useCallback(async () => {
     try {
       const data = await apiJson<BootstrapPayload>('/api/bootstrap');
@@ -202,11 +225,65 @@ const InnerApp: React.FC = () => {
     }
   };
 
+  const voiceDspEnabled = boot?.state.settings.voiceDspEnabled ?? true;
+
+  const triggerAuthorizationAlert = useCallback(
+    (appr: ApprovalRequest) => {
+      if (!appr?.id || seenApprovalIdsRef.current.has(appr.id)) return;
+      seenApprovalIdsRef.current.add(appr.id);
+
+      const badge = formatApprovalRequesterBadge(appr);
+      pushToast({
+        title: `Autorização Necessária · ${badge.roleLabel}`,
+        detail: `${badge.actorDisplay}: ${appr.title}`,
+        tone: 'warning',
+      });
+
+      markViiAudio.playAuthorityAlertChime(voiceDspEnabled);
+
+      if (
+        typeof window !== 'undefined' &&
+        'Notification' in window &&
+        window.Notification.permission === 'granted'
+      ) {
+        try {
+          new window.Notification(`J.A.R.V.I.S. · ${badge.roleLabel}`, {
+            body: `${badge.actorDisplay}: ${appr.title} — ${appr.commandOrAction.slice(0, 120)}`,
+          });
+        } catch {
+          // Ignore browser desktop notification restriction
+        }
+      }
+    },
+    [pushToast, voiceDspEnabled]
+  );
+
+  const triggerAlertRef = useRef(triggerAuthorizationAlert);
+  useEffect(() => {
+    triggerAlertRef.current = triggerAuthorizationAlert;
+  }, [triggerAuthorizationAlert]);
+
+  useEffect(() => {
+    const approvals = boot?.state.approvals;
+    if (!approvals) return;
+    const pending = approvals.filter((a) => a.status === 'PENDING');
+    if (!initialApprovalsSeededRef.current) {
+      pending.forEach((a) => seenApprovalIdsRef.current.add(a.id));
+      initialApprovalsSeededRef.current = true;
+      return;
+    }
+    for (const appr of pending) {
+      if (!seenApprovalIdsRef.current.has(appr.id)) {
+        triggerAuthorizationAlert(appr);
+      }
+    }
+  }, [boot?.state.approvals, triggerAuthorizationAlert]);
+
   useEffect(() => {
     refreshBootstrap();
   }, [refreshBootstrap]);
 
-  // Subscribe to Server-Sent Events (/api/events) including Studio activity_log and chat_message
+  // Subscribe to Server-Sent Events (/api/events) including Studio activity_log, chat_message & approval_requested
   useEffect(() => {
     const es = new EventSource('/api/events');
     es.addEventListener('connected', (ev) => {
@@ -223,6 +300,19 @@ const InnerApp: React.FC = () => {
     es.addEventListener('swarm_progress', onSseRefresh('swarm_progress'));
     es.addEventListener('proactive_scan', onSseRefresh('proactive_scan'));
     es.addEventListener('sidecar_event', onSseRefresh('sidecar_event'));
+    es.addEventListener('approval_requested', (ev: Event) => {
+      try {
+        const raw = (ev as MessageEvent).data;
+        if (raw) {
+          const approval = JSON.parse(String(raw)) as ApprovalRequest;
+          triggerAlertRef.current(approval);
+        }
+      } catch {
+        // Fallback: bootstrap diff handles newly inserted pending approvals
+      }
+      refreshBootstrap();
+    });
+    es.addEventListener('approval_decided', onSseRefresh('approval_decided'));
     es.addEventListener('heartbeat', onSseRefresh('heartbeat'));
     es.onerror = () => {
       console.debug('[JARVIS:SSE] Stream reconnecting...');
@@ -308,6 +398,7 @@ const InnerApp: React.FC = () => {
     if (!boot) return;
     try {
       await apiJson(`/api/projects/${projectId}/activate`, { method: 'POST' });
+      setPreferredResponderId(undefined);
       setActiveSection('studio');
       setMobileMenuOpen(false);
       await refreshBootstrap();
@@ -409,6 +500,75 @@ const InnerApp: React.FC = () => {
         detail: (err as Error).message,
         tone: 'error',
       });
+    }
+  };
+
+  const handleCreateGeneralChat = async () => {
+    if (!boot) return;
+    const generalCount = (boot.state.chatThreads || []).filter((c) =>
+      isGeneralUnlinkedChat(c)
+    ).length;
+
+    try {
+      await apiJson<{ chat: ChatThread }>('/api/chats', {
+        method: 'POST',
+        body: JSON.stringify({
+          projectId: GENERAL_CHAT_PROJECT_ID,
+          isGeneral: true,
+          title: generalCount === 0 ? 'Conversa Geral' : `Conversa Geral #${generalCount + 1}`,
+        }),
+      });
+      setPreferredResponderId(undefined);
+      setActiveSection('studio');
+      setMobileMenuOpen(false);
+      await refreshBootstrap();
+    } catch (err) {
+      pushToast({
+        title: 'Erro ao criar conversa geral',
+        detail: (err as Error).message,
+        tone: 'error',
+      });
+    }
+  };
+
+  const handleOpenGeneralChat = async () => {
+    const firstGeneral = (boot?.state.chatThreads || []).find((c) => isGeneralUnlinkedChat(c));
+    if (firstGeneral) {
+      await handleActivateChat(firstGeneral.id);
+    } else {
+      await handleCreateGeneralChat();
+    }
+  };
+
+  const handleQuickApprovalDecision = async (
+    approvalId: string,
+    decision: 'APPROVED_ONCE' | 'APPROVED_ALWAYS' | 'BLOCKED'
+  ) => {
+    if (decidingApprovalId) return;
+    setDecidingApprovalId(approvalId);
+    try {
+      await apiJson(`/api/approvals/${approvalId}/decide`, {
+        method: 'POST',
+        body: JSON.stringify({ decision }),
+      });
+      await refreshBootstrap();
+      pushToast({
+        title:
+          decision === 'BLOCKED'
+            ? 'Ação bloqueada pelo Operador'
+            : decision === 'APPROVED_ALWAYS'
+              ? 'Ação autorizada sempre'
+              : 'Ação autorizada (1x) e executada',
+        tone: decision === 'BLOCKED' ? 'info' : 'success',
+      });
+    } catch (err) {
+      pushToast({
+        title: 'Erro ao decidir autorização',
+        detail: (err as Error).message,
+        tone: 'error',
+      });
+    } finally {
+      setDecidingApprovalId(null);
     }
   };
 
@@ -662,31 +822,105 @@ const InnerApp: React.FC = () => {
 
   const { state: store } = boot;
   const lang = store.settings.language;
-  const pendingApprovalsCount = store.approvals.filter((a) => a.status === 'PENDING').length;
+  const pendingApprovals = store.approvals.filter((a) => a.status === 'PENDING');
+  const pendingApprovalsCount = pendingApprovals.length;
+  const topPendingApproval = pendingApprovals[0] || null;
+  const topApprovalBadge = topPendingApproval
+    ? formatApprovalRequesterBadge(topPendingApproval)
+    : null;
 
   const isAutostart =
     typeof window !== 'undefined' &&
     new URLSearchParams(window.location.search).get('autostart') === '1';
 
   const projects = store.projects || [];
-  const activeProject =
-    projects.find((p) => p.id === store.activeProjectId) || projects[0];
+  const allChatThreads = store.chatThreads || [];
+  const generalChatThreads = allChatThreads.filter((c) => isGeneralUnlinkedChat(c));
+  const activeChatFromStore = allChatThreads.find((c) => c.id === store.activeChatId);
+  const isGeneralChatActive =
+    store.activeProjectId === GENERAL_CHAT_PROJECT_ID ||
+    (activeChatFromStore ? isGeneralUnlinkedChat(activeChatFromStore) : false);
 
-  const projectChatThreads = (store.chatThreads || []).filter(
-    (c) => c.projectId === activeProject?.id
-  );
+  const activeProject: ProjectWorkspace | null = isGeneralChatActive
+    ? null
+    : projects.find((p) => p.id === store.activeProjectId) || projects[0] || null;
 
-  const activeChat: ChatThread =
-    projectChatThreads.find((c) => c.id === store.activeChatId) ||
-    projectChatThreads[0] || {
-      id: `chat-default-${activeProject?.id || 'main'}`,
-      projectId: activeProject?.id || 'proj-jarvis-core',
-      title: 'Planeamento Principal',
-      primaryAgentId: 'room-exec',
-      screenAutoSendEnabled: true,
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
-    };
+  const projectChatThreads = activeProject
+    ? allChatThreads.filter((c) => c.projectId === activeProject.id && !isGeneralUnlinkedChat(c))
+    : [];
+
+  const activeChat: ChatThread = isGeneralChatActive
+    ? generalChatThreads.find((c) => c.id === store.activeChatId) ||
+      generalChatThreads[0] || {
+        id: 'chat-general-main',
+        projectId: GENERAL_CHAT_PROJECT_ID,
+        isGeneral: true,
+        title: 'Conversa Geral (Livre)',
+        primaryAgentId: 'room-exec',
+        screenAutoSendEnabled: true,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      }
+    : projectChatThreads.find((c) => c.id === store.activeChatId) ||
+      projectChatThreads[0] || {
+        id: `chat-default-${activeProject?.id || 'main'}`,
+        projectId: activeProject?.id || 'proj-jarvis-core',
+        title: 'Planeamento Principal',
+        primaryAgentId: 'room-exec',
+        screenAutoSendEnabled: true,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      };
+
+  const activeProjectAgents = resolveProjectAgentsList(store.rooms, activeProject);
+
+  const handleToggleProjectAgent = async (roomId: string) => {
+    if (!activeProject || roomId === 'room-exec') return;
+    const targetRoom = store.rooms.find((r) => r.id === roomId);
+    const currentSet = new Set(activeProject.assignedAgentIds || []);
+    const isCurrentlyAssigned =
+      currentSet.has(roomId) || targetRoom?.projectId === activeProject.id;
+
+    try {
+      if (isCurrentlyAssigned) {
+        currentSet.delete(roomId);
+        await apiJson(`/api/projects/${activeProject.id}`, {
+          method: 'PATCH',
+          body: JSON.stringify({ assignedAgentIds: Array.from(currentSet) }),
+        });
+        if (targetRoom?.projectId === activeProject.id) {
+          await apiJson(`/api/rooms/${roomId}`, {
+            method: 'PATCH',
+            body: JSON.stringify({ projectId: null }),
+          });
+        }
+        if (preferredResponderId === roomId) {
+          setPreferredResponderId('room-exec');
+        }
+        pushToast({
+          title: `${targetRoom?.name || 'Agente'} desassociado de ${activeProject.name}`,
+          tone: 'info',
+        });
+      } else {
+        currentSet.add(roomId);
+        await apiJson(`/api/projects/${activeProject.id}`, {
+          method: 'PATCH',
+          body: JSON.stringify({ assignedAgentIds: Array.from(currentSet) }),
+        });
+        pushToast({
+          title: `${targetRoom?.name || 'Agente'} atribuído a ${activeProject.name}`,
+          tone: 'success',
+        });
+      }
+      await refreshBootstrap();
+    } catch (err) {
+      pushToast({
+        title: 'Erro ao atualizar agentes do projeto',
+        detail: (err as Error).message,
+        tone: 'error',
+      });
+    }
+  };
 
   const advancedModules: {
     id: NavSectionId;
@@ -758,6 +992,21 @@ const InnerApp: React.FC = () => {
             </button>
 
             <div className="w-full border-t border-white/7 pt-2.5 flex flex-col items-center gap-1.5">
+              <button
+                type="button"
+                data-testid="compact-general-chat-btn"
+                onClick={handleOpenGeneralChat}
+                title="Conversa Geral (Sem Projeto)"
+                aria-label="Conversa Geral"
+                className={`w-9 h-9 rounded-lg flex items-center justify-center transition-colors ${
+                  isGeneralChatActive && activeSection === 'studio'
+                    ? 'bg-[#e59a54]/16 border border-[#e59a54]/45 text-[#e59a54]'
+                    : 'text-slate-400 hover:text-slate-100 hover:bg-white/6'
+                }`}
+              >
+                <MessageSquare className="w-4 h-4" />
+              </button>
+
               {projects.map((proj) => {
                 const ProjIcon = getProjectCategoryIcon(proj.ideaCategory);
                 const selected = proj.id === activeProject?.id && activeSection === 'studio';
@@ -785,7 +1034,7 @@ const InnerApp: React.FC = () => {
             <PebbleWidget
               settings={store.settings}
               compactRail={true}
-              activeProjectId={activeProject?.id}
+              activeProjectId={activeProject?.id || (isGeneralChatActive ? GENERAL_CHAT_PROJECT_ID : undefined)}
               activeChatId={activeChat.id}
               onToggleWakeWord={async (enabled) => {
                 await apiJson('/api/settings', {
@@ -942,10 +1191,84 @@ const InnerApp: React.FC = () => {
           )}
         </div>
 
-        {/* Scrollable Projects + Active Project Chats + Advanced Modules */}
+        {/* Scrollable General Chats + Projects + Active Project Chats & Agents + Advanced Modules */}
         <div className="flex-1 overflow-y-auto px-3 py-3 space-y-5 min-h-0">
+          {/* 0. Chat Geral (Sem Projeto Associado) */}
+          <div className="space-y-1.5" data-testid="sidebar-general-chats-section">
+            <div className="px-2 flex items-center justify-between">
+              <span className="text-[11px] font-medium text-slate-400 truncate">
+                Chat Geral (Sem Projeto)
+              </span>
+              <button
+                type="button"
+                data-testid="new-general-chat-btn"
+                onClick={handleCreateGeneralChat}
+                title="Nova conversa geral livre (não associada a projetos)"
+                className="inline-flex items-center gap-1 text-[11px] font-medium text-[#e59a54] hover:text-[#eba868] transition-colors whitespace-nowrap shrink-0"
+              >
+                <Plus className="w-3 h-3" />
+                <span>Nova</span>
+              </button>
+            </div>
+
+            <div className="space-y-0.5" data-testid="sidebar-general-chats-list">
+              {generalChatThreads.length === 0 ? (
+                <button
+                  type="button"
+                  onClick={handleCreateGeneralChat}
+                  className="w-full px-2.5 py-1.5 rounded-lg text-left text-xs text-slate-400 hover:text-slate-200 hover:bg-white/4 flex items-center gap-2 transition-colors"
+                >
+                  <MessageSquare className="w-3.5 h-3.5 shrink-0 opacity-80" />
+                  <span className="truncate">Abrir Conversa Geral</span>
+                </button>
+              ) : (
+                generalChatThreads.map((chat) => {
+                  const isChatActive =
+                    isGeneralChatActive &&
+                    chat.id === activeChat.id &&
+                    activeSection === 'studio';
+                  return (
+                    <div
+                      key={chat.id}
+                      onClick={() => handleActivateChat(chat.id)}
+                      role="button"
+                      tabIndex={0}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter' || e.key === ' ') {
+                          e.preventDefault();
+                          handleActivateChat(chat.id);
+                        }
+                      }}
+                      data-testid={`sidebar-chat-${chat.id}`}
+                      className={`group w-full px-2.5 py-1.5 rounded-lg flex items-center justify-between gap-2 cursor-pointer transition-colors ${
+                        isChatActive
+                          ? 'bg-[#e59a54]/14 text-[#f3c394] border border-[#e59a54]/30'
+                          : 'text-slate-300 hover:text-slate-100 hover:bg-white/4'
+                      }`}
+                    >
+                      <div className="flex items-center gap-2 min-w-0">
+                        <MessageSquare className="w-3.5 h-3.5 shrink-0 text-[#e59a54]/85" />
+                        <span className="text-xs truncate">{chat.title}</span>
+                      </div>
+                      {generalChatThreads.length > 1 && (
+                        <button
+                          type="button"
+                          onClick={(e) => handleDeleteChat(e, chat.id)}
+                          aria-label={`Eliminar conversa ${chat.title}`}
+                          className="opacity-0 group-hover:opacity-100 p-0.5 text-slate-500 hover:text-rose-400 transition-opacity shrink-0"
+                        >
+                          <Trash2 className="w-3 h-3" />
+                        </button>
+                      )}
+                    </div>
+                  );
+                })
+              )}
+            </div>
+          </div>
+
           {/* 1. Ideias & Projetos */}
-          <div className="space-y-1.5">
+          <div className="space-y-1.5 pt-3 border-t border-white/6">
             <div className="px-2 flex items-center justify-between text-[11px] font-medium text-slate-400">
               <span>Ideias & Projetos</span>
               <span className="font-mono tabular-nums text-slate-500">{projects.length}</span>
@@ -1050,6 +1373,55 @@ const InnerApp: React.FC = () => {
                   );
                 })}
               </div>
+
+              {/* Acesso Direto aos Agentes & Sub-Agentes do Projeto na Barra Lateral */}
+              <div className="pt-2.5 space-y-1" data-testid="sidebar-project-agents-section">
+                <div className="px-2 flex items-center justify-between text-[11px] font-medium text-slate-400">
+                  <span>Agentes do Projeto</span>
+                  <span className="font-mono tabular-nums text-slate-500">
+                    {activeProjectAgents.length}
+                  </span>
+                </div>
+                <div className="space-y-0.5" data-testid="sidebar-project-agents-list">
+                  {activeProjectAgents.map((ag) => {
+                    const isActiveAgent =
+                      activeSection === 'studio' &&
+                      (preferredResponderId
+                        ? preferredResponderId === ag.id
+                        : (activeChat.primaryAgentId || 'room-exec') === ag.id);
+                    const isPrincipal = ag.id === 'room-exec';
+                    return (
+                      <button
+                        key={ag.id}
+                        type="button"
+                        data-testid={`sidebar-project-agent-${ag.id}`}
+                        onClick={() => {
+                          setPreferredResponderId(ag.id);
+                          setActiveSection('studio');
+                          setMobileMenuOpen(false);
+                        }}
+                        className={`w-full px-2.5 py-1.5 rounded-lg flex items-center justify-between gap-2 text-left transition-colors ${
+                          isActiveAgent
+                            ? 'bg-[#171c27] border border-[#e59a54]/35 text-slate-100'
+                            : 'text-slate-400 hover:text-slate-200 hover:bg-white/4'
+                        }`}
+                      >
+                        <div className="flex items-center gap-2 min-w-0">
+                          <Bot
+                            className={`w-3.5 h-3.5 shrink-0 ${
+                              isPrincipal ? 'text-[#e59a54]' : 'text-[#8ea6ff]'
+                            }`}
+                          />
+                          <span className="text-xs truncate">{ag.name}</span>
+                        </div>
+                        <span className="font-mono text-[9px] text-slate-500 shrink-0">
+                          {isPrincipal ? 'CORE' : ag.callsign || 'SUB'}
+                        </span>
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
             </div>
           )}
 
@@ -1106,7 +1478,7 @@ const InnerApp: React.FC = () => {
           <PebbleWidget
             settings={store.settings}
             compactRail={false}
-            activeProjectId={activeProject?.id}
+            activeProjectId={activeProject?.id || (isGeneralChatActive ? GENERAL_CHAT_PROJECT_ID : undefined)}
             activeChatId={activeChat.id}
             onToggleWakeWord={async (enabled) => {
               await apiJson('/api/settings', {
@@ -1179,7 +1551,7 @@ const InnerApp: React.FC = () => {
           </button>
           <span className="text-sm font-semibold text-slate-100 font-display truncate">
             {activeSection === 'studio'
-              ? activeProject?.name || 'J.A.R.V.I.S. Studio'
+              ? activeProject?.name || 'Conversa Geral · J.A.R.V.I.S.'
               : activeModuleObj?.label || 'J.A.R.V.I.S.'}
           </span>
         </div>
@@ -1222,14 +1594,137 @@ const InnerApp: React.FC = () => {
 
       {/* Main Content Stage */}
       <div className="flex-1 flex flex-col min-w-0 min-h-0 h-full">
-        {activeSection === 'studio' && activeProject ? (
+        {/* Global Real-Time Authorization Notification Banner (Agents & Sub-Agents) */}
+        {topPendingApproval && topApprovalBadge && (
+          <div
+            data-testid="global-approval-alert-banner"
+            role="alert"
+            className="px-4 py-2.5 bg-[#1b1411] border-b border-[#e59a54]/50 flex flex-wrap items-center justify-between gap-3 shrink-0"
+          >
+            <div className="flex items-start sm:items-center gap-2.5 min-w-0 flex-1">
+              <div className="w-7 h-7 rounded-lg bg-[#e59a54]/18 border border-[#e59a54]/45 flex items-center justify-center text-[#e59a54] shrink-0">
+                <ShieldAlert className="w-4 h-4" />
+              </div>
+              <div className="min-w-0 flex-1 space-y-0.5">
+                <div className="flex flex-wrap items-center gap-1.5 text-xs">
+                  <span
+                    className={`px-1.5 py-0.5 rounded font-mono text-[10px] font-semibold ${
+                      topApprovalBadge.isSubagent
+                        ? 'bg-[#8ea6ff]/18 text-[#a9bcff] border border-[#8ea6ff]/35'
+                        : 'bg-[#e59a54]/18 text-[#f3c394] border border-[#e59a54]/35'
+                    }`}
+                  >
+                    {topApprovalBadge.roleLabel}
+                  </span>
+                  <span className="font-medium text-slate-200 truncate">
+                    {topApprovalBadge.actorDisplay}
+                  </span>
+                  <span className="text-slate-600" aria-hidden="true">
+                    ·
+                  </span>
+                  <span className="font-semibold text-slate-100 truncate">
+                    {topPendingApproval.title}
+                  </span>
+                  <span
+                    className={`px-1.5 py-0.5 rounded font-mono text-[10px] ${
+                      topPendingApproval.riskLevel === 'CRITICAL' ||
+                      topPendingApproval.riskLevel === 'HIGH'
+                        ? 'bg-rose-500/20 text-rose-300'
+                        : 'bg-amber-500/15 text-amber-300'
+                    }`}
+                  >
+                    {topPendingApproval.riskLevel}
+                  </span>
+                </div>
+                <p className="text-[11px] font-mono text-slate-400 truncate">
+                  {topPendingApproval.commandOrAction}
+                </p>
+              </div>
+            </div>
+
+            <div className="flex flex-wrap items-center gap-1.5 shrink-0">
+              <button
+                type="button"
+                data-testid="banner-approve-once-btn"
+                disabled={decidingApprovalId === topPendingApproval.id}
+                onClick={() =>
+                  handleQuickApprovalDecision(topPendingApproval.id, 'APPROVED_ONCE')
+                }
+                className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs font-semibold bg-[#e59a54] text-[#0b0d11] hover:bg-[#f0ac6b] disabled:opacity-50 transition-colors whitespace-nowrap"
+              >
+                <Check className="w-3.5 h-3.5" />
+                <span>Autorizar 1x</span>
+              </button>
+
+              <button
+                type="button"
+                data-testid="banner-approve-always-btn"
+                disabled={decidingApprovalId === topPendingApproval.id}
+                onClick={() =>
+                  handleQuickApprovalDecision(topPendingApproval.id, 'APPROVED_ALWAYS')
+                }
+                className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs font-medium bg-emerald-500/16 border border-emerald-400/40 text-emerald-300 hover:bg-emerald-500/25 disabled:opacity-50 transition-colors whitespace-nowrap"
+              >
+                <span>Sempre</span>
+              </button>
+
+              <button
+                type="button"
+                data-testid="banner-block-btn"
+                disabled={decidingApprovalId === topPendingApproval.id}
+                onClick={() => handleQuickApprovalDecision(topPendingApproval.id, 'BLOCKED')}
+                className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs font-medium bg-rose-500/15 border border-rose-400/35 text-rose-300 hover:bg-rose-500/25 disabled:opacity-50 transition-colors whitespace-nowrap"
+              >
+                <Ban className="w-3.5 h-3.5" />
+                <span>Bloquear</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => handleNavigate('authority')}
+                className="px-2 py-1 rounded-lg text-[11px] font-mono bg-[#141821] border border-white/10 text-slate-300 hover:text-slate-100 whitespace-nowrap"
+              >
+                Inbox ({pendingApprovalsCount})
+              </button>
+
+              {desktopNotifPermission === 'default' && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (typeof window !== 'undefined' && 'Notification' in window) {
+                      window.Notification.requestPermission()
+                        .then(setDesktopNotifPermission)
+                        .catch(() => {});
+                    }
+                  }}
+                  title="Ativar notificações desktop do navegador"
+                  className="inline-flex items-center gap-1 px-2 py-1 rounded-lg text-[11px] bg-[#141821] border border-white/10 text-[#e59a54] hover:border-[#e59a54]/45 whitespace-nowrap"
+                >
+                  <Bell className="w-3 h-3" />
+                  <span className="hidden xl:inline">Alertas OS</span>
+                </button>
+              )}
+            </div>
+          </div>
+        )}
+
+        {activeSection === 'studio' && (activeProject || isGeneralChatActive) ? (
           <StudioWorkspaceView
             store={store}
             activeProject={activeProject}
             activeChat={activeChat}
+            preferredResponderId={preferredResponderId}
+            onSelectResponder={setPreferredResponderId}
+            onToggleProjectAgent={activeProject ? handleToggleProjectAgent : undefined}
             onRefreshBootstrap={refreshBootstrap}
             onNavigateModule={handleNavigate}
-            onCreateNewChat={() => handleCreateNewChat(activeProject.id)}
+            onCreateNewChat={() =>
+              isGeneralChatActive
+                ? handleCreateGeneralChat()
+                : activeProject
+                  ? handleCreateNewChat(activeProject.id)
+                  : handleCreateGeneralChat()
+            }
           />
         ) : (
           /* Secondary System Module Container (MCP, Skills, Sidecar, Brain, Swarm, etc.) */

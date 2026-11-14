@@ -3,13 +3,17 @@ import { type LiveServerMessage, Modality } from '@google/genai';
 import { WebSocket, WebSocketServer } from 'ws';
 import {
   GEMINI_VOICE_CATALOG,
+  isGeneralUnlinkedChat,
   normalizeGeminiVoiceName,
+  rankQ18Actions,
+  resolveProjectAgentsList,
 } from '../shared/cortex-math.ts';
-import type {
-  GeminiVoiceName,
-  LanguageCode,
-  StudioInlineEvent,
-  ToolCallRecord,
+import {
+  GENERAL_CHAT_PROJECT_ID,
+  type GeminiVoiceName,
+  type LanguageCode,
+  type StudioInlineEvent,
+  type ToolCallRecord,
 } from '../shared/types.ts';
 import { db } from './db.ts';
 import { debugLog } from './debug-logger.ts';
@@ -23,16 +27,11 @@ import {
   type StudioExecutionContext,
 } from './gemini-engine.ts';
 
-const LIVE_ALLOWED_TOOL_NAMES = new Set([
-  'upsert_project_goal',
-  'spawn_project_subagent',
-  'activate_antigravity_skill',
-  'call_mcp_gateway_tool',
-  'capture_and_inspect_sidecar_screen',
-  'search_memories',
-  'save_memory',
-  'get_system_telemetry',
-]);
+/**
+ * Exposes all J.A.R.V.I.S. Cortex OS agent tools to the Live Voice Principal Agent,
+ * granting omniscient control over projects, chats, operations, governed files, Swarm, MCP, and Python CLI.
+ */
+export const LIVE_VOICE_TOOL_DECLARATIONS = AGENT_TOOL_DECLARATIONS;
 
 const LIVE_IDLE_TIMEOUT_MS = 180_000; // 3 min auto-idle disconnect to protect audio quota
 
@@ -79,7 +78,7 @@ export async function transcribeAudioServerSide(
       modelUsed: 'gemini-3.5-transcribe',
       latencyMs: Math.max(1, Math.round(performance.now() - t0)),
       error:
-        'GEMINI_API_KEY não configurada no servidor. Associa a chave em Settings > Secrets ou utiliza o ditado local do navegador.',
+        'GEMINI_API_KEY não configurada no servidor. Configura a chave em Motores LLM > Chaves API (GEMINI_API_KEY) ou utiliza o ditado local do navegador.',
     };
   }
 
@@ -394,7 +393,7 @@ export function attachGeminiLiveWebSocketServer(params: {
     const voiceName: GeminiVoiceName = normalizeGeminiVoiceName(
       parsedUrl.searchParams.get('voice') || stateSnapshot.settings.preferredVoiceName
     );
-    const projectId =
+    const rawProjectId =
       parsedUrl.searchParams.get('projectId') ||
       stateSnapshot.activeProjectId ||
       'proj-website-studio';
@@ -413,18 +412,37 @@ export function attachGeminiLiveWebSocketServer(params: {
         type: 'error',
         code: 'NO_GEMINI_KEY',
         message:
-          'GEMINI_API_KEY não detetada no servidor. Associa a chave em Settings > Secrets para ativar conversas em tempo real com gemini-3.8-live.',
+          'GEMINI_API_KEY não detetada no servidor. Configura a chave em Motores LLM > Chaves API (GEMINI_API_KEY) para ativar conversas em tempo real com gemini-3.8-live.',
       });
       clientWs.close(1008, 'Missing GEMINI_API_KEY');
       return;
     }
 
-    const activeProject =
-      (stateSnapshot.projects || []).find((p) => p.id === projectId) ||
-      (stateSnapshot.projects || [])[0];
-    const projectGoals = stateSnapshot.goals
-      .filter((g) => (g.projectId || projectId) === projectId)
-      .slice(0, 6);
+    const activeChatObj = (stateSnapshot.chatThreads || []).find((c) => c.id === chatId);
+    const isGeneralSession =
+      rawProjectId === GENERAL_CHAT_PROJECT_ID ||
+      (activeChatObj ? isGeneralUnlinkedChat(activeChatObj) : false);
+    const projectId = isGeneralSession ? GENERAL_CHAT_PROJECT_ID : rawProjectId;
+
+    const activeProject = isGeneralSession
+      ? null
+      : (stateSnapshot.projects || []).find((p) => p.id === projectId) ||
+        (stateSnapshot.projects || [])[0] ||
+        null;
+
+    const projectGoals = isGeneralSession
+      ? []
+      : stateSnapshot.goals
+          .filter((g) => (g.projectId || projectId) === projectId)
+          .slice(0, 6);
+
+    const projectAgents = resolveProjectAgentsList(stateSnapshot.rooms, activeProject);
+    const portfolioSummary = (stateSnapshot.projects || [])
+      .map((p) => `${p.name} [${p.id}]`)
+      .join(', ');
+    const pendingApprovals = stateSnapshot.approvals.filter((a) => a.status === 'PENDING');
+    const topQ18 = rankQ18Actions(stateSnapshot.candidates || [])[0];
+    const activeMcpServersCount = (stateSnapshot.mcpServers || []).filter((s) => s.enabled).length;
 
     const personality = getPersonalityDirective(
       stateSnapshot.settings.personalityMode,
@@ -433,27 +451,36 @@ export function attachGeminiLiveWebSocketServer(params: {
 
     const liveSystemInstruction = [
       personality,
-      `Estás em modo de CONVERSA DE VOZ EM TEMPO REAL (gemini-3.8-live) com ${
+      `Estás em modo de CONVERSA DE VOZ EM TEMPO REAL (gemini-3.8-live) como AGENTE PRINCIPAL do J.A.R.V.I.S. Cortex OS com ${
         stateSnapshot.settings.operatorName || 'o Operador'
-      } no J.A.R.V.I.S. Studio.`,
-      activeProject
-        ? `Projeto ativo: "${activeProject.name}" (${activeProject.ideaCategory || 'CUSTOM'} · Stack: ${activeProject.techStack}). Resumo: ${activeProject.ideaBrief || activeProject.description}`
+      }.`,
+      isGeneralSession
+        ? 'Contexto atual: Conversa Geral Livre (Sem Projeto Associado). Tens acesso omnisciente a todo o sistema J.A.R.V.I.S. OS, todos os projetos, sub-agentes, memórias e operações.'
+        : activeProject
+          ? `Projeto ativo: "${activeProject.name}" [${activeProject.id}] (${activeProject.ideaCategory || 'CUSTOM'} · Stack: ${activeProject.techStack}). Resumo: ${activeProject.ideaBrief || activeProject.description}`
+          : '',
+      portfolioSummary ? `Projetos no portefólio: ${portfolioSummary}.` : '',
+      projectAgents.length > 0
+        ? `Agentes & Sub-Agentes disponíveis: ${projectAgents.map((a) => `${a.name} (${a.callsign})`).join(', ')}.`
         : '',
-      projectGoals.length > 0
+      !isGeneralSession && projectGoals.length > 0
         ? `Goals atuais do projeto: ${projectGoals
             .map((g) => `"${g.title}" (${g.progress}%, ${g.status})`)
             .join(' | ')}.`
-        : 'Ainda sem Goals criados neste projeto.',
-      'Regras para conversa por voz: Fala de forma natural, calorosa, concisa e fluida (2 a 4 frases por turno, sem ler listas longas de markdown nem símbolos como asteriscos).',
-      'Se o utilizador partilhar o ecrã em direto (frames de vídeo), descreve ou usa o que estás realmente a ver no ecrã dele.',
-      'Quando planearem objetivos, tarefas, agentes ou skills na conversa, invoca diretamente as ferramentas upsert_project_goal, spawn_project_subagent ou activate_antigravity_skill e confirma brevemente por voz.',
+        : !isGeneralSession
+          ? 'Ainda sem Goals criados neste projeto.'
+          : '',
+      `Snapshot operacional J.A.R.V.I.S. OS: ${pendingApprovals.length} autorização(ões) pendente(s) | ${(stateSnapshot.contracts || []).length} Today Contract(s) | Workflows: ${(stateSnapshot.workflows || []).length} | MCP Servers ativos: ${activeMcpServersCount} | Dispositivos Sidecar: ${(stateSnapshot.devices || []).length}${
+        topQ18 ? ` | Prioridade Q-18: "${topQ18.title}"` : ''
+      }.`,
+      'Tens acesso TOTAL a todas as 22 ferramentas do J.A.R.V.I.S. OS, incluindo get_jarvis_os_full_state, manage_jarvis_projects_and_chats, manage_jarvis_operations, write_workspace_file_governed, query_python_jarvis_cortex, request_shell_approval, sidecar_host_control, dispatch_swarm_48x, lookup_ast_symbol, call_mcp_gateway_tool, upsert_project_goal, spawn_project_subagent, search_memories e save_memory.',
+      'REGRA DE AUTORIZAÇÃO HUMANA: Nunca tentes contornar o Security Gate. Sempre que uma ferramenta devolver PENDING_APPROVAL ou colocar uma ação na fila de autorização, avisa imediatamente o operador por voz de que surgiu um alerta de autorização no ecrã a aguardar confirmação.',
+      'Regras para conversa por voz: Fala de forma natural, calorosa, concisa e fluida (2 a 4 frases por turno, sem ler listas longas de markdown nem símbolos como asteriscos). Se o utilizador partilhar o ecrã em direto, usa e descreve o que estás realmente a ver.',
     ]
       .filter(Boolean)
       .join('\n');
 
-    const liveTools = AGENT_TOOL_DECLARATIONS.filter((decl) =>
-      LIVE_ALLOWED_TOOL_NAMES.has(decl.name || '')
-    );
+    const liveTools = LIVE_VOICE_TOOL_DECLARATIONS;
 
     let closed = false;
     let currentInputTranscript = '';
@@ -492,7 +519,9 @@ export function attachGeminiLiveWebSocketServer(params: {
       kind: 'VOICE_LIVE',
       status: 'RUNNING',
       summary: `Sessão de voz em direto iniciada · Voz ${voiceName} (gemini-3.8-live)`,
-      detail: activeProject ? `Projeto: ${activeProject.name}` : undefined,
+      detail: activeProject
+        ? `Projeto: ${activeProject.name}`
+        : 'Conversa Geral · Acesso Total Cortex OS',
       durationMs: 1,
     });
 
@@ -567,6 +596,10 @@ export function attachGeminiLiveWebSocketServer(params: {
               projectId,
               chatId,
               actor: `Jarvis Live (${voiceName})`,
+              agentId: 'room-exec',
+              agentCallsign: 'CORE-EXEC',
+              isSubagent: false,
+              isLiveVoice: true,
               studioEventsOut: [],
             };
 

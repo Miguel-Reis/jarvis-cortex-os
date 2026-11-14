@@ -10,13 +10,23 @@ import { promisify } from 'node:util';
 process.env.JARVIS_SKIP_AUTO_LISTEN = '1';
 
 import { KeyedAsyncMutex } from './async-mutex';
-import { CURRENT_SCHEMA_VERSION, JarvisDatabase } from './db';
+import {
+  getServerApiKeysStatus,
+  loadDotEnvIntoProcess,
+  sanitizeApiKeyInput,
+  updateServerApiKeys,
+} from './api-keys-manager';
+import { CURRENT_SCHEMA_VERSION, db, JarvisDatabase } from './db';
 import { sanitizeLogText } from './debug-logger';
+import { AGENT_TOOL_DECLARATIONS } from './gemini-engine';
+import { enqueueApprovalRequest } from './os-adapter';
 import {
   evaluateBindAuthPolicy,
   resolveSafeBindHost,
   SlidingWindowRateLimiter,
 } from './security-gate';
+import { LIVE_VOICE_TOOL_DECLARATIONS } from './voice-live-bridge';
+import { GENERAL_CHAT_PROJECT_ID } from '../shared/types.ts';
 import { createJarvisExpressApp } from '../../server';
 
 const execFileAsync = promisify(execFile);
@@ -275,4 +285,195 @@ test('A-09 & §7 CLI --doctor executes cleanly under Node >= 22.6 and outputs st
   assert.equal(report.schemaVersion, CURRENT_SCHEMA_VERSION);
   assert.ok(report.checks.some((c) => c.id === 'NODE_RUNTIME' && c.status === 'PASS'));
   assert.ok(report.checks.some((c) => c.id === 'SQLITE_WAL_COLLECTIONS'));
+});
+
+test('Isolated Server API Keys Manager sanitizes input, hot-reloads runtime env, preserves .env comments, and clears safely', () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'jarvis-apikeys-'));
+  const tmpDotEnv = path.join(tmpDir, '.env');
+  const prevGemini = process.env.GEMINI_API_KEY;
+  const prevOpenRouter = process.env.OPENROUTER_API_KEY;
+
+  try {
+    fs.writeFileSync(tmpDotEnv, '# Existing Jarvis Env\nPORT=3000\n', 'utf-8');
+
+    // Prevent newline injection
+    assert.equal(sanitizeApiKeyInput('  "AIzaTest\r\nMALICIOUS=1"  '), 'AIzaTestMALICIOUS=1');
+
+    const statusSet = updateServerApiKeys(
+      {
+        geminiApiKey: 'AIzaSyIsolatedTestKey1234567890ABCD',
+        openRouterApiKey: 'sk-or-v1-isolatedtest987654',
+        persistToDotEnv: true,
+      },
+      tmpDotEnv
+    );
+
+    assert.equal(statusSet.geminiConfigured, true);
+    assert.equal(statusSet.geminiKeySource, 'DOTENV');
+    assert.ok(
+      statusSet.geminiMaskedKey && !statusSet.geminiMaskedKey.includes('IsolatedTestKey')
+    );
+    assert.equal(statusSet.openRouterConfigured, true);
+    assert.equal(process.env.GEMINI_API_KEY, 'AIzaSyIsolatedTestKey1234567890ABCD');
+
+    const dotEnvBody = fs.readFileSync(tmpDotEnv, 'utf-8');
+    assert.ok(dotEnvBody.includes('# Existing Jarvis Env'));
+    assert.ok(dotEnvBody.includes('PORT=3000'));
+    assert.ok(dotEnvBody.includes('GEMINI_API_KEY=AIzaSyIsolatedTestKey1234567890ABCD'));
+
+    // Clearing key removes it from runtime, removes from .env, and prevents reload resurrection
+    const statusCleared = updateServerApiKeys(
+      { clearGeminiKey: true, clearOpenRouterKey: true, persistToDotEnv: true },
+      tmpDotEnv
+    );
+    assert.equal(statusCleared.geminiConfigured, false);
+    assert.equal(statusCleared.geminiKeySource, 'NONE');
+    assert.equal(process.env.GEMINI_API_KEY, undefined);
+
+    loadDotEnvIntoProcess(tmpDotEnv);
+    assert.equal(process.env.GEMINI_API_KEY, undefined);
+
+    const freshStatus = getServerApiKeysStatus(tmpDotEnv);
+    assert.equal(freshStatus.geminiConfigured, false);
+  } finally {
+    if (prevGemini === undefined) {
+      delete process.env.GEMINI_API_KEY;
+    } else {
+      updateServerApiKeys({ geminiApiKey: prevGemini, persistToDotEnv: false }, tmpDotEnv);
+    }
+    if (prevOpenRouter === undefined) {
+      delete process.env.OPENROUTER_API_KEY;
+    } else {
+      updateServerApiKeys({ openRouterApiKey: prevOpenRouter, persistToDotEnv: false }, tmpDotEnv);
+    }
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('Live Voice Principal Agent exposes all 22 jarvis-os tools without subset restrictions', () => {
+  assert.ok(LIVE_VOICE_TOOL_DECLARATIONS.length >= 22);
+  assert.equal(LIVE_VOICE_TOOL_DECLARATIONS.length, AGENT_TOOL_DECLARATIONS.length);
+
+  const toolNames = new Set(LIVE_VOICE_TOOL_DECLARATIONS.map((t) => t.name));
+  for (const requiredTool of [
+    'get_jarvis_os_full_state',
+    'manage_jarvis_projects_and_chats',
+    'manage_jarvis_operations',
+    'write_workspace_file_governed',
+    'query_python_jarvis_cortex',
+    'request_shell_approval',
+    'sidecar_host_control',
+    'dispatch_swarm_48x',
+  ]) {
+    assert.ok(toolNames.has(requiredTool), `Missing Live Voice tool: ${requiredTool}`);
+  }
+});
+
+test('General Chat (__general__), API keys status masking, and Sub-Agent real-time authorization flow work end-to-end', async () => {
+  const initialSnapshot = structuredClone(db.getState());
+  const prevToken = process.env.JARVIS_API_TOKEN;
+  delete process.env.JARVIS_API_TOKEN;
+
+  const { app } = createJarvisExpressApp({ port: 0, host: '127.0.0.1' });
+  const server = http.createServer(app);
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const addr = server.address();
+  const port = typeof addr === 'object' && addr ? addr.port : 0;
+  const baseUrl = `http://127.0.0.1:${port}`;
+
+  try {
+    // 1. Bootstrap includes seeded unlinked General Chat
+    const bootRes = await fetch(`${baseUrl}/api/bootstrap`);
+    assert.equal(bootRes.status, 200);
+    const bootJson = (await bootRes.json()) as {
+      state: {
+        chatThreads: Array<{ id: string; projectId: string; isGeneral?: boolean }>;
+        goals: unknown[];
+      };
+    };
+    const seededGeneral = bootJson.state.chatThreads.find((c) => c.id === 'chat-general-main');
+    assert.ok(seededGeneral, 'Expected default chat-general-main in bootstrap');
+    assert.equal(seededGeneral?.projectId, GENERAL_CHAT_PROJECT_ID);
+    assert.equal(seededGeneral?.isGeneral, true);
+
+    // 2. Creating a second General Chat activates __general__ cleanly
+    const createGenRes = await fetch(`${baseUrl}/api/chats`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ isGeneral: true, title: 'Chat Livre de Arquitetura' }),
+    });
+    assert.equal(createGenRes.status, 200);
+    const createdGen = (await createGenRes.json()) as {
+      chat: { id: string; projectId: string; isGeneral?: boolean };
+    };
+    assert.equal(createdGen.chat.projectId, GENERAL_CHAT_PROJECT_ID);
+    assert.equal(createdGen.chat.isGeneral, true);
+
+    // 3. Sending a message in General Chat succeeds deterministically without altering Goals
+    db.update((draft) => {
+      draft.settings.modelProvider = 'LOCAL_DETERMINISTIC';
+    });
+    const goalsBefore = db.getState().goals.length;
+    const sendRes = await fetch(`${baseUrl}/api/chat/send`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        roomId: 'room-exec',
+        projectId: GENERAL_CHAT_PROJECT_ID,
+        chatId: createdGen.chat.id,
+        content: 'Conversa livre: faz um resumo rápido.',
+      }),
+    });
+    assert.equal(sendRes.status, 200);
+    assert.equal(db.getState().goals.length, goalsBefore);
+
+    // 4. GET /api/settings/api-keys never returns raw secret strings
+    const keysRes = await fetch(`${baseUrl}/api/settings/api-keys`);
+    assert.equal(keysRes.status, 200);
+    const keysStatus = (await keysRes.json()) as {
+      geminiConfigured: boolean;
+      geminiMaskedKey: string | null;
+    };
+    assert.equal(typeof keysStatus.geminiConfigured, 'boolean');
+    if (keysStatus.geminiMaskedKey) {
+      assert.ok(keysStatus.geminiMaskedKey.includes('•'));
+    }
+
+    // 5. Enqueuing a Sub-Agent ApprovalRequest and deciding via /api/approvals/:id/decide
+    const queued = enqueueApprovalRequest({
+      id: `appr-test-${Date.now()}`,
+      title: 'Escrita Sub-Agente em src/demo.ts',
+      commandOrAction: 'write_workspace_file_governed("src/demo.ts")',
+      riskLevel: 'MEDIUM',
+      source: 'SUBAGENT',
+      actorName: 'Frontend Specialist',
+      agentId: 'room-sub-ui',
+      agentCallsign: 'SUB-UI',
+      isSubagent: true,
+      projectId: 'proj-jarvis-core',
+      chatId: 'chat-web-main',
+      status: 'PENDING',
+      requestedAt: new Date().toISOString(),
+    });
+    assert.equal(queued.isSubagent, true);
+
+    const decideRes = await fetch(`${baseUrl}/api/approvals/${queued.id}/decide`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ decision: 'BLOCKED' }),
+    });
+    assert.equal(decideRes.status, 200);
+    const decided = db.getState().approvals.find((a) => a.id === queued.id);
+    assert.equal(decided?.status, 'BLOCKED');
+  } finally {
+    server.closeAllConnections?.();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    db.replaceAll(initialSnapshot);
+    db.flushSync({ writeJsonMirror: true });
+    if (prevToken !== undefined) {
+      process.env.JARVIS_API_TOKEN = prevToken;
+    } else {
+      delete process.env.JARVIS_API_TOKEN;
+    }
+  }
 });

@@ -14,18 +14,19 @@ import {
   buildSeedMcpServers,
 } from '../shared/mcp-catalog.ts';
 import { CORTEX_PLUGINS_CATALOG } from '../shared/skills-plugins-catalog.ts';
-import type {
-  ChatThread,
-  GoalItem,
-  JarvisStoreData,
-  MemoryItem,
-  PluginItem,
-  ProjectActivityLogEntry,
-  ProjectArtifact,
-  ProjectWorkspace,
-  SeedMode,
-  SwarmLane,
-  SwarmTask,
+import {
+  GENERAL_CHAT_PROJECT_ID,
+  type ChatThread,
+  type GoalItem,
+  type JarvisStoreData,
+  type MemoryItem,
+  type PluginItem,
+  type ProjectActivityLogEntry,
+  type ProjectArtifact,
+  type ProjectWorkspace,
+  type SeedMode,
+  type SwarmLane,
+  type SwarmTask,
 } from '../shared/types.ts';
 import { debugLog } from './debug-logger.ts';
 
@@ -501,6 +502,17 @@ export function buildInitialSeed(explicitSeedMode?: SeedMode): JarvisStoreData {
   ];
 
   const seedChatThreads: ChatThread[] = [
+    {
+      id: 'chat-general-main',
+      projectId: GENERAL_CHAT_PROJECT_ID,
+      isGeneral: true,
+      title: 'Conversa Geral · J.A.R.V.I.S.',
+      createdAt: nowIso,
+      updatedAt: nowIso,
+      primaryAgentId: 'room-exec',
+      participatingAgentIds: ['room-exec'],
+      screenAutoSendEnabled: true,
+    },
     {
       id: 'chat-web-main',
       projectId: 'proj-website-studio',
@@ -1157,6 +1169,18 @@ export function buildInitialSeed(explicitSeedMode?: SeedMode): JarvisStoreData {
       },
     ],
     messages: [
+      {
+        id: 'msg-welcome-general',
+        roomId: 'room-exec',
+        chatId: 'chat-general-main',
+        projectId: GENERAL_CHAT_PROJECT_ID,
+        agentName: 'Jarvis',
+        role: 'assistant',
+        content:
+          'Olá! Esta é a tua **Conversa Geral** — desligada de qualquer projeto específico, mas com **acesso total ao J.A.R.V.I.S. Cortex OS**.\n\nPodes conversar livremente, pedir análises ao vivo por voz ou texto, consultar telemetria, gerir projetos, workflows, memória, servidores MCP e controlos do Sidecar.',
+        createdAt: nowIso,
+        engineUsed: 'JARVIS_STUDIO_ORCHESTRATOR',
+      },
       {
         id: 'msg-welcome-web',
         roomId: 'room-exec',
@@ -1851,6 +1875,23 @@ export function migrateStoreToV4(
     : [...(seed.chatThreads || [])];
 
   if (!isImport) {
+    const hasGeneralChat = migratedChats.some(
+      (c) => c.isGeneral || c.projectId === GENERAL_CHAT_PROJECT_ID
+    );
+    if (!hasGeneralChat) {
+      migratedChats.unshift({
+        id: 'chat-general-main',
+        projectId: GENERAL_CHAT_PROJECT_ID,
+        isGeneral: true,
+        title: 'Conversa Geral · J.A.R.V.I.S.',
+        createdAt: nowIso,
+        updatedAt: nowIso,
+        primaryAgentId: 'room-exec',
+        participatingAgentIds: ['room-exec'],
+        screenAutoSendEnabled: true,
+      });
+    }
+
     for (const proj of migratedProjects) {
       let projChats = migratedChats.filter((c) => c.projectId === proj.id);
       if (projChats.length === 0) {
@@ -1923,11 +1964,18 @@ export function migrateStoreToV4(
       : (state.quota5h ?? seed.quota5h);
 
   const resolvedActiveProjectId =
-    (state.activeProjectId && migratedProjects.some((p) => p.id === state.activeProjectId)
-      ? state.activeProjectId
-      : migratedProjects[0]?.id) || 'proj-website-studio';
+    state.activeProjectId === GENERAL_CHAT_PROJECT_ID
+      ? GENERAL_CHAT_PROJECT_ID
+      : (state.activeProjectId && migratedProjects.some((p) => p.id === state.activeProjectId)
+          ? state.activeProjectId
+          : migratedProjects[0]?.id) || 'proj-website-studio';
 
-  const activeProjChats = migratedChats.filter((c) => c.projectId === resolvedActiveProjectId);
+  const activeProjChats =
+    resolvedActiveProjectId === GENERAL_CHAT_PROJECT_ID
+      ? migratedChats.filter(
+          (c) => c.isGeneral || c.projectId === GENERAL_CHAT_PROJECT_ID
+        )
+      : migratedChats.filter((c) => c.projectId === resolvedActiveProjectId);
   const resolvedActiveChatId =
     state.activeChatId && activeProjChats.some((c) => c.id === state.activeChatId)
       ? state.activeChatId
@@ -2129,7 +2177,39 @@ export class JarvisDatabase {
           }
           const loadedVersion = Number(assembled.schemaVersion ?? 0);
           if (loadedVersion >= CURRENT_SCHEMA_VERSION) {
-            const ready = { ...seed, ...(assembled as Partial<JarvisStoreData>) } as JarvisStoreData;
+            const rawChats = Array.isArray(assembled.chatThreads)
+              ? (assembled.chatThreads as ChatThread[])
+              : [];
+            const hasGeneral = rawChats.some(
+              (c) => c.isGeneral || c.projectId === GENERAL_CHAT_PROJECT_ID
+            );
+            let nextChats = rawChats;
+            if (!hasGeneral) {
+              const nowIso = new Date().toISOString();
+              nextChats = [
+                {
+                  id: 'chat-general-main',
+                  projectId: GENERAL_CHAT_PROJECT_ID,
+                  isGeneral: true,
+                  title: 'Conversa Geral · J.A.R.V.I.S.',
+                  createdAt: nowIso,
+                  updatedAt: nowIso,
+                  primaryAgentId: 'room-exec',
+                  participatingAgentIds: ['room-exec'],
+                  screenAutoSendEnabled: true,
+                },
+                ...rawChats,
+              ];
+              const serializedChats = JSON.stringify(nextChats);
+              this.lastKeySerialized.set('chatThreads', serializedChats);
+              this.dirtyPayloads.set('chatThreads', serializedChats);
+              this.flushSync();
+            }
+            const ready = {
+              ...seed,
+              ...(assembled as Partial<JarvisStoreData>),
+              chatThreads: nextChats,
+            } as JarvisStoreData;
             debugLog(
               'INFO',
               'DB',

@@ -18,12 +18,15 @@ powershell -NoProfile -Command "$c = Get-NetTCPConnection -LocalPort 8766 -State
 if not exist ".git" goto :skip_git
 where git >nul 2>nul
 if errorlevel 1 goto :skip_git
-echo [0/3] A sincronizar automaticamente com GitHub [origin/main]...
-git rebase --abort >nul 2>nul
-git merge --abort >nul 2>nul
-git fetch origin main
-if not errorlevel 1 (
-  git reset --hard origin/main
+echo [0/3] A verificar sincronizacao com GitHub [origin/main]...
+git fetch origin main >nul 2>nul
+if errorlevel 1 (
+  echo [0/3] Sem ligacao ao remoto; a manter versao local atual.
+  goto :skip_git
+)
+powershell -NoProfile -Command "$dirty = git status --porcelain; if ($dirty) { Write-Host '[0/3] Alteracoes locais detetadas; a preservar trabalho local sem reset.'; exit 2 }; git merge-base --is-ancestor HEAD origin/main 2>$null; if ($LASTEXITCODE -ne 0) { Write-Host '[0/3] Commits locais nao publicados detetados; a preservar HEAD local.'; exit 2 }"
+if "%ERRORLEVEL%"=="0" (
+  git merge --ff-only origin/main
 )
 :skip_git
 

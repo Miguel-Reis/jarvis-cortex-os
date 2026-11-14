@@ -13,6 +13,7 @@ import {
   validateSafeOutboundUrl,
 } from '../shared/cortex-math.ts';
 import type {
+  ApprovalRequest,
   OSTelemetry,
   PortRadarEntry,
   ScreenCaptureSnapshot,
@@ -24,6 +25,42 @@ import type {
 } from '../shared/types.ts';
 import { db } from './db.ts';
 import { debugLog } from './debug-logger.ts';
+
+export interface ApprovalActorMeta {
+  actorName?: string;
+  agentId?: string;
+  agentCallsign?: string;
+  isSubagent?: boolean;
+  projectId?: string;
+  chatId?: string;
+}
+
+type ApprovalBroadcastFn = (approval: ApprovalRequest) => void;
+let approvalBroadcaster: ApprovalBroadcastFn = () => {};
+
+/**
+ * Registers the server-side SSE broadcaster invoked immediately whenever any
+ * agent, subagent, workflow, MCP server, or sidecar queues a new `ApprovalRequest`.
+ */
+export function registerApprovalBroadcaster(fn: ApprovalBroadcastFn): void {
+  approvalBroadcaster = fn;
+}
+
+/**
+ * Persists a new `ApprovalRequest` in SQLite WAL and emits a real-time
+ * `approval_requested` notification to connected UI operators.
+ */
+export function enqueueApprovalRequest(approval: ApprovalRequest): ApprovalRequest {
+  db.update((draft) => {
+    draft.approvals.unshift(approval);
+  });
+  try {
+    approvalBroadcaster(approval);
+  } catch {
+    // Non-fatal broadcast hook error
+  }
+  return approval;
+}
 
 const execAsync = promisify(exec);
 const execFileAsync = promisify(execFile);
@@ -326,16 +363,10 @@ const SAFE_READONLY_PATTERNS = [
 
 export async function executeGovernedCommand(
   command: string,
-  source:
-    | 'CHAT_AGENT'
-    | 'WORKFLOW'
-    | 'WORKSPACE_TERMINAL'
-    | 'EXTERNAL_CHANNEL'
-    | 'SWARM_SANDBOX'
-    | 'MCP_GATEWAY'
-    | 'SIDECAR_HOST' = 'WORKSPACE_TERMINAL',
+  source: ApprovalRequest['source'] = 'WORKSPACE_TERMINAL',
   bypassApprovalOnce = false,
-  workflowRunId?: string
+  workflowRunId?: string,
+  actorMeta?: ApprovalActorMeta
 ): Promise<{
   status: 'EXECUTED' | 'PENDING_APPROVAL' | 'BLOCKED';
   output: string;
@@ -395,22 +426,27 @@ export async function executeGovernedCommand(
     debugLog('INFO', 'OS-EXEC', `Queued command for human approval (${approvalId}, risk=${combinedRiskScore}/100) from ${source}`, {
       payload: cleanCmd,
     });
-    db.update((draft) => {
-      draft.approvals.unshift({
-        id: approvalId,
-        title: shellSafety.hasShellOperators
-          ? `Execução Shell com Operadores [${shellSafety.detectedOperators.join(' ')}] (${source})`
-          : `Execução Governada (${source})`,
-        commandOrAction: cleanCmd,
-        source,
-        riskLevel,
-        requestedAt: new Date().toISOString(),
-        status: 'PENDING',
-        workflowRunId,
-      });
+    const actorTag = actorMeta?.actorName ? ` · ${actorMeta.actorName}` : '';
+    enqueueApprovalRequest({
+      id: approvalId,
+      title: shellSafety.hasShellOperators
+        ? `Execução Shell com Operadores [${shellSafety.detectedOperators.join(' ')}] (${source}${actorTag})`
+        : `Execução Governada (${source}${actorTag})`,
+      commandOrAction: cleanCmd,
+      source,
+      riskLevel,
+      requestedAt: new Date().toISOString(),
+      status: 'PENDING',
+      workflowRunId,
+      actorName: actorMeta?.actorName,
+      agentId: actorMeta?.agentId,
+      agentCallsign: actorMeta?.agentCallsign,
+      isSubagent: actorMeta?.isSubagent,
+      projectId: actorMeta?.projectId,
+      chatId: actorMeta?.chatId,
     });
     db.appendAudit(
-      source,
+      actorMeta?.actorName || source,
       'TERMINAL',
       'APPROVAL_REQUESTED',
       redactAiDefenceSecrets(`Risco ${combinedRiskScore}/100 · Aguarda aprovação: ${cleanCmd}`).sanitized,
@@ -816,6 +852,7 @@ export async function dispatchSidecarHostCommand(params: {
   command: string;
   deviceId?: string;
   kind?: SidecarHostCommandRecord['kind'];
+  actorMeta?: ApprovalActorMeta;
 }): Promise<SidecarHostCommandRecord> {
   const cleanCmd = params.command.trim();
   const state = db.getState();
@@ -860,7 +897,13 @@ export async function dispatchSidecarHostCommand(params: {
     return remoteRec;
   }
 
-  const execRes = await executeGovernedCommand(cleanCmd, 'SIDECAR_HOST');
+  const execRes = await executeGovernedCommand(
+    cleanCmd,
+    params.actorMeta?.isSubagent ? 'SUBAGENT' : 'SIDECAR_HOST',
+    false,
+    undefined,
+    params.actorMeta
+  );
   const record: SidecarHostCommandRecord = {
     id: `scmd-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
     deviceId: device?.id || 'dev-local-host',
@@ -1089,6 +1132,127 @@ export async function captureSidecarDesktopScreen(
     dataBase64: Buffer.from(svgMarkup, 'utf-8').toString('base64'),
     activeWindowTitle: topWin,
     hostname: hostSnap.hostname,
+  };
+}
+
+const PROTECTED_WRITE_SEGMENTS = new Set(['.git', 'node_modules']);
+
+/**
+ * Safely creates or updates a workspace text file under TrustBoundaryGate governance.
+ * Sensitive files (`.env*`, `.git/**`, `node_modules/**`, `data/*.sqlite*`) are blocked,
+ * and unless `autonomyLevel === 'FULL_EXECUTIVE'` or `bypassApprovalOnce`, writes queue
+ * a real-time `ApprovalRequest` for operator authorization.
+ */
+export function writeGovernedWorkspaceFile(
+  filePath: string,
+  content: string,
+  actorMeta?: ApprovalActorMeta,
+  bypassApprovalOnce = false
+): {
+  ok: boolean;
+  status: 'WRITTEN' | 'PENDING_APPROVAL' | 'BLOCKED';
+  output: string;
+  approvalId?: string;
+} {
+  const cleanRel = String(filePath || '').trim().replace(/\\/g, '/').replace(/^\/+/, '');
+  if (!cleanRel) {
+    return { ok: false, status: 'BLOCKED', output: 'Caminho do ficheiro em falta.' };
+  }
+
+  const segments = cleanRel.split('/').filter(Boolean);
+  const lowerRel = cleanRel.toLowerCase();
+  if (
+    segments.some((seg) => PROTECTED_WRITE_SEGMENTS.has(seg)) ||
+    /\.env(\.|$)/i.test(segments[segments.length - 1] || '') ||
+    lowerRel.endsWith('.sqlite') ||
+    lowerRel.endsWith('.sqlite3') ||
+    lowerRel.endsWith('.db')
+  ) {
+    db.appendAudit(
+      actorMeta?.actorName || 'TRUST_GATE',
+      'SECURITY',
+      'FILE_WRITE_BLOCKED',
+      `Escrita protegida bloqueada em "${cleanRel}"`,
+      'BLOCKED'
+    );
+    return {
+      ok: false,
+      status: 'BLOCKED',
+      output: `Acesso bloqueado pelo TrustBoundaryGate: "${cleanRel}" é um ficheiro protegido (.env / .git / node_modules / sqlite).`,
+    };
+  }
+
+  const resolved = path.resolve(WORKSPACE_ROOT, cleanRel);
+  if (!isPathInsideWorkspace(WORKSPACE_ROOT, resolved)) {
+    return {
+      ok: false,
+      status: 'BLOCKED',
+      output: 'Caminho fora dos limites do workspace autorizado.',
+    };
+  }
+
+  const state = db.getState();
+  const threshold = state.settings.trustThreshold ?? 70;
+  const contentScan = detectPromptInjection(content.slice(0, 4000), threshold);
+  if (contentScan.blocked) {
+    db.appendAudit(
+      actorMeta?.actorName || 'TRUST_GATE',
+      'SECURITY',
+      'FILE_WRITE_INJECTION_BLOCKED',
+      `Conteúdo suspeito em "${cleanRel}" (${contentScan.matchedRules.join(', ')})`,
+      'BLOCKED'
+    );
+    return {
+      ok: false,
+      status: 'BLOCKED',
+      output: `Conteúdo bloqueado pelo TrustBoundaryGate (risco ${contentScan.riskScore}/100): ${contentScan.matchedRules.join(', ')}`,
+    };
+  }
+
+  const preApproved =
+    bypassApprovalOnce || state.settings.autonomyLevel === 'FULL_EXECUTIVE';
+  if (!preApproved) {
+    const approvalId = `appr-write-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+    const source: ApprovalRequest['source'] = actorMeta?.isSubagent
+      ? 'SUBAGENT'
+      : 'CHAT_AGENT';
+    enqueueApprovalRequest({
+      id: approvalId,
+      title: `Escrever Ficheiro: ${cleanRel}${actorMeta?.actorName ? ` · ${actorMeta.actorName}` : ''}`,
+      commandOrAction: `write_file ${cleanRel} (${content.length} bytes)`,
+      source,
+      riskLevel: 'MEDIUM',
+      requestedAt: new Date().toISOString(),
+      status: 'PENDING',
+      actorName: actorMeta?.actorName,
+      agentId: actorMeta?.agentId,
+      agentCallsign: actorMeta?.agentCallsign,
+      isSubagent: actorMeta?.isSubagent,
+      projectId: actorMeta?.projectId,
+      chatId: actorMeta?.chatId,
+      pendingFileWrite: { filePath: cleanRel, content },
+    });
+    return {
+      ok: false,
+      status: 'PENDING_APPROVAL',
+      approvalId,
+      output: `Escrita de "${cleanRel}" colocada na Inbox de Autoridade (${approvalId}) para confirmação do Operador.`,
+    };
+  }
+
+  fs.mkdirSync(path.dirname(resolved), { recursive: true });
+  fs.writeFileSync(resolved, content, 'utf-8');
+  db.appendAudit(
+    actorMeta?.actorName || 'JARVIS_AGENT',
+    'TERMINAL',
+    'WORKSPACE_FILE_WRITTEN',
+    `Escrito "${cleanRel}" (${content.length} bytes)`,
+    'VERIFIED'
+  );
+  return {
+    ok: true,
+    status: 'WRITTEN',
+    output: `Ficheiro "${cleanRel}" escrito com sucesso (${content.length} bytes).`,
   };
 }
 

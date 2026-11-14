@@ -9,6 +9,7 @@ import {
   MCP_STANDARD_LIBRARY,
 } from '../../shared/mcp-catalog.ts';
 import type {
+  ApprovalRequest,
   McpCustomServer,
   McpLibraryCategory,
   McpRegistryResourceItem,
@@ -525,23 +526,30 @@ export function createMcpRouter(ctx: McpRouterContext): express.Router {
         authorityGate: gate,
       };
 
+      let pendingMcpApproval: ApprovalRequest | null = null;
       db.update((draft) => {
         if (!draft.mcpServers) draft.mcpServers = [];
         draft.mcpServers.unshift(newServer);
 
         if (!stdioPreApproved) {
-          draft.approvals.unshift({
+          pendingMcpApproval = {
             id: `appr-mcp-${Date.now()}`,
             title: `Autorizar Servidor MCP stdio (${name})`,
             commandOrAction: fullStdioCmd,
             source: 'MCP_GATEWAY',
+            actorName: `MCP Gateway · ${name}`,
             riskLevel: gate.riskLevel === 'LOW' ? 'MEDIUM' : gate.riskLevel,
             requestedAt: nowIso,
             status: 'PENDING',
             mcpServerId: serverId,
-          });
+          };
+          draft.approvals.unshift(pendingMcpApproval);
         }
       });
+
+      if (pendingMcpApproval) {
+        ctx.broadcastSse('approval_requested', pendingMcpApproval);
+      }
 
       const auditSummary = redactAiDefenceSecrets(
         `${name} [${transport}] JEV-S1=${jevEligible ? 'ON' : 'OFF'} · Risco=${gate.riskScore}/100`

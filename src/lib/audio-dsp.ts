@@ -245,6 +245,43 @@ class MarkViiAudioEngine {
   }
 
   /**
+   * Subtle two-tone tactical alert chime emitted when an Agent or Sub-Agent requests human authorization.
+   */
+  public playAuthorityAlertChime(dspEnabled = true): void {
+    try {
+      const ctx = this.ensureContext();
+      if (!ctx || !this.cleanInputGain || !this.dspInputNode) return;
+
+      const now = ctx.currentTime;
+      const osc1 = ctx.createOscillator();
+      const osc2 = ctx.createOscillator();
+      const gain = ctx.createGain();
+
+      osc1.type = 'sine';
+      osc2.type = 'triangle';
+      osc1.frequency.setValueAtTime(587.33, now);
+      osc1.frequency.setValueAtTime(880, now + 0.11);
+      osc2.frequency.setValueAtTime(293.66, now);
+      osc2.frequency.setValueAtTime(440, now + 0.11);
+
+      gain.gain.setValueAtTime(0.0001, now);
+      gain.gain.exponentialRampToValueAtTime(0.085, now + 0.02);
+      gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.28);
+
+      osc1.connect(gain);
+      osc2.connect(gain);
+      gain.connect(dspEnabled ? this.dspInputNode : this.cleanInputGain);
+
+      osc1.start(now);
+      osc2.start(now);
+      osc1.stop(now + 0.3);
+      osc2.stop(now + 0.3);
+    } catch {
+      // Safe no-op if browser autoplay policy blocks AudioContext before user gesture
+    }
+  }
+
+  /**
    * Local zero-dependency Web Speech API fallback when offline or in LOCAL_DETERMINISTIC mode.
    */
   public speakWithMarkVII(text: string, lang: LanguageCode = 'pt-PT', dspEnabled = true): void {

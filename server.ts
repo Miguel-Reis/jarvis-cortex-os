@@ -15,6 +15,7 @@ import {
   detectPromptInjection,
   filterProjectActivityLogs,
   GEMINI_VOICE_CATALOG,
+  isGeneralUnlinkedChat,
   normalizeGeminiModelId,
   normalizeGeminiVoiceName,
   rankQ18Actions,
@@ -25,20 +26,22 @@ import {
   SPECIALIST_AGENT_TEMPLATES,
   STANDARD_SKILLS_LIBRARY,
 } from './src/shared/skills-plugins-catalog.ts';
-import type {
-  ArtifactKind,
-  ChannelPlatform,
-  ChatThread,
-  GoalItem,
-  GoalSubtask,
-  PluginItem,
-  PluginLifecycleHook,
-  ProjectArtifact,
-  ProjectIdeaCategory,
-  ProjectWorkspace,
-  Room,
-  TodayContractItem,
+import {
+  GENERAL_CHAT_PROJECT_ID,
+  type ArtifactKind,
+  type ChannelPlatform,
+  type ChatThread,
+  type GoalItem,
+  type GoalSubtask,
+  type PluginItem,
+  type PluginLifecycleHook,
+  type ProjectArtifact,
+  type ProjectIdeaCategory,
+  type ProjectWorkspace,
+  type Room,
+  type TodayContractItem,
 } from './src/shared/types.ts';
+import { loadDotEnvIntoProcess } from './src/server/api-keys-manager.ts';
 import { domainMutex } from './src/server/async-mutex.ts';
 import { db } from './src/server/db.ts';
 import { enforceMinimumNodeRuntime, runSystemDoctor } from './src/server/doctor.ts';
@@ -56,6 +59,7 @@ import {
   getGitOverview,
   listWorkspaceFiles,
   readSafeWorkspaceFile,
+  registerApprovalBroadcaster,
   triggerSidecarHotkey,
   verifyTodayContractItem,
 } from './src/server/os-adapter.ts';
@@ -102,30 +106,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 function loadDotEnvIfPresent(): void {
-  const envPath = path.join(__dirname, '.env');
-  if (!fs.existsSync(envPath)) return;
-  try {
-    const lines = fs.readFileSync(envPath, 'utf-8').split(/\r?\n/);
-    for (const rawLine of lines) {
-      const line = rawLine.trim();
-      if (!line || line.startsWith('#')) continue;
-      const eqIdx = line.indexOf('=');
-      if (eqIdx <= 0) continue;
-      const key = line.slice(0, eqIdx).trim();
-      let val = line.slice(eqIdx + 1).trim();
-      if (
-        (val.startsWith('"') && val.endsWith('"')) ||
-        (val.startsWith("'") && val.endsWith("'"))
-      ) {
-        val = val.slice(1, -1);
-      }
-      if (key && process.env[key] === undefined) {
-        process.env[key] = val;
-      }
-    }
-  } catch {
-    // Ignore unreadable .env
-  }
+  loadDotEnvIntoProcess(path.join(__dirname, '.env'));
 }
 
 loadDotEnvIfPresent();
@@ -234,6 +215,7 @@ export function createJarvisExpressApp(options: { port?: number; host?: string }
   registerWorkflowBroadcaster(broadcastSse);
   registerSwarmOrbitBroadcaster(broadcastSse);
   registerStudioActivityBroadcaster(broadcastSse);
+  registerApprovalBroadcaster((approval) => broadcastSse('approval_requested', approval));
 
   // ==========================================================================
   // Health & Unified Bootstrap State
@@ -629,9 +611,58 @@ export function createJarvisExpressApp(options: { port?: number; host?: string }
     });
   });
 
-  // Chat Threads inside Idea Projects
+  // Chat Threads inside Idea Projects OR Unlinked General Conversations
   app.post('/api/chats', (req, res) => {
     const state = db.getState();
+    const wantsGeneral =
+      req.body?.isGeneral === true || req.body?.projectId === GENERAL_CHAT_PROJECT_ID;
+    const rawTitle = String(req.body?.title || '').trim();
+    const primaryAgentId = String(req.body?.primaryAgentId || 'room-exec');
+    const nowIso = new Date().toISOString();
+    const agentRoom = state.rooms.find((r) => r.id === primaryAgentId) || state.rooms[0];
+
+    if (wantsGeneral) {
+      const cleanTitle = rawTitle || 'Nova Conversa Livre';
+      const chat: ChatThread = {
+        id: `chat-gen-${Date.now()}-${Math.random().toString(36).slice(2, 5)}`,
+        projectId: GENERAL_CHAT_PROJECT_ID,
+        isGeneral: true,
+        title: cleanTitle,
+        createdAt: nowIso,
+        updatedAt: nowIso,
+        primaryAgentId,
+        participatingAgentIds: Array.from(new Set([primaryAgentId, 'room-exec'])),
+        screenAutoSendEnabled: true,
+      };
+
+      db.update((draft) => {
+        if (!draft.chatThreads) draft.chatThreads = [];
+        draft.chatThreads.unshift(chat);
+        draft.activeProjectId = GENERAL_CHAT_PROJECT_ID;
+        draft.activeChatId = chat.id;
+        draft.messages.push({
+          id: `msg-welcome-${chat.id}`,
+          roomId: agentRoom.id,
+          chatId: chat.id,
+          projectId: GENERAL_CHAT_PROJECT_ID,
+          agentName: agentRoom.name,
+          role: 'assistant',
+          content: `**${cleanTitle}** iniciada em modo **Conversa Geral (Sem Projeto)**. Podes conversar normalmente ou pedir ações em todo o ecossistema J.A.R.V.I.S. Cortex OS.`,
+          createdAt: nowIso,
+          engineUsed: 'JARVIS_STUDIO_ORCHESTRATOR',
+        });
+      });
+
+      broadcastSse('state_updated', { section: 'chats' });
+      res.json({
+        chat,
+        chatThreads: db.getState().chatThreads,
+        activeChatId: chat.id,
+        activeProjectId: GENERAL_CHAT_PROJECT_ID,
+      });
+      return;
+    }
+
     const projectId = String(req.body?.projectId || state.activeProjectId || 'proj-website-studio');
     const proj = (state.projects || []).find((p) => p.id === projectId) || (state.projects || [])[0];
     if (!proj) {
@@ -639,9 +670,7 @@ export function createJarvisExpressApp(options: { port?: number; host?: string }
       return;
     }
 
-    const cleanTitle = String(req.body?.title || '').trim() || 'Nova Conversa';
-    const primaryAgentId = String(req.body?.primaryAgentId || 'room-exec');
-    const nowIso = new Date().toISOString();
+    const cleanTitle = rawTitle || 'Nova Conversa';
     const chat: ChatThread = {
       id: `chat-${Date.now()}-${Math.random().toString(36).slice(2, 5)}`,
       projectId: proj.id,
@@ -654,8 +683,6 @@ export function createJarvisExpressApp(options: { port?: number; host?: string }
       ),
       screenAutoSendEnabled: true,
     };
-
-    const agentRoom = state.rooms.find((r) => r.id === primaryAgentId) || state.rooms[0];
 
     db.update((draft) => {
       if (!draft.chatThreads) draft.chatThreads = [];
@@ -700,7 +727,9 @@ export function createJarvisExpressApp(options: { port?: number; host?: string }
       const target = (draft.chatThreads || []).find((c) => c.id === req.params.id);
       if (target) {
         draft.activeChatId = target.id;
-        draft.activeProjectId = target.projectId;
+        draft.activeProjectId = isGeneralUnlinkedChat(target)
+          ? GENERAL_CHAT_PROJECT_ID
+          : target.projectId;
         found = { ...target };
       }
     });
@@ -709,7 +738,11 @@ export function createJarvisExpressApp(options: { port?: number; host?: string }
       return;
     }
     broadcastSse('state_updated', { section: 'chats' });
-    res.json({ chat: found, activeChatId: (found as ChatThread).id });
+    res.json({
+      chat: found,
+      activeChatId: (found as ChatThread).id,
+      activeProjectId: db.getState().activeProjectId,
+    });
   });
 
   app.patch('/api/chats/:id', (req, res) => {
@@ -745,11 +778,16 @@ export function createJarvisExpressApp(options: { port?: number; host?: string }
       res.status(404).json({ error: 'Conversa não encontrada.' });
       return;
     }
-    const siblingCount = (state.chatThreads || []).filter(
-      (c) => c.projectId === target.projectId
+    const targetIsGeneral = isGeneralUnlinkedChat(target);
+    const siblingCount = (state.chatThreads || []).filter((c) =>
+      targetIsGeneral ? isGeneralUnlinkedChat(c) : !isGeneralUnlinkedChat(c) && c.projectId === target.projectId
     ).length;
     if (siblingCount <= 1) {
-      res.status(400).json({ error: 'Mantém pelo menos uma conversa ativa no projeto.' });
+      res.status(400).json({
+        error: targetIsGeneral
+          ? 'Mantém pelo menos uma conversa geral ativa.'
+          : 'Mantém pelo menos uma conversa ativa no projeto.',
+      });
       return;
     }
 
@@ -760,7 +798,9 @@ export function createJarvisExpressApp(options: { port?: number; host?: string }
         (l) => l.chatId !== req.params.id
       );
       if (draft.activeChatId === req.params.id) {
-        const next = (draft.chatThreads || []).find((c) => c.projectId === target.projectId);
+        const next = (draft.chatThreads || []).find((c) =>
+          targetIsGeneral ? isGeneralUnlinkedChat(c) : !isGeneralUnlinkedChat(c) && c.projectId === target.projectId
+        );
         if (next) draft.activeChatId = next.id;
       }
     });
@@ -1544,6 +1584,10 @@ export function createJarvisExpressApp(options: { port?: number; host?: string }
       ? body.accentColor
       : tpl?.accentColor || 'amber';
 
+    const rawProjectId = body.projectId ? String(body.projectId).trim() : undefined;
+    const normalizedProjectId =
+      rawProjectId && rawProjectId !== GENERAL_CHAT_PROJECT_ID ? rawProjectId : undefined;
+
     const room: Room = {
       id: `room-custom-${Date.now()}`,
       name,
@@ -1559,7 +1603,7 @@ export function createJarvisExpressApp(options: { port?: number; host?: string }
       allowedTools: Array.isArray(body.allowedTools)
         ? body.allowedTools.map(String)
         : tpl?.allowedTools || ['upsert_project_goal', 'search_memories', 'lookup_ast_symbol'],
-      projectId: body.projectId ? String(body.projectId) : undefined,
+      projectId: normalizedProjectId,
       modelOverride: body.modelOverride ? String(body.modelOverride).trim() : undefined,
       isCustom: true,
     };

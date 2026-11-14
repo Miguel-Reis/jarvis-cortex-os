@@ -4,7 +4,11 @@ import { domainMutex } from './async-mutex.ts';
 import { db } from './db.ts';
 import { debugLog } from './debug-logger.ts';
 import { synthesizeBriefText } from './gemini-engine.ts';
-import { collectOSTelemetry, executeGovernedCommand } from './os-adapter.ts';
+import {
+  collectOSTelemetry,
+  enqueueApprovalRequest,
+  executeGovernedCommand,
+} from './os-adapter.ts';
 import { runProjectProactiveScan } from './swarm-orbit-engine.ts';
 
 type SseBroadcastFn = (event: string, data: unknown) => void;
@@ -81,17 +85,16 @@ export async function runWorkflowById(
       if (!bypassApproval && db.getState().settings.autonomyLevel !== 'FULL_EXECUTIVE') {
         const apprId = `appr-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
         pendingApprovalId = apprId;
-        db.update((draft) => {
-          draft.approvals.unshift({
-            id: apprId,
-            title: `Workflow: ${wf.name} (${node.label})`,
-            commandOrAction: node.config.approverNote || `Aprovar continuação de ${wf.name}`,
-            source: 'WORKFLOW',
-            riskLevel: 'MEDIUM',
-            requestedAt: new Date().toISOString(),
-            status: 'PENDING',
-            workflowRunId: runId,
-          });
+        enqueueApprovalRequest({
+          id: apprId,
+          title: `Workflow: ${wf.name} (${node.label})`,
+          commandOrAction: node.config.approverNote || `Aprovar continuação de ${wf.name}`,
+          source: 'WORKFLOW',
+          actorName: `Workflow "${wf.name}"`,
+          riskLevel: 'MEDIUM',
+          requestedAt: new Date().toISOString(),
+          status: 'PENDING',
+          workflowRunId: runId,
         });
         steps.push({
           nodeId: node.id,

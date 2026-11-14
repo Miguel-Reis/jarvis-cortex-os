@@ -56,9 +56,12 @@ export interface GoalItem {
   updatedAt?: string;
 }
 
+export const GENERAL_CHAT_PROJECT_ID = '__general__' as const;
+
 export interface ChatThread {
   id: string;
   projectId: string;
+  isGeneral?: boolean;
   title: string;
   createdAt: string;
   updatedAt: string;
@@ -675,6 +678,8 @@ export interface ApprovalRequest {
   commandOrAction: string;
   source:
     | 'CHAT_AGENT'
+    | 'LIVE_VOICE_AGENT'
+    | 'SUBAGENT'
     | 'WORKFLOW'
     | 'WORKSPACE_TERMINAL'
     | 'EXTERNAL_CHANNEL'
@@ -687,6 +692,35 @@ export interface ApprovalRequest {
   decidedAt?: string;
   workflowRunId?: string;
   mcpServerId?: string;
+  actorName?: string;
+  agentId?: string;
+  agentCallsign?: string;
+  isSubagent?: boolean;
+  projectId?: string;
+  chatId?: string;
+  pendingFileWrite?: {
+    filePath: string;
+    content: string;
+  };
+}
+
+export interface ServerApiKeysStatus {
+  geminiConfigured: boolean;
+  geminiMaskedKey: string | null;
+  geminiKeySource: 'DOTENV' | 'RUNTIME' | 'NONE';
+  openRouterConfigured: boolean;
+  openRouterMaskedKey: string | null;
+  openRouterKeySource: 'DOTENV' | 'RUNTIME' | 'NONE';
+  updatedAt?: string;
+}
+
+export interface UpdateServerApiKeysPayload {
+  geminiApiKey?: string | null;
+  clearGeminiKey?: boolean;
+  openRouterApiKey?: string | null;
+  clearOpenRouterKey?: boolean;
+  persistToDotEnv?: boolean;
+  validateNow?: boolean;
 }
 
 export interface AuditLogEntry {

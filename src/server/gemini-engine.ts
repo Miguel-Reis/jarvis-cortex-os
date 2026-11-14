@@ -1,3 +1,5 @@
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { type FunctionDeclaration, GoogleGenAI, ThinkingLevel, Type } from '@google/genai';
 import {
   buildDeterministicArtifactFromPrompt,
@@ -6,6 +8,8 @@ import {
   detectPromptInjection,
   extractDeterministicPlanFromPrompt,
   extractUrlsFromPrompt,
+  formatApprovalRequesterBadge,
+  isGeneralUnlinkedChat,
   isLocalOpenAiCompatibleEndpoint,
   normalizeGeminiModelId,
   rankQ18Actions,
@@ -13,30 +17,35 @@ import {
   searchMemories4WayRRF,
 } from '../shared/cortex-math.ts';
 import { STANDARD_SKILLS_LIBRARY } from '../shared/skills-plugins-catalog.ts';
-import type {
-  ArtifactKind,
-  AttachmentItem,
-  ChatMessage,
-  GoalItem,
-  GoalSubtask,
-  GroundingSourceItem,
-  JevRouteDecision,
-  LanguageCode,
-  MemoryCategory,
-  PersonalityMode,
-  ProjectActivityLogEntry,
-  ProjectArtifact,
-  Room,
-  ScreenCaptureSnapshot,
-  SkillItem,
-  StudioInlineEvent,
-  ToolCallRecord,
-  WorkflowNode,
+import {
+  GENERAL_CHAT_PROJECT_ID,
+  type ApprovalRequest,
+  type ArtifactKind,
+  type AttachmentItem,
+  type ChatMessage,
+  type ChatThread,
+  type GoalItem,
+  type GoalSubtask,
+  type GroundingSourceItem,
+  type JevRouteDecision,
+  type LanguageCode,
+  type MemoryCategory,
+  type PersonalityMode,
+  type ProjectActivityLogEntry,
+  type ProjectArtifact,
+  type ProjectWorkspace,
+  type Room,
+  type ScreenCaptureSnapshot,
+  type SkillItem,
+  type StudioInlineEvent,
+  type ToolCallRecord,
+  type WorkflowNode,
 } from '../shared/types.ts';
 import { db } from './db.ts';
 import { debugLog } from './debug-logger.ts';
 import { handleMcpJsonRpc } from './mcp-server.ts';
 import {
+  type ApprovalActorMeta,
   captureSidecarDesktopScreen,
   collectOSTelemetry,
   collectSidecarHostSnapshot,
@@ -46,14 +55,20 @@ import {
   listWorkspaceFiles,
   readSafeWorkspaceFile,
   triggerSidecarHotkey,
+  verifyTodayContractItem,
+  writeGovernedWorkspaceFile,
 } from './os-adapter.ts';
 import {
   buildScoutWorkspaceIndex,
   harvestSelfLearnFromTurn,
   launchAsymmetricSwarm,
   lookupWorkspaceSymbols,
+  probeAndSyncBrain8765,
+  runProjectProactiveScan,
   storeBiTemporalMemory,
 } from './swarm-orbit-engine.ts';
+
+const execFileAsync = promisify(execFile);
 
 const roomDeltaHashes = new Map<string, string>();
 let studioActivityBroadcaster: ((event: string, payload: unknown) => void) | null = null;
@@ -76,6 +91,10 @@ export interface StudioExecutionContext {
   projectId: string;
   chatId: string;
   actor: string;
+  agentId?: string;
+  agentCallsign?: string;
+  isSubagent?: boolean;
+  isLiveVoice?: boolean;
   studioEventsOut: StudioInlineEvent[];
 }
 
@@ -135,6 +154,11 @@ const STUDIO_CORE_TOOL_NAMES = new Set([
   'activate_antigravity_skill',
   'call_mcp_gateway_tool',
   'capture_and_inspect_sidecar_screen',
+  'get_jarvis_os_full_state',
+  'manage_jarvis_projects_and_chats',
+  'manage_jarvis_operations',
+  'write_workspace_file_governed',
+  'query_python_jarvis_cortex',
 ]);
 
 export const AGENT_TOOL_DECLARATIONS: FunctionDeclaration[] = [
@@ -429,7 +453,125 @@ export const AGENT_TOOL_DECLARATIONS: FunctionDeclaration[] = [
       required: ['action'],
     },
   },
+  {
+    name: 'get_jarvis_os_full_state',
+    description:
+      'Retrieve a complete real-time snapshot of everything inside J.A.R.V.I.S. Cortex OS: all projects, general/project chats, agents & subagents, pending authority approvals, Goals, Today Contracts, ranked Q-18 actions, workflows, MCP Gateway servers/tools, Skills, Plugins, Sidecar devices, 5h quota, and Brain :8765 status.',
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        includeDetails: {
+          type: Type.BOOLEAN,
+          description: 'Include full lists of goals, contracts, workflows, and agents (defaults to true).',
+        },
+      },
+    },
+  },
+  {
+    name: 'manage_jarvis_projects_and_chats',
+    description:
+      'List, switch, create, or link projects, general unlinked conversations, project conversations, and assign agents/subagents to a project.',
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        action: {
+          type: Type.STRING,
+          description:
+            'One of: LIST, SWITCH_PROJECT, CREATE_PROJECT, SWITCH_CHAT, CREATE_PROJECT_CHAT, CREATE_GENERAL_CHAT, ASSIGN_AGENT_TO_PROJECT.',
+        },
+        projectIdOrQuery: { type: Type.STRING, description: 'Project ID or name for SWITCH_PROJECT / CREATE_PROJECT_CHAT / ASSIGN_AGENT_TO_PROJECT.' },
+        chatIdOrQuery: { type: Type.STRING, description: 'Chat ID or title for SWITCH_CHAT.' },
+        agentIdOrQuery: { type: Type.STRING, description: 'Agent room ID, callsign, or name to assign.' },
+        nameOrTitle: { type: Type.STRING, description: 'Name/title for CREATE_PROJECT, CREATE_PROJECT_CHAT, or CREATE_GENERAL_CHAT.' },
+        description: { type: Type.STRING, description: 'Description or brief for CREATE_PROJECT.' },
+        techStack: { type: Type.STRING, description: 'Tech stack for CREATE_PROJECT.' },
+        rootPath: { type: Type.STRING, description: 'Workspace rootPath for CREATE_PROJECT.' },
+      },
+      required: ['action'],
+    },
+  },
+  {
+    name: 'manage_jarvis_operations',
+    description:
+      'Inspect pending human authorization requests, run Today Contract verification gates, execute top ranked Q-18 next actions, toggle project proactivity, or trigger a manual Heartbeat pulse.',
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        action: {
+          type: Type.STRING,
+          description:
+            'One of: LIST_PENDING_APPROVALS, VERIFY_ALL_CONTRACTS, VERIFY_CONTRACT, EXECUTE_TOP_Q18, TOGGLE_PROJECT_PROACTIVE, TRIGGER_HEARTBEAT.',
+        },
+        targetIdOrQuery: {
+          type: Type.STRING,
+          description: 'Optional Contract ID/title or Project ID/name.',
+        },
+        enabled: {
+          type: Type.BOOLEAN,
+          description: 'For TOGGLE_PROJECT_PROACTIVE: desired enabled flag.',
+        },
+      },
+      required: ['action'],
+    },
+  },
+  {
+    name: 'write_workspace_file_governed',
+    description:
+      'Create or update a file inside the workspace under TrustBoundaryGate governance (queues an ApprovalRequest if human confirmation is required; blocks .env/.git/node_modules/sqlite).',
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        filePath: { type: Type.STRING, description: 'Relative workspace file path (e.g. docs/notes.md).' },
+        content: { type: Type.STRING, description: 'Complete UTF-8 file content to write.' },
+      },
+      required: ['filePath', 'content'],
+    },
+  },
+  {
+    name: 'query_python_jarvis_cortex',
+    description:
+      'Execute a native Python jarvis_os CLI query (status, plan, briefing, routine, brain, sidecar, workflow, or memory search) and return its output.',
+    parameters: {
+      type: Type.OBJECT,
+      properties: {
+        subcommand: {
+          type: Type.STRING,
+          description: 'One of: status, plan, briefing, routine, brain, sidecar, workflow, memory.',
+        },
+        query: {
+          type: Type.STRING,
+          description: 'Search query when subcommand is memory.',
+        },
+      },
+      required: ['subcommand'],
+    },
+  },
 ];
+
+function buildActorMeta(studioCtx?: StudioExecutionContext): {
+  actorMeta?: ApprovalActorMeta;
+  approvalSource: ApprovalRequest['source'];
+} {
+  if (!studioCtx) {
+    return { actorMeta: undefined, approvalSource: 'CHAT_AGENT' };
+  }
+  const approvalSource: ApprovalRequest['source'] = studioCtx.isSubagent
+    ? 'SUBAGENT'
+    : studioCtx.isLiveVoice
+      ? 'LIVE_VOICE_AGENT'
+      : 'CHAT_AGENT';
+  return {
+    approvalSource,
+    actorMeta: {
+      actorName: studioCtx.actor,
+      agentId: studioCtx.agentId,
+      agentCallsign: studioCtx.agentCallsign,
+      isSubagent: studioCtx.isSubagent,
+      projectId: studioCtx.projectId,
+      chatId: studioCtx.chatId,
+    },
+  };
+}
 
 export async function executeAgentTool(
   name: string,
@@ -709,8 +851,10 @@ export async function executeAgentTool(
           'list_workspace_files',
         ];
 
-    const targetProjectId =
+    const rawTargetProj =
       studioCtx?.projectId || db.getState().activeProjectId || 'proj-website-studio';
+    const targetProjectId =
+      rawTargetProj === GENERAL_CHAT_PROJECT_ID ? undefined : rawTargetProj;
     const targetChatId = studioCtx?.chatId || db.getState().activeChatId || 'chat-web-main';
 
     let subagent: Room | null = null;
@@ -719,7 +863,7 @@ export async function executeAgentTool(
     db.update((draft) => {
       const existing = draft.rooms.find(
         (r) =>
-          r.projectId === targetProjectId &&
+          (targetProjectId ? r.projectId === targetProjectId : !r.projectId) &&
           r.name.toLowerCase() === agentName.toLowerCase()
       );
       if (existing) {
@@ -1210,7 +1354,14 @@ export async function executeAgentTool(
     }
   } else if (name === 'request_shell_approval') {
     const cmd = String(args.command || 'git status --short');
-    const execRes = await executeGovernedCommand(cmd, 'CHAT_AGENT');
+    const { actorMeta, approvalSource } = buildActorMeta(studioCtx);
+    const execRes = await executeGovernedCommand(
+      cmd,
+      approvalSource,
+      false,
+      undefined,
+      actorMeta
+    );
     stdRes = {
       record: {
         id,
@@ -1230,6 +1381,7 @@ export async function executeAgentTool(
   } else if (name === 'sidecar_host_control') {
     const action = String(args.action || 'SNAPSHOT').toUpperCase();
     const target = String(args.target || '').trim();
+    const { actorMeta } = buildActorMeta(studioCtx);
     if (action === 'HOTKEY') {
       const rec = await triggerSidecarHotkey(target || 'Alt+Space');
       stdRes = {
@@ -1244,7 +1396,11 @@ export async function executeAgentTool(
         rawResult: { commandRecord: rec },
       };
     } else if (action === 'EXEC' && target) {
-      const rec = await dispatchSidecarHostCommand({ command: target, kind: 'HOST_EXEC' });
+      const rec = await dispatchSidecarHostCommand({
+        command: target,
+        kind: 'HOST_EXEC',
+        actorMeta,
+      });
       stdRes = {
         record: {
           id,
@@ -1274,6 +1430,513 @@ export async function executeAgentTool(
         },
         rawResult: { snapshot: snap },
       };
+    }
+  } else if (name === 'get_jarvis_os_full_state') {
+    const state = db.getState();
+    const includeDetails = args.includeDetails !== false;
+    const brainStatus = await probeAndSyncBrain8765().catch(() => null);
+    const pendingApprovals = state.approvals
+      .filter((a) => a.status === 'PENDING')
+      .map((a) => ({
+        id: a.id,
+        title: a.title,
+        commandOrAction: a.commandOrAction,
+        riskLevel: a.riskLevel,
+        requestedAt: a.requestedAt,
+        requester: formatApprovalRequesterBadge(a),
+      }));
+    const rankedQ18 = rankQ18Actions(state.candidates);
+    const projectsSummary = (state.projects || []).map((p) => ({
+      id: p.id,
+      name: p.name,
+      rootPath: p.rootPath,
+      techStack: p.techStack,
+      proactiveEnabled: p.proactiveEnabled,
+      healthScore: p.healthScore,
+      assignedAgentIds: p.assignedAgentIds,
+      openInsights: p.proactiveInsights.filter((i) => i.status === 'OPEN').length,
+    }));
+    const chatsSummary = (state.chatThreads || []).map((c) => ({
+      id: c.id,
+      title: c.title,
+      projectId: c.projectId,
+      isGeneral: isGeneralUnlinkedChat(c),
+      primaryAgentId: c.primaryAgentId || 'room-exec',
+    }));
+
+    stdRes = {
+      record: {
+        id,
+        name,
+        args,
+        status: 'SUCCESS',
+        outputSummary: `Snapshot global jarvis-os: ${projectsSummary.length} projeto(s), ${chatsSummary.length} conversa(s), ${state.rooms.length} agente(s), ${pendingApprovals.length} aprovação(ões) pendente(s).`,
+        durationMs: Math.max(1, Date.now() - t0),
+      },
+      rawResult: {
+        activeProjectId: state.activeProjectId,
+        activeChatId: state.activeChatId,
+        isGeneralChatActive: state.activeProjectId === GENERAL_CHAT_PROJECT_ID,
+        seedMode: state.seedMode || 'demo',
+        settings: {
+          operatorName: state.settings.operatorName,
+          modelProvider: state.settings.modelProvider,
+          preferredGeminiModel: state.settings.preferredGeminiModel,
+          autonomyLevel: state.settings.autonomyLevel,
+          trustThreshold: state.settings.trustThreshold,
+          preferredVoiceName: state.settings.preferredVoiceName,
+        },
+        projects: projectsSummary,
+        chats: chatsSummary,
+        agentsAndSubagents: includeDetails
+          ? state.rooms.map((r) => ({
+              id: r.id,
+              name: r.name,
+              callsign: r.callsign || r.id,
+              roleTitle: r.roleTitle,
+              projectId: r.projectId || null,
+            }))
+          : state.rooms.length,
+        pendingApprovals,
+        goalsCount: state.goals.length,
+        activeGoals: includeDetails
+          ? state.goals
+              .filter((g) => g.status !== 'COMPLETED')
+              .slice(0, 12)
+              .map((g) => ({ id: g.id, title: g.title, progress: g.progress, projectId: g.projectId }))
+          : undefined,
+        contracts: includeDetails
+          ? state.contracts.map((c) => ({ id: c.id, title: c.title, status: c.status, rule: c.verificationRule }))
+          : state.contracts.length,
+        topQ18Actions: rankedQ18.filter((c) => !c.completed).slice(0, 5),
+        workflows: state.workflows.map((w) => ({ id: w.id, name: w.name, enabled: w.enabled, cronExpr: w.cronExpr })),
+        heartbeat: {
+          enabled: state.heartbeat.enabled,
+          intervalSeconds: state.heartbeat.intervalSeconds,
+          totalBeats: state.heartbeat.totalBeats,
+        },
+        mcpServers: (state.mcpServers || []).map((s) => ({
+          id: s.id,
+          name: s.name,
+          healthStatus: s.healthStatus,
+          authStatus: s.authStatus,
+        })),
+        skillsEnabledCount: state.skills.filter((s) => s.enabled).length,
+        pluginsEnabledCount: (state.plugins || []).filter((p) => p.enabled).length,
+        devices: state.devices.map((d) => ({ id: d.id, name: d.name, status: d.status, osType: d.osType })),
+        quota5h: state.quota5h,
+        brain8765: brainStatus,
+      },
+    };
+  } else if (name === 'manage_jarvis_projects_and_chats') {
+    const action = String(args.action || 'LIST').toUpperCase();
+    const projectQ = String(args.projectIdOrQuery || '').trim();
+    const chatQ = String(args.chatIdOrQuery || '').trim();
+    const agentQ = String(args.agentIdOrQuery || '').trim();
+    const nameOrTitle = String(args.nameOrTitle || '').trim();
+    let summaryText = '';
+    let resultPayload: Record<string, unknown> = {};
+
+    if (action === 'LIST') {
+      const s = db.getState();
+      resultPayload = {
+        activeProjectId: s.activeProjectId,
+        activeChatId: s.activeChatId,
+        projects: (s.projects || []).map((p) => ({ id: p.id, name: p.name, techStack: p.techStack })),
+        chats: (s.chatThreads || []).map((c) => ({
+          id: c.id,
+          title: c.title,
+          projectId: c.projectId,
+          isGeneral: isGeneralUnlinkedChat(c),
+        })),
+      };
+      summaryText = `Listados ${(s.projects || []).length} projeto(s) e ${(s.chatThreads || []).length} conversa(s).`;
+    } else if (action === 'SWITCH_PROJECT') {
+      let matchedProj: ProjectWorkspace | null = null;
+      let resolvedChatId = '';
+      db.update((draft) => {
+        const target = (draft.projects || []).find(
+          (p) =>
+            p.id.toLowerCase() === projectQ.toLowerCase() ||
+            p.name.toLowerCase().includes(projectQ.toLowerCase())
+        );
+        if (!target) return;
+        draft.activeProjectId = target.id;
+        const projChat = (draft.chatThreads || []).find((c) => c.projectId === target.id);
+        if (projChat) {
+          draft.activeChatId = projChat.id;
+          resolvedChatId = projChat.id;
+        }
+        matchedProj = { ...target };
+      });
+      if (!matchedProj) {
+        summaryText = `Projeto "${projectQ}" não encontrado.`;
+      } else {
+        studioActivityBroadcaster?.('state_updated', { section: 'projects' });
+        summaryText = `Projeto ativo mudado para "${(matchedProj as ProjectWorkspace).name}" (chat: ${resolvedChatId || 'n/a'}).`;
+        resultPayload = { project: matchedProj, activeChatId: resolvedChatId };
+      }
+    } else if (action === 'CREATE_PROJECT') {
+      const cleanName = nameOrTitle || 'Novo Projeto Jarvis';
+      const slug =
+        cleanName
+          .toLowerCase()
+          .replace(/[^a-z0-9]+/g, '-')
+          .replace(/(^-|-$)/g, '') || `proj-${Date.now()}`;
+      const projId = `proj-${slug}-${Date.now().toString().slice(-4)}`;
+      const chatIdNew = `chat-${projId}-main`;
+      const newProj: ProjectWorkspace = {
+        id: projId,
+        name: cleanName,
+        slug,
+        rootPath: String(args.rootPath || slug),
+        techStack: String(args.techStack || 'TypeScript · Node.js'),
+        gitBranch: 'main',
+        description: String(args.description || `Projeto ${cleanName}`).trim(),
+        ideaCategory: 'CUSTOM',
+        ideaBrief: String(args.description || `Projeto ${cleanName}`).trim(),
+        activeSkillIds: ['skill-01'],
+        defaultChatId: chatIdNew,
+        status: 'ACTIVE',
+        proactiveEnabled: true,
+        proactiveIntervalSec: 120,
+        healthScore: 100,
+        openTasksCount: 0,
+        symbolCount: 0,
+        assignedAgentIds: ['room-exec'],
+        proactiveInsights: [],
+      };
+      const newChat: ChatThread = {
+        id: chatIdNew,
+        projectId: projId,
+        title: `Conversa Principal · ${cleanName}`,
+        createdAt: nowIso,
+        updatedAt: nowIso,
+        primaryAgentId: 'room-exec',
+        participatingAgentIds: ['room-exec'],
+        screenAutoSendEnabled: true,
+      };
+      db.update((draft) => {
+        if (!draft.projects) draft.projects = [];
+        if (!draft.chatThreads) draft.chatThreads = [];
+        draft.projects.unshift(newProj);
+        draft.chatThreads.unshift(newChat);
+        draft.activeProjectId = projId;
+        draft.activeChatId = chatIdNew;
+      });
+      studioActivityBroadcaster?.('state_updated', { section: 'projects' });
+      summaryText = `Projeto "${cleanName}" criado e ativado (${projId}).`;
+      resultPayload = { project: newProj, chat: newChat };
+    } else if (action === 'CREATE_GENERAL_CHAT') {
+      const title = nameOrTitle || 'Nova Conversa Geral';
+      const newChat: ChatThread = {
+        id: `chat-gen-${Date.now()}-${Math.random().toString(36).slice(2, 5)}`,
+        projectId: GENERAL_CHAT_PROJECT_ID,
+        isGeneral: true,
+        title,
+        createdAt: nowIso,
+        updatedAt: nowIso,
+        primaryAgentId: 'room-exec',
+        participatingAgentIds: ['room-exec'],
+        screenAutoSendEnabled: true,
+      };
+      db.update((draft) => {
+        if (!draft.chatThreads) draft.chatThreads = [];
+        draft.chatThreads.unshift(newChat);
+        draft.activeProjectId = GENERAL_CHAT_PROJECT_ID;
+        draft.activeChatId = newChat.id;
+      });
+      studioActivityBroadcaster?.('state_updated', { section: 'chats' });
+      summaryText = `Conversa geral sem projeto criada e ativada: "${title}".`;
+      resultPayload = { chat: newChat };
+    } else if (action === 'CREATE_PROJECT_CHAT') {
+      const s = db.getState();
+      const targetProj =
+        (s.projects || []).find(
+          (p) =>
+            p.id.toLowerCase() === projectQ.toLowerCase() ||
+            p.name.toLowerCase().includes(projectQ.toLowerCase())
+        ) ||
+        (s.projects || []).find((p) => p.id === s.activeProjectId) ||
+        (s.projects || [])[0];
+      if (!targetProj) {
+        summaryText = 'Nenhum projeto disponível para criar conversa.';
+      } else {
+        const title = nameOrTitle || `Conversa · ${targetProj.name}`;
+        const newChat: ChatThread = {
+          id: `chat-${Date.now()}-${Math.random().toString(36).slice(2, 5)}`,
+          projectId: targetProj.id,
+          title,
+          createdAt: nowIso,
+          updatedAt: nowIso,
+          primaryAgentId: 'room-exec',
+          participatingAgentIds: Array.from(new Set(['room-exec', ...(targetProj.assignedAgentIds || [])])),
+          screenAutoSendEnabled: true,
+        };
+        db.update((draft) => {
+          if (!draft.chatThreads) draft.chatThreads = [];
+          draft.chatThreads.unshift(newChat);
+          draft.activeProjectId = targetProj.id;
+          draft.activeChatId = newChat.id;
+        });
+        studioActivityBroadcaster?.('state_updated', { section: 'chats' });
+        summaryText = `Conversa "${title}" criada no projeto "${targetProj.name}".`;
+        resultPayload = { chat: newChat, project: targetProj };
+      }
+    } else if (action === 'SWITCH_CHAT') {
+      let switched: ChatThread | null = null;
+      db.update((draft) => {
+        const target = (draft.chatThreads || []).find(
+          (c) =>
+            c.id.toLowerCase() === chatQ.toLowerCase() ||
+            c.title.toLowerCase().includes(chatQ.toLowerCase())
+        );
+        if (!target) return;
+        draft.activeChatId = target.id;
+        draft.activeProjectId = isGeneralUnlinkedChat(target)
+          ? GENERAL_CHAT_PROJECT_ID
+          : target.projectId;
+        switched = { ...target };
+      });
+      if (!switched) {
+        summaryText = `Conversa "${chatQ}" não encontrada.`;
+      } else {
+        studioActivityBroadcaster?.('state_updated', { section: 'chats' });
+        summaryText = `Conversa ativa alterada para "${(switched as ChatThread).title}".`;
+        resultPayload = { chat: switched };
+      }
+    } else if (action === 'ASSIGN_AGENT_TO_PROJECT') {
+      let assignedInfo: { projectName: string; agentName: string } | null = null;
+      db.update((draft) => {
+        const proj =
+          (draft.projects || []).find(
+            (p) =>
+              p.id.toLowerCase() === projectQ.toLowerCase() ||
+              p.name.toLowerCase().includes(projectQ.toLowerCase())
+          ) || (draft.projects || []).find((p) => p.id === draft.activeProjectId);
+        const agent = draft.rooms.find(
+          (r) =>
+            r.id.toLowerCase() === agentQ.toLowerCase() ||
+            (r.callsign || '').toLowerCase() === agentQ.toLowerCase() ||
+            r.name.toLowerCase().includes(agentQ.toLowerCase())
+        );
+        if (!proj || !agent) return;
+        if (!proj.assignedAgentIds.includes(agent.id)) {
+          proj.assignedAgentIds.push(agent.id);
+        }
+        assignedInfo = { projectName: proj.name, agentName: agent.name };
+      });
+      if (!assignedInfo) {
+        summaryText = 'Projeto ou agente não encontrado para atribuição.';
+      } else {
+        studioActivityBroadcaster?.('state_updated', { section: 'projects' });
+        summaryText = `Agente "${(assignedInfo as { agentName: string }).agentName}" atribuído ao projeto "${(assignedInfo as { projectName: string }).projectName}".`;
+        resultPayload = assignedInfo;
+      }
+    } else {
+      summaryText = `Ação desconhecida: ${action}.`;
+    }
+
+    stdRes = {
+      record: {
+        id,
+        name,
+        args,
+        status: summaryText.includes('não encontrado') || summaryText.includes('desconhecida') ? 'ERROR' : 'SUCCESS',
+        outputSummary: summaryText,
+        durationMs: Math.max(1, Date.now() - t0),
+      },
+      rawResult: resultPayload,
+    };
+  } else if (name === 'manage_jarvis_operations') {
+    const action = String(args.action || 'LIST_PENDING_APPROVALS').toUpperCase();
+    const targetQ = String(args.targetIdOrQuery || '').trim();
+    let summaryText = '';
+    let resultPayload: Record<string, unknown> = {};
+
+    if (action === 'LIST_PENDING_APPROVALS') {
+      const pending = db
+        .getState()
+        .approvals.filter((a) => a.status === 'PENDING')
+        .map((a) => ({
+          id: a.id,
+          title: a.title,
+          commandOrAction: a.commandOrAction,
+          riskLevel: a.riskLevel,
+          requestedAt: a.requestedAt,
+          requester: formatApprovalRequesterBadge(a),
+        }));
+      summaryText = `${pending.length} pedido(s) a aguardar autorização do Operador na Inbox/Notificações.`;
+      resultPayload = { pendingApprovals: pending };
+    } else if (action === 'VERIFY_ALL_CONTRACTS' || action === 'VERIFY_CONTRACT') {
+      const contracts = db.getState().contracts;
+      const targets =
+        action === 'VERIFY_CONTRACT' && targetQ
+          ? contracts.filter(
+              (c) =>
+                c.id.toLowerCase() === targetQ.toLowerCase() ||
+                c.title.toLowerCase().includes(targetQ.toLowerCase())
+            )
+          : contracts;
+      const results = [];
+      for (const c of targets) {
+        const vRes = await verifyTodayContractItem(c, activePort);
+        db.update((draft) => {
+          const ref = draft.contracts.find((x) => x.id === c.id);
+          if (ref) {
+            ref.status = vRes.verified ? 'VERIFIED' : 'FAILED';
+            ref.evidenceHash = vRes.evidenceHash;
+            ref.lastCheckedAt = new Date().toISOString();
+            ref.outputSummary = vRes.summary;
+            ref.source = 'REAL';
+          }
+        });
+        results.push({ id: c.id, title: c.title, verified: vRes.verified, evidenceHash: vRes.evidenceHash });
+      }
+      studioActivityBroadcaster?.('state_updated', { section: 'contracts' });
+      const passedCount = results.filter((r) => r.verified).length;
+      summaryText = `${passedCount}/${results.length} contrato(s) verificados com prova SHA-256.`;
+      resultPayload = { results };
+    } else if (action === 'EXECUTE_TOP_Q18') {
+      const ranked = rankQ18Actions(db.getState().candidates).filter((c) => !c.completed);
+      const top = ranked[0];
+      if (!top) {
+        summaryText = 'Todas as ações Q-18 candidatas já estão concluídas.';
+      } else {
+        db.update((draft) => {
+          const target = draft.candidates.find((c) => c.id === top.id);
+          if (target) target.completed = true;
+        });
+        studioActivityBroadcaster?.('state_updated', { section: 'q18' });
+        summaryText = `Ação prioritária Q-18 marcada/executada: "${top.title}" (Score ${top.q18Score ?? 0}).`;
+        resultPayload = { executedCandidate: top };
+      }
+    } else if (action === 'TOGGLE_PROJECT_PROACTIVE') {
+      const s = db.getState();
+      const proj =
+        (s.projects || []).find(
+          (p) =>
+            p.id.toLowerCase() === targetQ.toLowerCase() ||
+            p.name.toLowerCase().includes(targetQ.toLowerCase())
+        ) || (s.projects || []).find((p) => p.id === s.activeProjectId);
+      if (!proj) {
+        summaryText = 'Projeto não encontrado.';
+      } else {
+        const nextFlag = typeof args.enabled === 'boolean' ? args.enabled : !proj.proactiveEnabled;
+        db.update((draft) => {
+          const ref = (draft.projects || []).find((p) => p.id === proj.id);
+          if (ref) ref.proactiveEnabled = nextFlag;
+        });
+        if (nextFlag) {
+          await runProjectProactiveScan(proj.id).catch(() => {});
+        }
+        studioActivityBroadcaster?.('state_updated', { section: 'projects' });
+        summaryText = `Proatividade de "${proj.name}" alterada para ${nextFlag ? 'ON' : 'OFF'}.`;
+        resultPayload = { projectId: proj.id, proactiveEnabled: nextFlag };
+      }
+    } else if (action === 'TRIGGER_HEARTBEAT') {
+      const tel = await collectOSTelemetry(activePort);
+      const beatAt = new Date().toISOString();
+      db.update((draft) => {
+        draft.heartbeat.lastBeatAt = beatAt;
+        draft.heartbeat.totalBeats += 1;
+        draft.heartbeat.recentAlerts.unshift({
+          id: `hb-agent-${Date.now()}`,
+          timestamp: beatAt,
+          severity: tel.ramPercent > 88 ? 'WARNING' : 'NOMINAL',
+          title: 'Pulso Heartbeat Executado pelo Agente Principal',
+          detail: `CPU ${tel.cpuUsagePercent}% · RAM ${tel.ramPercent}% (${tel.ramFreeGb} GB livres).`,
+        });
+      });
+      studioActivityBroadcaster?.('state_updated', { section: 'heartbeat' });
+      summaryText = `Pulso Heartbeat concluído: CPU ${tel.cpuUsagePercent}% · RAM ${tel.ramPercent}%.`;
+      resultPayload = { telemetry: tel, beatAt };
+    } else {
+      summaryText = `Ação operacional desconhecida: ${action}`;
+    }
+
+    stdRes = {
+      record: {
+        id,
+        name,
+        args,
+        status: summaryText.includes('não encontrado') || summaryText.includes('desconhecida') ? 'ERROR' : 'SUCCESS',
+        outputSummary: summaryText,
+        durationMs: Math.max(1, Date.now() - t0),
+      },
+      rawResult: resultPayload,
+    };
+  } else if (name === 'write_workspace_file_governed') {
+    const filePath = String(args.filePath || '').trim();
+    const content = String(args.content ?? '');
+    const { actorMeta } = buildActorMeta(studioCtx);
+    const writeRes = writeGovernedWorkspaceFile(filePath, content, actorMeta);
+    stdRes = {
+      record: {
+        id,
+        name,
+        args: { filePath, bytes: content.length },
+        status:
+          writeRes.status === 'PENDING_APPROVAL'
+            ? 'PENDING_APPROVAL'
+            : writeRes.ok
+              ? 'SUCCESS'
+              : 'ERROR',
+        outputSummary: writeRes.output,
+        durationMs: Math.max(1, Date.now() - t0),
+      },
+      rawResult: writeRes,
+    };
+  } else if (name === 'query_python_jarvis_cortex') {
+    const sub = String(args.subcommand || 'status').trim().toLowerCase();
+    const allowedSubs = new Set(['status', 'plan', 'briefing', 'routine', 'brain', 'sidecar', 'workflow', 'memory']);
+    if (!allowedSubs.has(sub)) {
+      stdRes = {
+        record: {
+          id,
+          name,
+          args,
+          status: 'ERROR',
+          outputSummary: `Subcomando jarvis_os não permitido: "${sub}".`,
+          durationMs: 1,
+        },
+        rawResult: { error: 'Unsupported subcommand' },
+      };
+    } else {
+      const cliArgs = ['-m', 'jarvis_os.cli', sub];
+      if (sub === 'routine') cliArgs.push('discover');
+      if (sub === 'memory') cliArgs.push('search', String(args.query || 'jarvis'));
+      const pyBin = process.platform === 'win32' ? 'python' : 'python3';
+      try {
+        const { stdout, stderr } = await execFileAsync(pyBin, cliArgs, {
+          cwd: process.cwd(),
+          timeout: 4000,
+        });
+        const cleanOut = `${stdout}${stderr ? `\n${stderr}` : ''}`.trim().slice(0, 4000);
+        stdRes = {
+          record: {
+            id,
+            name,
+            args,
+            status: 'SUCCESS',
+            outputSummary: `jarvis_os.cli ${sub} concluído (${cleanOut.length} chars).`,
+            durationMs: Math.max(1, Date.now() - t0),
+          },
+          rawResult: { subcommand: sub, output: cleanOut },
+        };
+      } catch (err) {
+        stdRes = {
+          record: {
+            id,
+            name,
+            args,
+            status: 'ERROR',
+            outputSummary: `Erro ao invocar jarvis_os.cli ${sub}: ${(err as Error).message}`,
+            durationMs: Math.max(1, Date.now() - t0),
+          },
+          rawResult: { error: (err as Error).message },
+        };
+      }
     }
   }
 
@@ -1324,9 +1987,21 @@ async function runDeterministicReActTurn(params: {
   const toolCalls: ToolCallRecord[] = [];
   const sections: string[] = [];
 
-  const activeProject = (state.projects || []).find((p) => p.id === studioCtx.projectId);
+  const isGeneralChat = studioCtx.projectId === GENERAL_CHAT_PROJECT_ID;
+  const activeProject = isGeneralChat
+    ? undefined
+    : (state.projects || []).find((p) => p.id === studioCtx.projectId);
 
   if (jevDecision.microTick && !screenFrame) {
+    if (isGeneralChat) {
+      return {
+        reply: isPt
+          ? `Registado! Estou pronto na tua **Conversa Geral** com acesso total ao J.A.R.V.I.S. Cortex OS. Como posso ajudar-te agora?`
+          : `Got it! Ready in your **General Chat** with full J.A.R.V.I.S. Cortex OS access. How can I help?`,
+        toolCalls: [],
+        engineUsed: 'JARVIS_STUDIO_FASTPATH',
+      };
+    }
     const projGoals = state.goals.filter(
       (g) => (g.projectId || studioCtx.projectId) === studioCtx.projectId && g.status !== 'COMPLETED'
     );
@@ -1342,14 +2017,21 @@ async function runDeterministicReActTurn(params: {
     };
   }
 
-  // 1. Automatic Studio Planning: Goals + Sub-Agents + Antigravity Skills
-  const planDraft = extractDeterministicPlanFromPrompt({
-    prompt: userText,
-    project: activeProject,
-    existingGoals: state.goals,
-    existingRooms: state.rooms,
-    skills: state.skills,
-  });
+  // 1. Automatic Studio Planning: Goals + Sub-Agents + Antigravity Skills (only in Project-linked chats)
+  const planDraft = isGeneralChat
+    ? {
+        isPlanningIntent: false,
+        subagentsToSpawn: [] as ReturnType<typeof extractDeterministicPlanFromPrompt>['subagentsToSpawn'],
+        goalsToCreate: [] as ReturnType<typeof extractDeterministicPlanFromPrompt>['goalsToCreate'],
+        skillsToActivate: [] as string[],
+      }
+    : extractDeterministicPlanFromPrompt({
+        prompt: userText,
+        project: activeProject,
+        existingGoals: state.goals,
+        existingRooms: state.rooms,
+        skills: state.skills,
+      });
 
   if (planDraft.isPlanningIntent) {
     let spawnedAgentId: string | undefined;
@@ -1572,26 +2254,49 @@ async function runDeterministicReActTurn(params: {
   }
 
   if (sections.length === 0) {
-    const { record } = await executeAgentTool(
-      'call_mcp_gateway_tool',
-      { toolName: 'search_brain', argsJson: JSON.stringify({ query: userText }) },
-      activePort,
-      studioCtx
-    );
-    toolCalls.push(record);
-    const projGoals = db
-      .getState()
-      .goals.filter((g) => (g.projectId || studioCtx.projectId) === studioCtx.projectId);
-    sections.push(
-      isPt
-        ? `Analisei o contexto do projeto **${activeProject?.name || 'Ativo'}** (${projGoals.length} Goal(s) registados).\n- Podes pedir-me para **planear uma nova funcionalidade** (crio automaticamente os Goals e sub-agentes necessários) ou **partilhar o teu ecrã** para trabalharmos em direto sobre o que estás a ver.`
-        : `Analyzed project **${activeProject?.name || 'Active'}** (${projGoals.length} Goal(s) tracked).`
-    );
+    if (isGeneralChat) {
+      const { record, rawResult } = await executeAgentTool(
+        'get_jarvis_os_full_state',
+        { includeDetails: false },
+        activePort,
+        studioCtx
+      );
+      toolCalls.push(record);
+      const pendingCount = Array.isArray(rawResult.pendingApprovals)
+        ? rawResult.pendingApprovals.length
+        : 0;
+      const projCount = Array.isArray(rawResult.projects) ? rawResult.projects.length : 0;
+      sections.push(
+        isPt
+          ? `Estou ligado à tua **Conversa Geral (Sem Projeto Associado)** com acesso completo ao **J.A.R.V.I.S. Cortex OS** (${projCount} projeto(s) disponíveis${
+              pendingCount > 0 ? ` · ${pendingCount} aprovação(ões) pendente(s)` : ''
+            }). Podes conversar normalmente, pedir telemetria, workflows, ficheiros, pesquisa web ou delegar qualquer operação do sistema.`
+          : `Connected to your **General Chat** with full J.A.R.V.I.S. Cortex OS access (${projCount} project(s)).`
+      );
+    } else {
+      const { record } = await executeAgentTool(
+        'call_mcp_gateway_tool',
+        { toolName: 'search_brain', argsJson: JSON.stringify({ query: userText }) },
+        activePort,
+        studioCtx
+      );
+      toolCalls.push(record);
+      const projGoals = db
+        .getState()
+        .goals.filter((g) => (g.projectId || studioCtx.projectId) === studioCtx.projectId);
+      sections.push(
+        isPt
+          ? `Analisei o contexto do projeto **${activeProject?.name || 'Ativo'}** (${projGoals.length} Goal(s) registados).\n- Podes pedir-me para **planear uma nova funcionalidade** (crio automaticamente os Goals e sub-agentes necessários) ou **partilhar o teu ecrã** para trabalharmos em direto sobre o que estás a ver.`
+          : `Analyzed project **${activeProject?.name || 'Active'}** (${projGoals.length} Goal(s) tracked).`
+      );
+    }
   }
 
   const intro = planDraft.isPlanningIntent
     ? `Excelente direção para **${activeProject?.name || 'o teu projeto'}**! Já atualizei o plano no painel lateral direito com os novos **Goals**, **Sub-Agentes** e **Skills** para começarmos a executar:`
-    : `Aqui tens a atualização para **${activeProject?.name || 'esta conversa'}**:`;
+    : isGeneralChat
+      ? `Conversa Geral · **${studioCtx.actor}**:`
+      : `Aqui tens a atualização para **${activeProject?.name || 'esta conversa'}**:`;
 
   return {
     reply: `${intro}\n\n${sections.join('\n\n')}`,
@@ -1631,14 +2336,24 @@ export async function runAgentChatTurn(params: {
     (state.activeChatId ? threads.find((c) => c.id === state.activeChatId) : undefined) ||
     threads[0];
 
-  const resolvedProject =
-    (projectId ? projects.find((p) => p.id === projectId) : undefined) ||
-    (resolvedChat ? projects.find((p) => p.id === resolvedChat.projectId) : undefined) ||
-    (state.activeProjectId ? projects.find((p) => p.id === state.activeProjectId) : undefined) ||
-    projects[0];
+  const isGeneralChat =
+    projectId === GENERAL_CHAT_PROJECT_ID ||
+    Boolean(resolvedChat && isGeneralUnlinkedChat(resolvedChat)) ||
+    (!projectId && !resolvedChat && state.activeProjectId === GENERAL_CHAT_PROJECT_ID);
 
-  const targetProjectId = resolvedProject?.id || 'proj-website-studio';
-  const targetChatId = resolvedChat?.id || 'chat-web-main';
+  const resolvedProject = isGeneralChat
+    ? undefined
+    : (projectId ? projects.find((p) => p.id === projectId) : undefined) ||
+      (resolvedChat ? projects.find((p) => p.id === resolvedChat.projectId) : undefined) ||
+      (state.activeProjectId && state.activeProjectId !== GENERAL_CHAT_PROJECT_ID
+        ? projects.find((p) => p.id === state.activeProjectId)
+        : undefined) ||
+      projects[0];
+
+  const targetProjectId = isGeneralChat
+    ? GENERAL_CHAT_PROJECT_ID
+    : resolvedProject?.id || 'proj-website-studio';
+  const targetChatId = resolvedChat?.id || (isGeneralChat ? 'chat-general-main' : 'chat-web-main');
 
   const preferredRoomId = roomId || resolvedChat?.primaryAgentId || 'room-exec';
   const room = state.rooms.find((r) => r.id === preferredRoomId) || state.rooms[0];
@@ -1649,6 +2364,9 @@ export async function runAgentChatTurn(params: {
     projectId: targetProjectId,
     chatId: targetChatId,
     actor: room.name || 'Jarvis',
+    agentId: room.id,
+    agentCallsign: room.callsign || (room.id === 'room-exec' ? 'CORE-EXEC' : room.id),
+    isSubagent: room.id !== 'room-exec',
     studioEventsOut,
   };
 
@@ -1831,27 +2549,33 @@ export async function runAgentChatTurn(params: {
   const systemInstruction = [
     getPersonalityDirective(freshState.settings.personalityMode, freshState.settings.language),
     room.systemPrompt,
-    `Estás no Estúdio de Projetos do J.A.R.V.I.S. com ${freshState.settings.operatorName}.`,
+    isGeneralChat
+      ? `Estás numa CONVERSA GERAL LIVRE (não vinculada a nenhum projeto específico) com ${freshState.settings.operatorName}, mas com acesso total a todo o J.A.R.V.I.S. Cortex OS.`
+      : `Estás no Estúdio de Projetos do J.A.R.V.I.S. com ${freshState.settings.operatorName}.`,
     resolvedProject
       ? `Projeto / Ideia Atual: "${resolvedProject.name}" (Categoria: ${resolvedProject.ideaCategory || 'CUSTOM'} · Stack: ${resolvedProject.techStack}). Descrição: ${resolvedProject.ideaBrief || resolvedProject.description}`
+      : 'Modo Conversa Geral: conversa naturalmente sobre qualquer assunto ou aciona ferramentas de todo o Cortex OS quando o utilizador pedir.',
+    !isGeneralChat
+      ? projectGoals.length > 0
+        ? `Goals Atuais deste Projeto:\n${projectGoals
+            .slice(0, 8)
+            .map((g) => `- [${g.status} ${g.progress}%] ${g.title}`)
+            .join('\n')}`
+        : 'Ainda não existem Goals neste projeto — cria Goals estruturados com upsert_project_goal assim que o utilizador descrever objetivos ou funcionalidades.'
       : '',
-    projectGoals.length > 0
-      ? `Goals Atuais deste Projeto:\n${projectGoals
-          .slice(0, 8)
-          .map((g) => `- [${g.status} ${g.progress}%] ${g.title}`)
-          .join('\n')}`
-      : 'Ainda não existem Goals neste projeto — cria Goals estruturados com upsert_project_goal assim que o utilizador descrever objetivos ou funcionalidades.',
-    projectAgents.length > 0
+    !isGeneralChat && projectAgents.length > 0
       ? `Agentes a colaborar neste Projeto: ${projectAgents.map((a) => `${a.name} (${a.roleTitle})`).join('; ')}.`
       : '',
-    projectSkills.length > 0
+    !isGeneralChat && projectSkills.length > 0
       ? `Skills Antigravity Ativas no Projeto: ${projectSkills.map((s) => `${s.name} (${s.quickCommand})`).join(', ')}.`
       : '',
     compressedContextBlock ? `Memória Relevante:\n${compressedContextBlock}` : '',
     useWebTools
       ? 'PESQUISA WEB & URL CONTEXT ATIVOS: Usa a pesquisa Google em direto e/ou leitura dos URLs fornecidos para validar factos atuais, documentação oficial, preços ou referências antes de responder.'
       : '',
-    'REGRAS DE ESTÚDIO AGÊNTICO (MUITO IMPORTANTE):\n1. Sempre que o utilizador apresentar uma ideia, pedir para planear funcionalidades (ex: fazer um website, criar uma app, autenticação, pagamentos, UI, API) ou atualizar o rumo do projeto, invoca proativamente `upsert_project_goal` (com 2 a 4 subtasks claras) e, se fizer sentido ter ajuda especializada, invoca `spawn_project_subagent` e/ou `activate_antigravity_skill`.\n2. Sempre que o utilizador pedir um protótipo visual, landing page, componente UI, diagrama SVG, especificação Markdown ou módulo de código, invoca `upsert_project_artifact` para renderizar o resultado ao vivo no painel Artefactos.\n3. Se for fornecida uma imagem do ecrã em tempo real (`inlineData`), observa atentamente o que está no ecrã do utilizador (código, design, browser, erros ou janelas) e responde diretamente sobre o que estás a ver.\n4. Se o utilizador perguntar o que está no ecrã dele e não houver imagem anexada no turno, invoca `capture_and_inspect_sidecar_screen`.',
+    isGeneralChat
+      ? 'REGRAS DE CONVERSA GERAL:\n1. Mantém conversa natural e direta sem criar Goals de projeto desnecessários, a menos que o utilizador peça explicitamente para iniciar um projeto.\n2. Tens acesso completo às ferramentas de sistema (`get_jarvis_os_full_state`, `manage_jarvis_projects_and_chats`, `manage_jarvis_operations`, `write_workspace_file_governed`, `query_python_jarvis_cortex`, Swarm, Memória, Sidecar e MCP).\n3. Se alguma ação gerar `PENDING_APPROVAL`, avisa imediatamente o utilizador de que surgiu uma notificação para autorizar ou bloquear.'
+      : 'REGRAS DE ESTÚDIO AGÊNTICO (MUITO IMPORTANTE):\n1. Sempre que o utilizador apresentar uma ideia, pedir para planear funcionalidades (ex: fazer um website, criar uma app, autenticação, pagamentos, UI, API) ou atualizar o rumo do projeto, invoca proativamente `upsert_project_goal` (com 2 a 4 subtasks claras) e, se fizer sentido ter ajuda especializada, invoca `spawn_project_subagent` e/ou `activate_antigravity_skill`.\n2. Sempre que o utilizador pedir um protótipo visual, landing page, componente UI, diagrama SVG, especificação Markdown ou módulo de código, invoca `upsert_project_artifact` para renderizar o resultado ao vivo no painel Artefactos.\n3. Se for fornecida uma imagem do ecrã em tempo real (`inlineData`), observa atentamente o que está no ecrã do utilizador (código, design, browser, erros ou janelas) e responde diretamente sobre o que estás a ver.\n4. Se o utilizador perguntar o que está no ecrã dele e não houver imagem anexada no turno, invoca `capture_and_inspect_sidecar_screen`.\n5. Se alguma ferramenta retornar `PENDING_APPROVAL`, informa o utilizador de imediato para autorizar na notificação/Inbox.',
   ]
     .filter(Boolean)
     .join('\n\n');
@@ -1908,9 +2632,10 @@ export async function runAgentChatTurn(params: {
       const contents: unknown[] = [...recentHistory, { role: 'user', parts: currentParts }];
 
       const allowedSet = new Set([...(room.allowedTools || []), ...STUDIO_CORE_TOOL_NAMES]);
-      const filteredDecls = AGENT_TOOL_DECLARATIONS.filter(
-        (d) => d.name && allowedSet.has(d.name)
-      );
+      const filteredDecls =
+        room.id === 'room-exec'
+          ? AGENT_TOOL_DECLARATIONS
+          : AGENT_TOOL_DECLARATIONS.filter((d) => d.name && allowedSet.has(d.name));
 
       const buildToolsConfig = (withWeb: boolean) => {
         const toolsArr: Record<string, unknown>[] = [];

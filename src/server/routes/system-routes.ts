@@ -4,6 +4,10 @@ import {
   normalizeGeminiModelId,
   normalizeGeminiVoiceName,
 } from '../../shared/cortex-math.ts';
+import {
+  getServerApiKeysStatus,
+  updateServerApiKeys,
+} from '../api-keys-manager.ts';
 import { domainMutex } from '../async-mutex.ts';
 import { db } from '../db.ts';
 import { runSystemDoctor } from '../doctor.ts';
@@ -14,7 +18,10 @@ import {
 } from '../gemini-engine.ts';
 import { audit, respondError, respondOk } from '../http-helpers.ts';
 import { probeExternalMcpServer } from '../mcp-server.ts';
-import { executeGovernedCommand } from '../os-adapter.ts';
+import {
+  executeGovernedCommand,
+  writeGovernedWorkspaceFile,
+} from '../os-adapter.ts';
 import {
   buildClearSessionCookieHeader,
   buildSessionSetCookieHeader,
@@ -133,7 +140,22 @@ export function createSystemRouter(ctx: SystemRouterContext): express.Router {
 
       let executionOutput = '';
       if (decision === 'APPROVED_ONCE' || decision === 'APPROVED_ALWAYS') {
-        if (appr.mcpServerId) {
+        if (appr.pendingFileWrite) {
+          const writeRes = writeGovernedWorkspaceFile(
+            appr.pendingFileWrite.filePath,
+            appr.pendingFileWrite.content,
+            {
+              actorName: appr.actorName,
+              agentId: appr.agentId,
+              agentCallsign: appr.agentCallsign,
+              isSubagent: appr.isSubagent,
+              projectId: appr.projectId,
+              chatId: appr.chatId,
+            },
+            true
+          );
+          executionOutput = writeRes.output;
+        } else if (appr.mcpServerId) {
           db.update((draft) => {
             const srv = (draft.mcpServers || []).find((s) => s.id === appr.mcpServerId);
             if (srv) {
@@ -180,6 +202,11 @@ export function createSystemRouter(ctx: SystemRouterContext): express.Router {
         decision === 'BLOCKED' ? 'BLOCKED' : 'VERIFIED'
       );
 
+      ctx.broadcastSse('approval_decided', {
+        id: appr.id,
+        decision,
+        executionOutput,
+      });
       ctx.broadcastSse('state_updated', { section: 'approvals' });
       respondOk(res, {
         approvals: db.getState().approvals,
@@ -239,6 +266,37 @@ export function createSystemRouter(ctx: SystemRouterContext): express.Router {
     ctx.reloadDotEnv();
     const result = await testModelProviderConnection(req.body || {});
     respondOk(res, result);
+  });
+
+  router.get('/api/settings/api-keys', (_req, res) => {
+    ctx.reloadDotEnv();
+    respondOk(res, getServerApiKeysStatus());
+  });
+
+  router.put('/api/settings/api-keys', async (req, res) => {
+    await domainMutex.withLock('system', async () => {
+      const body = req.body || {};
+      const status = updateServerApiKeys(body);
+      const summaryParts = [
+        `Gemini=${status.geminiConfigured ? status.geminiMaskedKey || 'CONFIGURED' : 'CLEARED'}`,
+        `OpenRouter=${status.openRouterConfigured ? status.openRouterMaskedKey || 'CONFIGURED' : 'CLEARED'}`,
+      ];
+      audit('OPERATOR', 'SECURITY', 'API_KEYS_UPDATED', summaryParts.join(' · '), 'VERIFIED');
+
+      const validation =
+        body.validateNow && status.geminiConfigured
+          ? await testModelProviderConnection({ provider: 'GEMINI_STUDIO' })
+          : undefined;
+
+      ctx.broadcastSse('state_updated', { section: 'api_keys' });
+      respondOk(res, {
+        ok: true,
+        status,
+        validation,
+        geminiAvailable: status.geminiConfigured,
+        openRouterAvailable: status.openRouterConfigured,
+      });
+    });
   });
 
   router.get('/api/settings/gemini-models', async (req, res) => {

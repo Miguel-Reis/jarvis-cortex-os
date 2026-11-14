@@ -4,12 +4,16 @@ import {
   Check,
   Copy,
   Cpu,
+  Eye,
+  EyeOff,
   HardDrive,
+  KeyRound,
   Layers,
   Play,
   RefreshCw,
   Server,
   Sliders,
+  Trash2,
 } from 'lucide-react';
 import { apiJson } from '../../lib/api';
 import {
@@ -22,6 +26,8 @@ import type {
   BrainLiveStatus,
   JarvisStoreData,
   ModelProviderType,
+  ServerApiKeysStatus,
+  UpdateServerApiKeysPayload,
 } from '../../shared/types';
 import { useToast } from '../ToastContext';
 
@@ -151,6 +157,38 @@ export const LLMSettingsView: React.FC<LLMSettingsViewProps> = ({
     openRouterConfigured: openRouterAvailable,
   });
 
+  // Direct Server API Key Manager states (GEMINI_API_KEY & OPENROUTER_API_KEY)
+  const [apiKeysStatus, setApiKeysStatus] = useState<ServerApiKeysStatus | null>(null);
+  const [geminiKeyInput, setGeminiKeyInput] = useState('');
+  const [showGeminiKey, setShowGeminiKey] = useState(false);
+  const [openRouterKeyInput, setOpenRouterKeyInput] = useState('');
+  const [showOpenRouterKey, setShowOpenRouterKey] = useState(false);
+  const [persistToDotEnv, setPersistToDotEnv] = useState(true);
+  const [savingApiKeys, setSavingApiKeys] = useState(false);
+  const [apiKeySaveFeedback, setApiKeySaveFeedback] = useState<{
+    ok: boolean;
+    detail: string;
+  } | null>(null);
+
+  useEffect(() => {
+    let active = true;
+    apiJson<ServerApiKeysStatus>('/api/settings/api-keys')
+      .then((status) => {
+        if (!active) return;
+        setApiKeysStatus(status);
+        setLiveEnvStatus({
+          geminiConfigured: status.geminiConfigured,
+          openRouterConfigured: status.openRouterConfigured,
+        });
+      })
+      .catch(() => {
+        // Keep bootstrap props fallback
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
+
   // Antigravity MCP & Bridge helper states
   const [copiedMcpSnippet, setCopiedMcpSnippet] = useState(false);
   const [probingBridge, setProbingBridge] = useState(false);
@@ -217,6 +255,68 @@ export const LLMSettingsView: React.FC<LLMSettingsViewProps> = ({
     await onRefreshBootstrap();
     if (toastTitle) {
       pushToast({ title: toastTitle, tone: 'success' });
+    }
+  };
+
+  const handleSaveApiKeys = async (payload: UpdateServerApiKeysPayload) => {
+    if (savingApiKeys) return;
+    setSavingApiKeys(true);
+    setApiKeySaveFeedback(null);
+    try {
+      const res = await apiJson<{
+        ok: boolean;
+        status: ServerApiKeysStatus;
+        validation?: { ok: boolean; detail: string; latencyMs?: number } | null;
+      }>('/api/settings/api-keys', {
+        method: 'PUT',
+        body: JSON.stringify(payload),
+      });
+
+      setApiKeysStatus(res.status);
+      setLiveEnvStatus({
+        geminiConfigured: res.status.geminiConfigured,
+        openRouterConfigured: res.status.openRouterConfigured,
+      });
+
+      if (payload.geminiApiKey !== undefined || payload.clearGeminiKey) {
+        setGeminiKeyInput('');
+        setShowGeminiKey(false);
+      }
+      if (payload.openRouterApiKey !== undefined || payload.clearOpenRouterKey) {
+        setOpenRouterKeyInput('');
+        setShowOpenRouterKey(false);
+      }
+
+      const persisted = payload.persistToDotEnv !== false;
+      const validationDetail = res.validation
+        ? `${res.validation.detail}${res.validation.latencyMs ? ` (${res.validation.latencyMs}ms)` : ''}`
+        : payload.clearGeminiKey || payload.clearOpenRouterKey
+          ? 'Chave removida da memória do servidor.'
+          : `Chave atualizada${persisted ? ' e persistida no ficheiro .env local' : ' em memória runtime'}.`;
+
+      const isOk = res.validation ? res.validation.ok : true;
+      setApiKeySaveFeedback({ ok: isOk, detail: validationDetail });
+
+      await onRefreshBootstrap();
+      if (payload.geminiApiKey !== undefined || payload.clearGeminiKey) {
+        await discoverGeminiModels(true, true);
+      }
+
+      pushToast({
+        title: isOk ? 'Chave API atualizada no servidor' : 'Chave API guardada com aviso de validação',
+        detail: validationDetail,
+        tone: isOk ? 'success' : 'warning',
+      });
+    } catch (err) {
+      const msg = (err as Error).message;
+      setApiKeySaveFeedback({ ok: false, detail: msg });
+      pushToast({
+        title: 'Erro ao atualizar chave API',
+        detail: msg,
+        tone: 'error',
+      });
+    } finally {
+      setSavingApiKeys(false);
     }
   };
 
@@ -780,23 +880,31 @@ export const LLMSettingsView: React.FC<LLMSettingsViewProps> = ({
           <div className="space-y-5">
             <div className="space-y-1">
               <h3 className="text-base font-semibold text-slate-100 font-display">
-                02. Credenciais Server-Side & Parâmetros Cloud
+                02. Chaves API & Parâmetros Cloud
               </h3>
               <p className="text-xs text-slate-400 leading-relaxed">
-                As chaves de API são lidas exclusivamente no servidor a partir do painel{' '}
-                <strong className="text-slate-200">Settings &gt; Secrets</strong> (ou do ficheiro{' '}
-                <code className="font-mono text-slate-300">.env</code> local), mantendo todas as
-                chamadas protegidas nas rotas <code className="font-mono text-slate-300">/api/*</code>.
+                Configura ou altera diretamente a tua <code className="font-mono text-slate-300">GEMINI_API_KEY</code>{' '}
+                (e <code className="font-mono text-slate-300">OPENROUTER_API_KEY</code>) no servidor com hot-reload
+                imediato e persistência opcional no <code className="font-mono text-slate-300">.env</code> local, mantendo
+                todas as chamadas protegidas nas rotas <code className="font-mono text-slate-300">/api/*</code>.
               </p>
             </div>
 
-            {/* Server Credential Detection Summary */}
-            <div className="p-4 rounded-xl bg-[#0b0d11] border border-white/8 space-y-2.5 text-xs">
+            {/* Interactive Server API Keys Manager */}
+            <div className="p-4 rounded-xl bg-[#0b0d11] border border-white/8 space-y-3 text-xs">
               <div className="flex items-center justify-between gap-2">
-                <span className="font-mono text-slate-300">GEMINI_API_KEY (Servidor)</span>
+                <div className="flex items-center gap-2 min-w-0">
+                  <KeyRound className="w-3.5 h-3.5 text-[#e59a54] shrink-0" />
+                  <span className="font-mono text-slate-300 truncate">GEMINI_API_KEY (Servidor)</span>
+                  {apiKeysStatus?.geminiMaskedKey && (
+                    <span className="font-mono text-[11px] text-slate-400 px-1.5 py-0.5 rounded bg-[#141821] border border-white/6">
+                      {apiKeysStatus.geminiMaskedKey} · {apiKeysStatus.geminiKeySource}
+                    </span>
+                  )}
+                </div>
                 <span
                   data-testid="env-status-gemini"
-                  className={`font-mono font-medium ${
+                  className={`font-mono font-medium shrink-0 ${
                     liveEnvStatus.geminiConfigured ? 'text-emerald-400' : 'text-[#e59a54]'
                   }`}
                 >
@@ -804,28 +912,174 @@ export const LLMSettingsView: React.FC<LLMSettingsViewProps> = ({
                 </span>
               </div>
 
-              <div className="flex items-center justify-between gap-2 pt-2 border-t border-white/6">
-                <span className="font-mono text-slate-300">OPENROUTER_API_KEY (Servidor)</span>
-                <span
-                  data-testid="env-status-openrouter"
-                  className={`font-mono font-medium ${
-                    liveEnvStatus.openRouterConfigured
-                      ? 'text-emerald-400'
-                      : isLocalOpenAi
-                        ? 'text-slate-300'
-                        : 'text-slate-500'
-                  }`}
+              <div className="flex flex-wrap items-center gap-2">
+                <div className="relative flex-1 min-w-[200px]">
+                  <input
+                    id="llm-gemini-api-key-input"
+                    data-testid="llm-gemini-api-key-input"
+                    type={showGeminiKey ? 'text' : 'password'}
+                    autoComplete="off"
+                    spellCheck={false}
+                    value={geminiKeyInput}
+                    onChange={(e) => setGeminiKeyInput(e.target.value)}
+                    placeholder={
+                      liveEnvStatus.geminiConfigured
+                        ? 'Substituir GEMINI_API_KEY (AIzaSy...)'
+                        : 'Inserir GEMINI_API_KEY (AIzaSy...)'
+                    }
+                    className="w-full pl-3 pr-8 py-1.5 text-xs font-mono bg-[#141821] border border-white/10 rounded-lg text-slate-100 placeholder:text-slate-500 focus:outline-none focus:border-[#e59a54]"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowGeminiKey((prev) => !prev)}
+                    aria-label={showGeminiKey ? 'Ocultar chave Gemini' : 'Mostrar chave Gemini'}
+                    className="absolute right-2 top-1.5 p-0.5 text-slate-400 hover:text-slate-100"
+                  >
+                    {showGeminiKey ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
+                  </button>
+                </div>
+
+                <button
+                  type="button"
+                  data-testid="save-gemini-api-key-btn"
+                  disabled={savingApiKeys || !geminiKeyInput.trim()}
+                  onClick={() =>
+                    handleSaveApiKeys({
+                      geminiApiKey: geminiKeyInput.trim(),
+                      persistToDotEnv,
+                      validateNow: true,
+                    })
+                  }
+                  className="px-3 py-1.5 rounded-lg text-xs font-semibold bg-[#e59a54] text-[#0b0d11] hover:bg-[#f0ac6b] disabled:opacity-45 transition-colors whitespace-nowrap"
                 >
-                  {liveEnvStatus.openRouterConfigured
-                    ? 'Detetada e Pronta'
-                    : isLocalOpenAi
-                      ? 'Opcional em URL local'
-                      : 'Não definida'}
-                </span>
+                  {savingApiKeys ? 'A validar...' : 'Guardar & Validar Gemini'}
+                </button>
+
+                {liveEnvStatus.geminiConfigured && (
+                  <button
+                    type="button"
+                    data-testid="clear-gemini-api-key-btn"
+                    disabled={savingApiKeys}
+                    onClick={() =>
+                      handleSaveApiKeys({
+                        clearGeminiKey: true,
+                        persistToDotEnv,
+                      })
+                    }
+                    title="Remover GEMINI_API_KEY do servidor"
+                    aria-label="Remover GEMINI_API_KEY"
+                    className="p-1.5 rounded-lg bg-[#141821] border border-white/10 text-slate-400 hover:text-rose-400 hover:border-rose-400/40 disabled:opacity-45 transition-colors"
+                  >
+                    <Trash2 className="w-3.5 h-3.5" />
+                  </button>
+                )}
               </div>
 
-              <div className="pt-2 border-t border-white/6 flex items-center justify-between gap-2 text-[11px] text-slate-400">
-                <span>Editaste o ambiente do servidor?</span>
+              {/* OpenRouter API Key Section */}
+              <div className="pt-2.5 border-t border-white/6 space-y-2">
+                <div className="flex items-center justify-between gap-2">
+                  <div className="flex items-center gap-2 min-w-0">
+                    <span className="font-mono text-slate-300 truncate">OPENROUTER_API_KEY (Servidor)</span>
+                    {apiKeysStatus?.openRouterMaskedKey && (
+                      <span className="font-mono text-[11px] text-slate-400 px-1.5 py-0.5 rounded bg-[#141821] border border-white/6">
+                        {apiKeysStatus.openRouterMaskedKey} · {apiKeysStatus.openRouterKeySource}
+                      </span>
+                    )}
+                  </div>
+                  <span
+                    data-testid="env-status-openrouter"
+                    className={`font-mono font-medium shrink-0 ${
+                      liveEnvStatus.openRouterConfigured
+                        ? 'text-emerald-400'
+                        : isLocalOpenAi
+                          ? 'text-slate-300'
+                          : 'text-slate-500'
+                    }`}
+                  >
+                    {liveEnvStatus.openRouterConfigured
+                      ? 'Detetada e Pronta'
+                      : isLocalOpenAi
+                        ? 'Opcional em URL local'
+                        : 'Não definida'}
+                  </span>
+                </div>
+
+                <div className="flex flex-wrap items-center gap-2">
+                  <div className="relative flex-1 min-w-[200px]">
+                    <input
+                      id="llm-openrouter-api-key-input"
+                      data-testid="llm-openrouter-api-key-input"
+                      type={showOpenRouterKey ? 'text' : 'password'}
+                      autoComplete="off"
+                      spellCheck={false}
+                      value={openRouterKeyInput}
+                      onChange={(e) => setOpenRouterKeyInput(e.target.value)}
+                      placeholder="Inserir / substituir OPENROUTER_API_KEY (sk-or-...)"
+                      className="w-full pl-3 pr-8 py-1.5 text-xs font-mono bg-[#141821] border border-white/10 rounded-lg text-slate-100 placeholder:text-slate-500 focus:outline-none focus:border-[#e59a54]"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => setShowOpenRouterKey((prev) => !prev)}
+                      aria-label={
+                        showOpenRouterKey ? 'Ocultar chave OpenRouter' : 'Mostrar chave OpenRouter'
+                      }
+                      className="absolute right-2 top-1.5 p-0.5 text-slate-400 hover:text-slate-100"
+                    >
+                      {showOpenRouterKey ? (
+                        <EyeOff className="w-3.5 h-3.5" />
+                      ) : (
+                        <Eye className="w-3.5 h-3.5" />
+                      )}
+                    </button>
+                  </div>
+
+                  <button
+                    type="button"
+                    data-testid="save-openrouter-api-key-btn"
+                    disabled={savingApiKeys || !openRouterKeyInput.trim()}
+                    onClick={() =>
+                      handleSaveApiKeys({
+                        openRouterApiKey: openRouterKeyInput.trim(),
+                        persistToDotEnv,
+                      })
+                    }
+                    className="px-3 py-1.5 rounded-lg text-xs font-medium bg-[#181d28] border border-white/10 text-slate-200 hover:border-[#e59a54]/50 disabled:opacity-45 transition-colors whitespace-nowrap"
+                  >
+                    Guardar OpenRouter
+                  </button>
+
+                  {liveEnvStatus.openRouterConfigured && (
+                    <button
+                      type="button"
+                      data-testid="clear-openrouter-api-key-btn"
+                      disabled={savingApiKeys}
+                      onClick={() =>
+                        handleSaveApiKeys({
+                          clearOpenRouterKey: true,
+                          persistToDotEnv,
+                        })
+                      }
+                      title="Remover OPENROUTER_API_KEY do servidor"
+                      aria-label="Remover OPENROUTER_API_KEY"
+                      className="p-1.5 rounded-lg bg-[#141821] border border-white/10 text-slate-400 hover:text-rose-400 hover:border-rose-400/40 disabled:opacity-45 transition-colors"
+                    >
+                      <Trash2 className="w-3.5 h-3.5" />
+                    </button>
+                  )}
+                </div>
+              </div>
+
+              <div className="pt-2 border-t border-white/6 flex flex-wrap items-center justify-between gap-2 text-[11px] text-slate-400">
+                <label className="inline-flex items-center gap-2 cursor-pointer text-slate-300">
+                  <input
+                    type="checkbox"
+                    checked={persistToDotEnv}
+                    onChange={(e) => setPersistToDotEnv(e.target.checked)}
+                    className="rounded border-slate-700 bg-[#141821]"
+                  />
+                  <span>Persistir no ficheiro .env local</span>
+                </label>
+
                 <button
                   type="button"
                   onClick={async () => {
@@ -834,9 +1088,20 @@ export const LLMSettingsView: React.FC<LLMSettingsViewProps> = ({
                   }}
                   className="font-medium text-[#e59a54] hover:text-[#eba868] whitespace-nowrap"
                 >
-                  Recarregar & Verificar
+                  Testar Ligação Agora
                 </button>
               </div>
+
+              {apiKeySaveFeedback && (
+                <p
+                  data-testid="api-key-save-feedback"
+                  className={`text-[11px] font-mono ${
+                    apiKeySaveFeedback.ok ? 'text-emerald-400' : 'text-amber-300'
+                  }`}
+                >
+                  {apiKeySaveFeedback.detail}
+                </p>
+              )}
             </div>
 
             {/* Gemini Model Selection — Strictly API-Verified Models */}
@@ -878,7 +1143,7 @@ export const LLMSettingsView: React.FC<LLMSettingsViewProps> = ({
                   <option value="">
                     {loadingGeminiModels
                       ? 'A consultar modelos compatíveis na tua GEMINI_API_KEY...'
-                      : 'Nenhum modelo carregado — configura GEMINI_API_KEY no .env e clica Atualizar'}
+                      : 'Nenhum modelo carregado — insere a GEMINI_API_KEY acima e clica Atualizar'}
                   </option>
                 ) : (
                   apiGeminiOptions.map((opt) => (

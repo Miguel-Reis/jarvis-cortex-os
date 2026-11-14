@@ -3,6 +3,8 @@ import {
   Activity,
   Bot,
   CheckCircle2,
+  ChevronDown,
+  ChevronRight,
   Circle,
   Eye,
   FileUp,
@@ -22,6 +24,8 @@ import {
   Sparkles,
   Target,
   Trash2,
+  UserPlus,
+  Users,
   Volume2,
   Wrench,
   X,
@@ -36,20 +40,22 @@ import {
 import {
   filterProjectActivityLogs,
   normalizeGeminiVoiceName,
+  resolveProjectAgentsList,
 } from '../../shared/cortex-math';
 import { STANDARD_SKILLS_LIBRARY } from '../../shared/skills-plugins-catalog';
-import type {
-  AppSettings,
-  AttachmentItem,
-  ChatMessage,
-  ChatThread,
-  GoalItem,
-  JarvisStoreData,
-  ProjectActivityLogEntry,
-  ProjectWorkspace,
-  Room,
-  ScreenCaptureSnapshot,
-  StudioInlineEvent,
+import {
+  GENERAL_CHAT_PROJECT_ID,
+  type AppSettings,
+  type AttachmentItem,
+  type ChatMessage,
+  type ChatThread,
+  type GoalItem,
+  type JarvisStoreData,
+  type ProjectActivityLogEntry,
+  type ProjectWorkspace,
+  type Room,
+  type ScreenCaptureSnapshot,
+  type StudioInlineEvent,
 } from '../../shared/types';
 import { useToast } from '../ToastContext';
 import { StudioLiveVoicePanel } from './StudioLiveVoicePanel';
@@ -69,8 +75,11 @@ interface BrowserSpeechRecognitionInstance {
 
 interface StudioWorkspaceViewProps {
   store: JarvisStoreData;
-  activeProject: ProjectWorkspace;
+  activeProject: ProjectWorkspace | null;
   activeChat: ChatThread;
+  preferredResponderId?: string;
+  onSelectResponder?: (roomId: string) => void;
+  onToggleProjectAgent?: (roomId: string) => Promise<void>;
   onRefreshBootstrap: () => Promise<void>;
   onNavigateModule: (section: NavSectionId) => void;
   onCreateNewChat: () => Promise<void>;
@@ -194,15 +203,23 @@ export const StudioWorkspaceView: React.FC<StudioWorkspaceViewProps> = ({
   store,
   activeProject,
   activeChat,
+  preferredResponderId,
+  onSelectResponder,
+  onToggleProjectAgent,
   onRefreshBootstrap,
   onNavigateModule,
   onCreateNewChat,
 }) => {
   const { pushToast } = useToast();
+  const isGeneralMode = !activeProject;
+  const effectiveProjectId = activeProject?.id || GENERAL_CHAT_PROJECT_ID;
 
   // Inspector state
   const [inspectorOpen, setInspectorOpen] = useState(true);
   const [activeTab, setActiveTab] = useState<StudioInspectorTab>('logs');
+  const [agentsQuickPanelOpen, setAgentsQuickPanelOpen] = useState(true);
+  const [manageProjectAgentsOpen, setManageProjectAgentsOpen] = useState(false);
+  const [togglingAgentId, setTogglingAgentId] = useState<string | null>(null);
   const [logScope, setLogScope] = useState<'CHAT' | 'PROJECT'>('CHAT');
   const [logSearch, setLogSearch] = useState('');
 
@@ -210,7 +227,7 @@ export const StudioWorkspaceView: React.FC<StudioWorkspaceViewProps> = ({
   const [input, setInput] = useState('');
   const [sending, setSending] = useState(false);
   const [selectedAgentId, setSelectedAgentId] = useState<string>(
-    activeChat.primaryAgentId || 'room-exec'
+    preferredResponderId || activeChat.primaryAgentId || 'room-exec'
   );
   const [attachments, setAttachments] = useState<AttachmentItem[]>([]);
   const [listeningVoice, setListeningVoice] = useState(false);
@@ -259,9 +276,36 @@ export const StudioWorkspaceView: React.FC<StudioWorkspaceViewProps> = ({
   const liveVoiceClientRef = useRef<GeminiLiveVoiceClient | null>(null);
 
   useEffect(() => {
-    setSelectedAgentId(activeChat.primaryAgentId || 'room-exec');
+    setSelectedAgentId(preferredResponderId || activeChat.primaryAgentId || 'room-exec');
     setScreenAutoSend(activeChat.screenAutoSendEnabled !== false);
-  }, [activeChat.id, activeChat.primaryAgentId, activeChat.screenAutoSendEnabled]);
+  }, [activeChat.id, activeChat.primaryAgentId, activeChat.screenAutoSendEnabled, preferredResponderId]);
+
+  useEffect(() => {
+    if (isGeneralMode && activeTab === 'goals') {
+      setActiveTab('logs');
+    }
+  }, [isGeneralMode, activeTab]);
+
+  const handleSelectResponder = useCallback(
+    (roomId: string) => {
+      setSelectedAgentId(roomId);
+      onSelectResponder?.(roomId);
+    },
+    [onSelectResponder]
+  );
+
+  const handleQuickToggleAgent = useCallback(
+    async (roomId: string) => {
+      if (!onToggleProjectAgent || togglingAgentId) return;
+      setTogglingAgentId(roomId);
+      try {
+        await onToggleProjectAgent(roomId);
+      } finally {
+        setTogglingAgentId(null);
+      }
+    },
+    [onToggleProjectAgent, togglingAgentId]
+  );
 
   useEffect(() => {
     if (store.latestScreenSnapshot) {
@@ -402,7 +446,7 @@ export const StudioWorkspaceView: React.FC<StudioWorkspaceViewProps> = ({
       const res = await apiJson<{ snapshot: ScreenCaptureSnapshot }>('/api/screen/sidecar-capture', {
         method: 'POST',
         body: JSON.stringify({
-          projectId: activeProject.id,
+          projectId: effectiveProjectId,
           chatId: activeChat.id,
         }),
       });
@@ -451,7 +495,7 @@ export const StudioWorkspaceView: React.FC<StudioWorkspaceViewProps> = ({
         }>('/api/screen/analyze', {
           method: 'POST',
           body: JSON.stringify({
-            projectId: activeProject.id,
+            projectId: effectiveProjectId,
             chatId: activeChat.id,
             screenFrame: payloadFrame,
             postToChat,
@@ -476,7 +520,7 @@ export const StudioWorkspaceView: React.FC<StudioWorkspaceViewProps> = ({
         setAnalyzingScreen(false);
       }
     },
-    [activeChat.id, activeProject.id, grabBrowserStreamFrame, localSnapshot, onRefreshBootstrap, pushToast]
+    [activeChat.id, effectiveProjectId, grabBrowserStreamFrame, localSnapshot, onRefreshBootstrap, pushToast]
   );
 
   // Continuous 20s screen observation timer when enabled
@@ -541,7 +585,7 @@ export const StudioWorkspaceView: React.FC<StudioWorkspaceViewProps> = ({
 
     await liveVoiceClientRef.current.start({
       voiceName: activeVoice,
-      projectId: activeProject.id,
+      projectId: effectiveProjectId,
       chatId: activeChat.id,
       language: store.settings.language,
       dspEnabled: store.settings.voiceDspEnabled,
@@ -570,37 +614,45 @@ export const StudioWorkspaceView: React.FC<StudioWorkspaceViewProps> = ({
     liveVoiceClientRef.current?.setMuted(next);
   };
 
-  // Scoped data for active project & chat
+  // Scoped data for active project or General Chat mode
   const chatMessages = useMemo(() => {
     return store.messages.filter((m) => {
       if (m.chatId) return m.chatId === activeChat.id;
-      return activeProject.id === 'proj-jarvis-core' && m.roomId === 'room-exec';
+      if (isGeneralMode) return m.projectId === GENERAL_CHAT_PROJECT_ID;
+      return effectiveProjectId === 'proj-jarvis-core' && m.roomId === 'room-exec';
     });
-  }, [store.messages, activeChat.id, activeProject.id]);
+  }, [store.messages, activeChat.id, isGeneralMode, effectiveProjectId]);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' });
   }, [chatMessages.length]);
 
   const projectGoals = useMemo(() => {
+    if (isGeneralMode) return [];
     return store.goals.filter((g) => {
-      if (g.projectId) return g.projectId === activeProject.id;
-      return activeProject.id === 'proj-jarvis-core';
+      if (g.projectId) return g.projectId === effectiveProjectId;
+      return effectiveProjectId === 'proj-jarvis-core';
     });
-  }, [store.goals, activeProject.id]);
+  }, [store.goals, isGeneralMode, effectiveProjectId]);
 
-  const projectAgents = useMemo(() => {
-    const assigned = new Set(activeProject.assignedAgentIds || []);
-    return store.rooms.filter(
-      (r) => r.id === 'room-exec' || r.projectId === activeProject.id || assigned.has(r.id)
-    );
-  }, [store.rooms, activeProject.id, activeProject.assignedAgentIds]);
+  const projectAgents = useMemo(
+    () => resolveProjectAgentsList(store.rooms, activeProject),
+    [store.rooms, activeProject]
+  );
+
+  const availableExtraFleetAgents = useMemo(
+    () =>
+      store.rooms.filter(
+        (r) => r.id !== 'room-exec' && !projectAgents.some((pa) => pa.id === r.id)
+      ),
+    [store.rooms, projectAgents]
+  );
 
   const scopedLogs = useMemo(() => {
     const base = filterProjectActivityLogs(store.projectActivityLogs || [], {
-      projectId: activeProject.id,
+      projectId: effectiveProjectId,
       chatId: activeChat.id,
-      scope: logScope,
+      scope: isGeneralMode ? 'CHAT' : logScope,
     });
     const q = logSearch.trim().toLowerCase();
     if (!q) return base;
@@ -610,7 +662,7 @@ export const StudioWorkspaceView: React.FC<StudioWorkspaceViewProps> = ({
         l.actor.toLowerCase().includes(q) ||
         (l.detail || '').toLowerCase().includes(q)
     );
-  }, [store.projectActivityLogs, activeProject.id, activeChat.id, logScope, logSearch]);
+  }, [store.projectActivityLogs, effectiveProjectId, activeChat.id, isGeneralMode, logScope, logSearch]);
 
   const completedGoalsCount = projectGoals.filter((g) => g.status === 'COMPLETED').length;
   const avgGoalProgress =
@@ -619,6 +671,13 @@ export const StudioWorkspaceView: React.FC<StudioWorkspaceViewProps> = ({
       : 0;
 
   const starterSuggestions = useMemo(() => {
+    if (!activeProject) {
+      return [
+        'Faz-me um ponto de situação rápido de todos os meus projetos, aprovações pendentes e contratos de hoje',
+        'Ajuda-me a pensar numa arquitetura ou resolver uma dúvida rápida fora dos projetos atuais',
+        'Mostra o estado da memória sináptica, Sidecar e motores LLM do J.A.R.V.I.S. OS',
+      ];
+    }
     if (activeProject.ideaCategory === 'WEBSITE') {
       return [
         'Quero criar uma landing page SaaS moderna com autenticação OAuth e pagamentos Stripe — define os Goals e cria um sub-agente UI',
@@ -638,7 +697,7 @@ export const StudioWorkspaceView: React.FC<StudioWorkspaceViewProps> = ({
       'Usa o Gateway MCP para pesquisar decisões na memória do projeto e alinhar prioridades',
       'Captura o meu ecrã pelo Sidecar e diz-me o que estás a ver em tempo real',
     ];
-  }, [activeProject.ideaCategory, activeProject.name]);
+  }, [activeProject]);
 
   const handleSendMessage = async (customPrompt?: string) => {
     const textToSend = (customPrompt ?? input).trim();
@@ -684,7 +743,7 @@ export const StudioWorkspaceView: React.FC<StudioWorkspaceViewProps> = ({
         body: JSON.stringify({
           roomId: selectedAgentId,
           chatId: activeChat.id,
-          projectId: activeProject.id,
+          projectId: effectiveProjectId,
           content: textToSend,
           attachments,
           screenFrame: screenFramePayload,
@@ -817,7 +876,7 @@ export const StudioWorkspaceView: React.FC<StudioWorkspaceViewProps> = ({
             const res = await transcribeAudioBlobWithGemini({
               blob,
               language: store.settings.language,
-              projectId: activeProject.id,
+              projectId: effectiveProjectId,
               chatId: activeChat.id,
             });
             if (res.ok && res.transcript) {
@@ -882,7 +941,7 @@ export const StudioWorkspaceView: React.FC<StudioWorkspaceViewProps> = ({
 
   const handleCreateGoalSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!newGoalTitle.trim() || savingGoal) return;
+    if (isGeneralMode || !newGoalTitle.trim() || savingGoal) return;
     setSavingGoal(true);
     try {
       const subtasks = newGoalSubtasksText
@@ -893,7 +952,7 @@ export const StudioWorkspaceView: React.FC<StudioWorkspaceViewProps> = ({
         method: 'POST',
         body: JSON.stringify({
           title: newGoalTitle.trim(),
-          projectId: activeProject.id,
+          projectId: effectiveProjectId,
           chatId: activeChat.id,
           subtasks: subtasks.length > 0 ? subtasks : undefined,
         }),
@@ -918,14 +977,15 @@ export const StudioWorkspaceView: React.FC<StudioWorkspaceViewProps> = ({
         body: JSON.stringify({
           name: newAgentName.trim(),
           roleTitle: newAgentRole.trim() || 'Sub-Agente Especialista do Projeto',
-          projectId: activeProject.id,
+          projectId: activeProject ? activeProject.id : undefined,
           chatId: activeChat.id,
         }),
       });
       setNewAgentName('');
       setNewAgentRole('');
       setShowAgentForm(false);
-      setSelectedAgentId(res.room.id);
+      setManageProjectAgentsOpen(false);
+      handleSelectResponder(res.room.id);
       await onRefreshBootstrap();
       pushToast({
         title: `Sub-agente ${res.room.name} criado`,
@@ -938,6 +998,7 @@ export const StudioWorkspaceView: React.FC<StudioWorkspaceViewProps> = ({
   };
 
   const handleToggleProjectSkill = async (skillIdOrTemplateId: string, isInstalled: boolean) => {
+    if (!activeProject) return;
     let resolvedSkillId = skillIdOrTemplateId;
     if (!isInstalled) {
       const res = await apiJson<{ skill: { id: string } }>('/api/skills/install-template', {
@@ -963,9 +1024,9 @@ export const StudioWorkspaceView: React.FC<StudioWorkspaceViewProps> = ({
 
   const handleClearLogs = async () => {
     const qs = new URLSearchParams({
-      projectId: activeProject.id,
+      projectId: effectiveProjectId,
       chatId: activeChat.id,
-      scope: logScope,
+      scope: isGeneralMode ? 'CHAT' : logScope,
     });
     await apiJson(`/api/activity-logs?${qs.toString()}`, { method: 'DELETE' });
     await onRefreshBootstrap();
@@ -998,7 +1059,7 @@ export const StudioWorkspaceView: React.FC<StudioWorkspaceViewProps> = ({
         <header className="h-13 px-5 border-b border-white/7 flex items-center justify-between gap-4 shrink-0">
           <div className="flex items-center gap-2.5 min-w-0">
             <h1 className="text-sm font-semibold text-slate-100 font-display truncate">
-              {activeProject.name}
+              {activeProject ? activeProject.name : 'Conversa Geral · J.A.R.V.I.S. Livre'}
             </h1>
             <span className="text-slate-600 shrink-0" aria-hidden="true">
               /
@@ -1007,7 +1068,7 @@ export const StudioWorkspaceView: React.FC<StudioWorkspaceViewProps> = ({
             <button
               type="button"
               onClick={onCreateNewChat}
-              title="Nova conversa neste projeto"
+              title={activeProject ? 'Nova conversa neste projeto' : 'Nova conversa geral'}
               className="p-1 rounded-md text-slate-400 hover:text-slate-100 hover:bg-white/6 transition-colors shrink-0"
             >
               <Plus className="w-3.5 h-3.5" />
@@ -1021,12 +1082,14 @@ export const StudioWorkspaceView: React.FC<StudioWorkspaceViewProps> = ({
               <select
                 aria-label="Selecionar agente ativo na conversa"
                 value={selectedAgentObj?.id || 'room-exec'}
-                onChange={(e) => setSelectedAgentId(e.target.value)}
+                onChange={(e) => handleSelectResponder(e.target.value)}
                 className="bg-[#141821] border border-white/8 hover:border-white/16 rounded-lg px-2.5 py-1 text-xs text-slate-200 focus:outline-none focus:border-[#e59a54] max-w-48 truncate"
               >
                 {projectAgents.map((ag) => (
                   <option key={ag.id} value={ag.id}>
-                    {ag.id === 'room-exec' ? 'Jarvis (Coordenador)' : ag.name}
+                    {ag.id === 'room-exec'
+                      ? 'Jarvis Principal (Coordenador)'
+                      : `${ag.name} (Sub-Agente)`}
                   </option>
                 ))}
               </select>
@@ -1128,24 +1191,40 @@ export const StudioWorkspaceView: React.FC<StudioWorkspaceViewProps> = ({
         {/* Scrollable Conversation Feed */}
         <div className="flex-1 overflow-y-auto px-5 py-6">
           <div className="max-w-3xl mx-auto space-y-6">
-            {/* Project Brief Header inside Thread */}
+            {/* Project Brief or General Chat Header inside Thread */}
             <div className="pb-4 border-b border-white/6 flex flex-col sm:flex-row sm:items-center justify-between gap-2">
-              <div className="space-y-1">
-                <div className="flex flex-wrap items-center gap-2 text-xs text-slate-400">
-                  <span>{activeProject.ideaCategory || 'PROJETO'}</span>
-                  <span aria-hidden="true">·</span>
-                  <span>{activeProject.techStack}</span>
-                  <span aria-hidden="true">·</span>
-                  <span className="tabular-nums">
-                    {projectGoals.length} Goals ({avgGoalProgress}%)
-                  </span>
-                  <span aria-hidden="true">·</span>
-                  <span className="tabular-nums">{projectAgents.length} Agentes</span>
+              {activeProject ? (
+                <div className="space-y-1">
+                  <div className="flex flex-wrap items-center gap-2 text-xs text-slate-400">
+                    <span>{activeProject.ideaCategory || 'PROJETO'}</span>
+                    <span aria-hidden="true">·</span>
+                    <span>{activeProject.techStack}</span>
+                    <span aria-hidden="true">·</span>
+                    <span className="tabular-nums">
+                      {projectGoals.length} Goals ({avgGoalProgress}%)
+                    </span>
+                    <span aria-hidden="true">·</span>
+                    <span className="tabular-nums">{projectAgents.length} Agentes</span>
+                  </div>
+                  <p className="text-xs text-slate-400">
+                    {activeProject.ideaBrief || activeProject.description}
+                  </p>
                 </div>
-                <p className="text-xs text-slate-400">
-                  {activeProject.ideaBrief || activeProject.description}
-                </p>
-              </div>
+              ) : (
+                <div className="space-y-1">
+                  <div className="flex flex-wrap items-center gap-2 text-xs text-slate-400">
+                    <span className="font-mono text-[#e59a54]">CONVERSA LIVRE</span>
+                    <span aria-hidden="true">·</span>
+                    <span>SEM PROJETO ASSOCIADO</span>
+                    <span aria-hidden="true">·</span>
+                    <span>ACESSO TOTAL AO CORTEX OS</span>
+                  </div>
+                  <p className="text-xs text-slate-400">
+                    Conversa aberta não vinculada a nenhum projeto específico. Podes falar
+                    livremente, consultar qualquer projeto ou coordenar todo o sistema J.A.R.V.I.S.
+                  </p>
+                </div>
+              )}
             </div>
 
             {/* Message Thread */}
@@ -1337,9 +1416,19 @@ export const StudioWorkspaceView: React.FC<StudioWorkspaceViewProps> = ({
                   handleSendMessage();
                 }
               }}
-              placeholder={`Conversa com ${
-                selectedAgentObj?.id === 'room-exec' ? 'o Jarvis' : selectedAgentObj?.name
-              } sobre "${activeProject.name}" — planeia funcionalidades, define Goals ou partilha o ecrã...`}
+              placeholder={
+                activeProject
+                  ? `Conversa com ${
+                      selectedAgentObj?.id === 'room-exec'
+                        ? 'o Jarvis Principal'
+                        : selectedAgentObj?.name
+                    } sobre "${activeProject.name}" — planeia funcionalidades, define Goals ou partilha o ecrã...`
+                  : `Conversa livre com ${
+                      selectedAgentObj?.id === 'room-exec'
+                        ? 'o Jarvis Principal'
+                        : selectedAgentObj?.name
+                    } (sem projeto associado) — acesso total ao J.A.R.V.I.S. OS...`
+              }
               className="w-full bg-transparent text-sm text-slate-100 placeholder:text-slate-500 resize-none focus:outline-none"
             />
 
@@ -1463,9 +1552,185 @@ export const StudioWorkspaceView: React.FC<StudioWorkspaceViewProps> = ({
           data-testid="studio-right-inspector"
           className="w-full sm:w-[372px] shrink-0 studio-inspector flex flex-col h-full overflow-hidden"
         >
+          {/* Always-Visible Direct Access to Project Agents & Sub-Agents */}
+          <div
+            data-testid="studio-project-agents-panel"
+            className="border-b border-white/8 bg-[#10141d] shrink-0"
+          >
+            <div className="px-3 py-2 flex items-center justify-between gap-2">
+              <button
+                type="button"
+                onClick={() => setAgentsQuickPanelOpen((prev) => !prev)}
+                className="flex items-center gap-1.5 text-left text-xs font-semibold text-slate-200 hover:text-slate-100 min-w-0"
+              >
+                {agentsQuickPanelOpen ? (
+                  <ChevronDown className="w-3.5 h-3.5 text-slate-400 shrink-0" />
+                ) : (
+                  <ChevronRight className="w-3.5 h-3.5 text-slate-400 shrink-0" />
+                )}
+                <Users className="w-3.5 h-3.5 text-[#8ea6ff] shrink-0" />
+                <span className="truncate">
+                  {activeProject ? 'Agentes & Sub-Agentes do Projeto' : 'Agentes Cortex OS'}
+                </span>
+                <span className="font-mono tabular-nums text-[11px] text-[#e59a54] shrink-0">
+                  {projectAgents.length}
+                </span>
+              </button>
+
+              <button
+                type="button"
+                data-testid="toggle-manage-project-agents-btn"
+                onClick={() => {
+                  setAgentsQuickPanelOpen(true);
+                  setManageProjectAgentsOpen((prev) => !prev);
+                }}
+                className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-[#181d28] border border-white/10 text-[11px] font-medium text-[#e59a54] hover:border-[#e59a54]/50 transition-colors whitespace-nowrap shrink-0"
+              >
+                <UserPlus className="w-3 h-3" />
+                <span>{manageProjectAgentsOpen ? 'Fechar' : 'Gerir'}</span>
+              </button>
+            </div>
+
+            {agentsQuickPanelOpen && (
+              <div className="px-2.5 pb-2.5 space-y-2">
+                <div className="max-h-44 overflow-y-auto space-y-1 pr-0.5">
+                  {projectAgents.map((ag) => {
+                    const isSelected = ag.id === selectedAgentObj?.id;
+                    const isPrincipal = ag.id === 'room-exec';
+                    return (
+                      <div
+                        key={ag.id}
+                        className={`rounded-lg border transition-colors flex items-center justify-between gap-1.5 px-2.5 py-1.5 ${
+                          isSelected
+                            ? 'bg-[#181f2c] border-[#e59a54]/55'
+                            : 'bg-[#141821] border-white/7 hover:border-white/15'
+                        }`}
+                      >
+                        <button
+                          type="button"
+                          data-testid={`conversation-agent-chip-${ag.id}`}
+                          onClick={() => handleSelectResponder(ag.id)}
+                          className="flex-1 min-w-0 text-left flex items-center gap-2"
+                        >
+                          <Bot
+                            className={`w-3.5 h-3.5 shrink-0 ${
+                              isPrincipal
+                                ? 'text-[#e59a54]'
+                                : isSelected
+                                  ? 'text-[#8ea6ff]'
+                                  : 'text-slate-400'
+                            }`}
+                          />
+                          <div className="min-w-0 flex-1">
+                            <div className="flex items-center gap-1.5">
+                              <span className="text-xs font-medium text-slate-100 truncate">
+                                {ag.name}
+                              </span>
+                              <span
+                                className={`px-1 py-0.2 rounded text-[9px] font-mono shrink-0 ${
+                                  isPrincipal
+                                    ? 'bg-[#e59a54]/15 text-[#e59a54]'
+                                    : 'bg-[#8ea6ff]/15 text-[#9fb3ff]'
+                                }`}
+                              >
+                                {isPrincipal ? 'PRINCIPAL' : ag.callsign || 'SUB'}
+                              </span>
+                            </div>
+                            <p className="text-[10px] text-slate-400 truncate">{ag.roleTitle}</p>
+                          </div>
+                        </button>
+
+                        <div className="flex items-center gap-1 shrink-0">
+                          {isSelected && (
+                            <span className="text-[10px] font-mono text-emerald-400 px-1">
+                              Ativo
+                            </span>
+                          )}
+                          {activeProject && !isPrincipal && onToggleProjectAgent && (
+                            <button
+                              type="button"
+                              disabled={togglingAgentId === ag.id}
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                handleQuickToggleAgent(ag.id);
+                              }}
+                              title={`Desassociar ${ag.name} deste projeto`}
+                              aria-label={`Remover ${ag.name} do projeto`}
+                              className="p-1 rounded text-slate-500 hover:text-rose-400 transition-colors disabled:opacity-40"
+                            >
+                              <X className="w-3 h-3" />
+                            </button>
+                          )}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+
+                {manageProjectAgentsOpen && (
+                  <div className="p-2.5 rounded-xl bg-[#0b0d11] border border-white/10 space-y-2.5">
+                    {activeProject && onToggleProjectAgent && availableExtraFleetAgents.length > 0 && (
+                      <div className="space-y-1.5">
+                        <p className="text-[10px] font-medium text-slate-400 uppercase tracking-wider">
+                          Atribuir Especialista da Frota
+                        </p>
+                        <div className="flex flex-wrap gap-1.5">
+                          {availableExtraFleetAgents.map((ag) => (
+                            <button
+                              key={ag.id}
+                              type="button"
+                              disabled={togglingAgentId === ag.id}
+                              onClick={() => handleQuickToggleAgent(ag.id)}
+                              className="inline-flex items-center gap-1 px-2 py-1 rounded-md bg-[#141821] border border-white/8 hover:border-[#8ea6ff]/50 text-[11px] text-slate-200 transition-colors disabled:opacity-40"
+                            >
+                              <Plus className="w-3 h-3 text-[#8ea6ff]" />
+                              <span>{ag.name}</span>
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+
+                    <form onSubmit={handleCreateSubagentSubmit} className="space-y-1.5">
+                      <p className="text-[10px] font-medium text-slate-400 uppercase tracking-wider">
+                        Recrutar Novo Sub-Agente
+                      </p>
+                      <input
+                        type="text"
+                        required
+                        value={newAgentName}
+                        onChange={(e) => setNewAgentName(e.target.value)}
+                        placeholder="Nome (ex: Especialista QA)"
+                        className="w-full px-2 py-1 text-xs bg-[#141821] border border-white/8 rounded-md text-slate-100 placeholder:text-slate-500 focus:outline-none focus:border-[#e59a54]"
+                      />
+                      <div className="flex items-center gap-1.5">
+                        <input
+                          type="text"
+                          value={newAgentRole}
+                          onChange={(e) => setNewAgentRole(e.target.value)}
+                          placeholder="Especialidade / Papel"
+                          className="flex-1 min-w-0 px-2 py-1 text-xs bg-[#141821] border border-white/8 rounded-md text-slate-200 placeholder:text-slate-500 focus:outline-none focus:border-[#e59a54]"
+                        />
+                        <button
+                          type="submit"
+                          disabled={savingAgent}
+                          className="px-2.5 py-1 rounded-md text-[11px] font-semibold bg-[#e59a54] text-[#0b0d11] hover:bg-[#f0ac6b] shrink-0 disabled:opacity-50"
+                        >
+                          {savingAgent ? '...' : 'Criar'}
+                        </button>
+                      </div>
+                    </form>
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+
           {/* Segmented Inspector Tabs */}
           <div className="p-2.5 border-b border-white/7 shrink-0">
-            <div className="grid grid-cols-4 gap-1 p-1 rounded-xl bg-[#0b0d11] border border-white/6">
+            <div
+              className={`grid ${isGeneralMode ? 'grid-cols-3' : 'grid-cols-4'} gap-1 p-1 rounded-xl bg-[#0b0d11] border border-white/6`}
+            >
               <button
                 type="button"
                 data-testid="studio-tab-logs"
@@ -1480,22 +1745,24 @@ export const StudioWorkspaceView: React.FC<StudioWorkspaceViewProps> = ({
                 <span>Logs</span>
               </button>
 
-              <button
-                type="button"
-                data-testid="studio-tab-goals"
-                onClick={() => setActiveTab('goals')}
-                className={`flex items-center justify-center gap-1.5 py-1.5 px-2 rounded-lg text-xs font-medium transition-colors whitespace-nowrap ${
-                  activeTab === 'goals'
-                    ? 'bg-[#1a202c] text-slate-100'
-                    : 'text-slate-400 hover:text-slate-200'
-                }`}
-              >
-                <Target className="w-3.5 h-3.5 text-[#e59a54] shrink-0" />
-                <span>Goals</span>
-                <span className="font-mono tabular-nums text-[11px] text-slate-400">
-                  {projectGoals.length}
-                </span>
-              </button>
+              {!isGeneralMode && (
+                <button
+                  type="button"
+                  data-testid="studio-tab-goals"
+                  onClick={() => setActiveTab('goals')}
+                  className={`flex items-center justify-center gap-1.5 py-1.5 px-2 rounded-lg text-xs font-medium transition-colors whitespace-nowrap ${
+                    activeTab === 'goals'
+                      ? 'bg-[#1a202c] text-slate-100'
+                      : 'text-slate-400 hover:text-slate-200'
+                  }`}
+                >
+                  <Target className="w-3.5 h-3.5 text-[#e59a54] shrink-0" />
+                  <span>Goals</span>
+                  <span className="font-mono tabular-nums text-[11px] text-slate-400">
+                    {projectGoals.length}
+                  </span>
+                </button>
+              )}
 
               <button
                 type="button"
@@ -1545,18 +1812,20 @@ export const StudioWorkspaceView: React.FC<StudioWorkspaceViewProps> = ({
                     >
                       Este Chat
                     </button>
-                    <button
-                      type="button"
-                      data-testid="logs-scope-project"
-                      onClick={() => setLogScope('PROJECT')}
-                      className={`px-2.5 py-1 rounded-md text-[11px] font-medium transition-colors whitespace-nowrap ${
-                        logScope === 'PROJECT'
-                          ? 'bg-[#1a202c] text-slate-100'
-                          : 'text-slate-400 hover:text-slate-200'
-                      }`}
-                    >
-                      Todo o Projeto
-                    </button>
+                    {!isGeneralMode && (
+                      <button
+                        type="button"
+                        data-testid="logs-scope-project"
+                        onClick={() => setLogScope('PROJECT')}
+                        className={`px-2.5 py-1 rounded-md text-[11px] font-medium transition-colors whitespace-nowrap ${
+                          logScope === 'PROJECT'
+                            ? 'bg-[#1a202c] text-slate-100'
+                            : 'text-slate-400 hover:text-slate-200'
+                        }`}
+                      >
+                        Todo o Projeto
+                      </button>
+                    )}
                   </div>
 
                   {scopedLogs.length > 0 && (
@@ -1579,7 +1848,9 @@ export const StudioWorkspaceView: React.FC<StudioWorkspaceViewProps> = ({
                     placeholder={
                       logScope === 'CHAT'
                         ? `Filtrar logs de "${activeChat.title}"...`
-                        : `Filtrar logs de "${activeProject.name}"...`
+                        : activeProject
+                          ? `Filtrar logs de "${activeProject.name}"...`
+                          : 'Filtrar logs do Sistema Geral...'
                     }
                     className="w-full pl-8 pr-2.5 py-1.5 text-xs bg-[#0b0d11] border border-white/7 rounded-lg text-slate-200 placeholder:text-slate-500 focus:outline-none focus:border-[#e59a54]/50"
                   />
@@ -1636,7 +1907,7 @@ export const StudioWorkspaceView: React.FC<StudioWorkspaceViewProps> = ({
           )}
 
           {/* TAB 2: PROJECT GOALS & INTERACTIVE SUBTASKS */}
-          {activeTab === 'goals' && (
+          {activeTab === 'goals' && activeProject && (
             <div className="flex-1 flex flex-col min-h-0">
               <div className="px-3.5 py-2.5 border-b border-white/6 flex items-center justify-between gap-2 shrink-0">
                 <div className="text-xs text-slate-400 tabular-nums">
@@ -1903,7 +2174,7 @@ export const StudioWorkspaceView: React.FC<StudioWorkspaceViewProps> = ({
                           </div>
                           <button
                             type="button"
-                            onClick={() => setSelectedAgentId(ag.id)}
+                            onClick={() => handleSelectResponder(ag.id)}
                             className={`px-2.5 py-1 rounded-lg text-[11px] font-medium shrink-0 transition-colors ${
                               isSelected
                                 ? 'bg-[#8ea6ff]/20 text-[#b4c4ff]'
@@ -1920,6 +2191,7 @@ export const StudioWorkspaceView: React.FC<StudioWorkspaceViewProps> = ({
               </div>
 
               {/* Antigravity Skills Section */}
+              {activeProject && (
               <div className="pt-3 border-t border-white/7 space-y-2.5">
                 <div className="flex items-center justify-between">
                   <h3 className="text-xs font-semibold text-slate-200">
@@ -1987,6 +2259,7 @@ export const StudioWorkspaceView: React.FC<StudioWorkspaceViewProps> = ({
                     ))}
                 </div>
               </div>
+              )}
 
               {/* MCP Gateway Bridge Section */}
               <div className="pt-3 border-t border-white/7 space-y-2">

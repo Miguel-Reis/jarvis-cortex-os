@@ -1,39 +1,41 @@
-import type {
-  ArchitecturalDriftItem,
-  ArtifactKind,
-  AutonomyLevel,
-  ChannelConfig,
-  CoChangeEdge,
-  GeminiVoiceName,
-  GoalItem,
-  GoalSubtask,
-  GraphEdge,
-  GraphNodeComputed,
-  JarvisStoreData,
-  JevRouteDecision,
-  LanguageCode,
-  LookaheadAlert,
-  McpAuthorityCheckItem,
-  McpAuthorityGateResult,
-  McpCustomServer,
-  McpLatencyStats,
-  McpTransportType,
-  MemoryCategory,
-  MemoryItem,
-  MemoryRankedHit,
-  MemoryTier,
-  NormalizedScreenRegion,
-  ProactiveInsight,
-  ProjectActivityLogEntry,
-  ProjectArtifact,
-  ProjectBlueprintBundle,
-  ProjectWorkspace,
-  Q18Candidate,
-  Room,
-  ScoutSymbolEntry,
-  SkillItem,
-  VoicePersonaOption,
-  WorkflowNode,
+import {
+  GENERAL_CHAT_PROJECT_ID,
+  type ApprovalRequest,
+  type ArchitecturalDriftItem,
+  type ArtifactKind,
+  type AutonomyLevel,
+  type ChannelConfig,
+  type CoChangeEdge,
+  type GeminiVoiceName,
+  type GoalItem,
+  type GoalSubtask,
+  type GraphEdge,
+  type GraphNodeComputed,
+  type JarvisStoreData,
+  type JevRouteDecision,
+  type LanguageCode,
+  type LookaheadAlert,
+  type McpAuthorityCheckItem,
+  type McpAuthorityGateResult,
+  type McpCustomServer,
+  type McpLatencyStats,
+  type McpTransportType,
+  type MemoryCategory,
+  type MemoryItem,
+  type MemoryRankedHit,
+  type MemoryTier,
+  type NormalizedScreenRegion,
+  type ProactiveInsight,
+  type ProjectActivityLogEntry,
+  type ProjectArtifact,
+  type ProjectBlueprintBundle,
+  type ProjectWorkspace,
+  type Q18Candidate,
+  type Room,
+  type ScoutSymbolEntry,
+  type SkillItem,
+  type VoicePersonaOption,
+  type WorkflowNode,
 } from './types.ts';
 
 /**
@@ -3556,5 +3558,124 @@ export function compactMemoryVault(params: {
     duplicatesSuperseded,
     workingPruned,
     importanceDecayed,
+  };
+}
+
+/**
+ * Returns `true` when a chat thread or identifier represents a standalone
+ * general conversation unlinked from any project workspace (`__general__`).
+ */
+export function isGeneralUnlinkedChat(
+  target?: { projectId?: string | null; isGeneral?: boolean } | string | null
+): boolean {
+  if (!target) return false;
+  if (typeof target === 'string') {
+    return target.trim() === GENERAL_CHAT_PROJECT_ID;
+  }
+  return Boolean(target.isGeneral || target.projectId === GENERAL_CHAT_PROJECT_ID);
+}
+
+/**
+ * Masks an API secret key into a safe non-sensitive preview (`AIza••••••9xYz`).
+ * Returns `null` for empty/unset keys.
+ */
+export function maskSecretApiKey(rawKey?: string | null): string | null {
+  const clean = (rawKey || '').trim();
+  if (!clean) return null;
+  if (clean.length < 10) return '••••••••';
+  return `${clean.slice(0, 4)}••••••${clean.slice(-4)}`;
+}
+
+/**
+ * Resolves the deduplicated ordered list of agents accessible in a conversation sidebar:
+ * Always puts the Principal Agent (`room-exec`) first, followed by project-assigned subagents
+ * (or all specialist rooms when operating in an unlinked general chat).
+ */
+export function resolveProjectAgentsList(
+  rooms: Room[],
+  project?: ProjectWorkspace | null
+): Room[] {
+  if (!rooms || rooms.length === 0) return [];
+  const principal = rooms.find((r) => r.id === 'room-exec');
+  const seen = new Set<string>();
+  const ordered: Room[] = [];
+
+  if (principal) {
+    ordered.push(principal);
+    seen.add(principal.id);
+  }
+
+  if (!project) {
+    for (const r of rooms) {
+      if (!seen.has(r.id)) {
+        ordered.push(r);
+        seen.add(r.id);
+      }
+    }
+    return ordered;
+  }
+
+  const assignedSet = new Set(project.assignedAgentIds || []);
+  for (const r of rooms) {
+    if (seen.has(r.id)) continue;
+    if (r.projectId === project.id || assignedSet.has(r.id)) {
+      ordered.push(r);
+      seen.add(r.id);
+    }
+  }
+  return ordered;
+}
+
+/**
+ * Formats clear Portuguese actor/requester badges for real-time authority notifications,
+ * distinguishing Principal Agents, Live Voice, and Subagents.
+ */
+export function formatApprovalRequesterBadge(
+  approval: Pick<ApprovalRequest, 'source' | 'actorName' | 'agentCallsign' | 'isSubagent'>
+): { roleLabel: string; actorDisplay: string; isSubagent: boolean } {
+  const isSubagent = Boolean(approval.isSubagent || approval.source === 'SUBAGENT');
+  const baseActor = (approval.actorName || '').trim();
+  const callsign = (approval.agentCallsign || '').trim();
+
+  if (isSubagent) {
+    const actorDisplay =
+      baseActor && callsign && !baseActor.includes(callsign)
+        ? `${baseActor} (${callsign})`
+        : baseActor || callsign || 'Sub-Agente do Projeto';
+    return { roleLabel: 'SUB-AGENTE', actorDisplay, isSubagent: true };
+  }
+
+  if (approval.source === 'LIVE_VOICE_AGENT') {
+    return {
+      roleLabel: 'AGENTE PRINCIPAL · LIVE',
+      actorDisplay: baseActor || 'J.A.R.V.I.S. Principal (Live)',
+      isSubagent: false,
+    };
+  }
+
+  if (approval.source === 'CHAT_AGENT') {
+    return {
+      roleLabel: 'AGENTE PRINCIPAL',
+      actorDisplay: baseActor || 'J.A.R.V.I.S. Principal',
+      isSubagent: false,
+    };
+  }
+
+  const sourceLabels: Record<ApprovalRequest['source'], string> = {
+    CHAT_AGENT: 'AGENTE PRINCIPAL',
+    LIVE_VOICE_AGENT: 'AGENTE PRINCIPAL · LIVE',
+    SUBAGENT: 'SUB-AGENTE',
+    WORKFLOW: 'WORKFLOW DAG',
+    WORKSPACE_TERMINAL: 'TERMINAL',
+    EXTERNAL_CHANNEL: 'CANAL EXTERNO',
+    SWARM_SANDBOX: 'SWARM 48X',
+    MCP_GATEWAY: 'MCP STDIO',
+    SIDECAR_HOST: 'SIDECAR HOST',
+  };
+
+  return {
+    roleLabel: sourceLabels[approval.source] || approval.source,
+    actorDisplay: baseActor || sourceLabels[approval.source] || approval.source,
+    isSubagent: false,
   };
 }

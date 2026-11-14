@@ -35,29 +35,37 @@ import {
   filterProjectActivityLogs,
   findCrossProjectReusableMemories,
   findShortestGraphPath,
+  formatApprovalRequesterBadge,
   formatDebugPayloadPreview,
   GEMINI_VOICE_CATALOG,
   getVisibleSidebarIds,
   hammingSimilarity128,
+  isGeneralUnlinkedChat,
   isLocalOpenAiCompatibleEndpoint,
   isPathInsideWorkspace,
+  maskSecretApiKey,
   normalizeGeminiModelId,
   normalizeGeminiVoiceName,
   normalizeScreenRegionBox,
   rankQ18Actions,
   redactAiDefenceSecrets,
+  resolveProjectAgentsList,
   routeJevS1,
   searchMemories4WayRRF,
   validateChannelSender,
   validateMcpServerAuthorityGate,
   validateSafeOutboundUrl,
 } from './cortex-math';
-import type {
-  ChannelConfig,
-  GraphEdge,
-  JarvisStoreData,
-  MemoryItem,
-  Q18Candidate,
+import {
+  GENERAL_CHAT_PROJECT_ID,
+  type ChannelConfig,
+  type ChatThread,
+  type GraphEdge,
+  type JarvisStoreData,
+  type MemoryItem,
+  type ProjectWorkspace,
+  type Q18Candidate,
+  type Room,
 } from './types.ts';
 
 test('Q-18 planner ranks high-impact urgent actions above blocked or low-impact ones', () => {
@@ -1242,6 +1250,142 @@ test('§7 extractEntitiesAndInferEdges & compactMemoryVault infer associative ed
   );
   assert.equal(compacted.memories.find((m) => m.id === 'mem-episodic-old')?.importance, 3);
   assert.ok(!compacted.edges.some((e) => e.target === 'mem-working-old'));
+});
+
+test('isGeneralUnlinkedChat distinguishes standalone __general__ threads from project chats', () => {
+  const generalById: Pick<ChatThread, 'projectId' | 'isGeneral'> = {
+    projectId: GENERAL_CHAT_PROJECT_ID,
+  };
+  const generalByFlag: Pick<ChatThread, 'projectId' | 'isGeneral'> = {
+    projectId: 'proj-jarvis-core',
+    isGeneral: true,
+  };
+  const projectChat: Pick<ChatThread, 'projectId' | 'isGeneral'> = {
+    projectId: 'proj-jarvis-core',
+    isGeneral: false,
+  };
+
+  assert.equal(isGeneralUnlinkedChat(generalById), true);
+  assert.equal(isGeneralUnlinkedChat(generalByFlag), true);
+  assert.equal(isGeneralUnlinkedChat(projectChat), false);
+  assert.equal(isGeneralUnlinkedChat(null), false);
+});
+
+test('maskSecretApiKey never leaks full credentials and formats short/long keys safely', () => {
+  assert.equal(maskSecretApiKey(undefined), null);
+  assert.equal(maskSecretApiKey('   '), null);
+
+  const secret = 'AIzaSySecretMiddleValue987654321';
+  const masked = maskSecretApiKey(secret);
+  assert.ok(masked !== null);
+  assert.ok(!masked.includes('SecretMiddleValue'));
+  assert.ok(masked.startsWith('AIza'));
+  assert.ok(masked.endsWith('4321'));
+
+  const shortMasked = maskSecretApiKey('abcd');
+  assert.equal(shortMasked, '••••••••');
+});
+
+test('resolveProjectAgentsList puts Principal Agent first, filters project subagents, and unlocks all fleet in General Chat', () => {
+  const rooms: Room[] = [
+    {
+      id: 'room-sub-other',
+      name: 'Other Specialist',
+      callsign: 'SUB-OTHER',
+      roleTitle: 'Other',
+      description: 'Other specialist room',
+      accentColor: 'cyan',
+      systemPrompt: 'Other',
+      allowedTools: [],
+      projectId: 'proj-other',
+    },
+    {
+      id: 'room-sub-assigned',
+      name: 'Assigned Analyst',
+      callsign: 'SUB-ANALYST',
+      roleTitle: 'Analyst',
+      description: 'Assigned analyst room',
+      accentColor: 'emerald',
+      systemPrompt: 'Analyze',
+      allowedTools: [],
+    },
+    {
+      id: 'room-exec',
+      name: 'J.A.R.V.I.S. Principal',
+      callsign: 'CORE-EXEC',
+      roleTitle: 'Coordenador',
+      description: 'Principal coordinator room',
+      accentColor: 'amber',
+      systemPrompt: 'Principal',
+      allowedTools: [],
+    },
+    {
+      id: 'room-sub-bound',
+      name: 'Project UI Builder',
+      callsign: 'SUB-UI',
+      roleTitle: 'Frontend UI',
+      description: 'Project-bound UI specialist room',
+      accentColor: 'cyan',
+      systemPrompt: 'UI',
+      allowedTools: [],
+      projectId: 'proj-target',
+    },
+  ];
+
+  const targetProject: ProjectWorkspace = {
+    id: 'proj-target',
+    name: 'Target Project',
+    slug: 'target-project',
+    rootPath: '.',
+    techStack: 'React',
+    gitBranch: 'main',
+    description: 'Test',
+    status: 'ACTIVE',
+    proactiveEnabled: true,
+    proactiveIntervalSec: 120,
+    healthScore: 95,
+    openTasksCount: 0,
+    assignedAgentIds: ['room-sub-assigned'],
+    proactiveInsights: [],
+  };
+
+  const scoped = resolveProjectAgentsList(rooms, targetProject);
+  assert.deepEqual(
+    scoped.map((r) => r.id),
+    ['room-exec', 'room-sub-assigned', 'room-sub-bound']
+  );
+
+  const generalFleet = resolveProjectAgentsList(rooms, null);
+  assert.equal(generalFleet[0].id, 'room-exec');
+  assert.equal(generalFleet.length, rooms.length);
+});
+
+test('formatApprovalRequesterBadge distinguishes Sub-Agents, Live Voice Principal, and Principal Agent', () => {
+  const subBadge = formatApprovalRequesterBadge({
+    source: 'SUBAGENT',
+    actorName: 'UI Specialist',
+    agentCallsign: 'SUB-UI',
+    isSubagent: true,
+  });
+  assert.equal(subBadge.roleLabel, 'SUB-AGENTE');
+  assert.equal(subBadge.isSubagent, true);
+  assert.ok(subBadge.actorDisplay.includes('UI Specialist'));
+  assert.ok(subBadge.actorDisplay.includes('SUB-UI'));
+
+  const liveBadge = formatApprovalRequesterBadge({
+    source: 'LIVE_VOICE_AGENT',
+    actorName: 'Jarvis Live (Charon)',
+    isSubagent: false,
+  });
+  assert.equal(liveBadge.roleLabel, 'AGENTE PRINCIPAL · LIVE');
+  assert.equal(liveBadge.isSubagent, false);
+
+  const principalBadge = formatApprovalRequesterBadge({
+    source: 'CHAT_AGENT',
+    isSubagent: false,
+  });
+  assert.equal(principalBadge.roleLabel, 'AGENTE PRINCIPAL');
+  assert.equal(principalBadge.isSubagent, false);
 });
 
 
