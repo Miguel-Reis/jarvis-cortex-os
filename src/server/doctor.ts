@@ -27,14 +27,19 @@ export function parseNodeMajorMinor(versionStr = process.versions.node): {
 
 /**
  * A-09: Explicit runtime version check executed at boot.
+ * Warns on Node < 22.6.0 (falling back to tsx + json-transactional store)
+ * instead of crashing Windows setups running Node 18/20 LTS.
  */
 export function enforceMinimumNodeRuntime(): void {
   const { supported } = parseNodeMajorMinor();
   if (!supported) {
-    throw new Error(
-      `[A-09 RUNTIME GUARD] Node.js ${process.version} não suportado. ` +
-        `O J.A.R.V.I.S. Cortex OS requer Node.js >= 22.6.0 (para TypeScript nativo e node:sqlite WAL).`
-    );
+    const msg =
+      `[A-09 RUNTIME GUARD] Node.js ${process.version} detetado (< 22.6.0). ` +
+      `Modo de compatibilidade ativo (tsx + fallback JSON transacional). Recomendado Node.js >= 22.6.0 para node:sqlite WAL nativo.`;
+    if (process.env.JARVIS_STRICT_NODE_VERSION === '1') {
+      throw new Error(msg);
+    }
+    console.warn(msg);
   }
 }
 
@@ -54,7 +59,7 @@ export async function runSystemDoctor(params: {
     id: 'NODE_RUNTIME',
     category: 'RUNTIME',
     label: 'Versão de Runtime Node.js (>= 22.6.0)',
-    status: nodeVer.supported ? 'PASS' : 'FAIL',
+    status: nodeVer.supported ? 'PASS' : nodeVer.major >= 18 ? 'WARN' : 'FAIL',
     detail: `Node v${process.versions.node} (${process.platform}/${process.arch}).`,
   });
 
