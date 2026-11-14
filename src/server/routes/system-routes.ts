@@ -7,7 +7,10 @@ import {
 import { domainMutex } from '../async-mutex.ts';
 import { db } from '../db.ts';
 import { runSystemDoctor } from '../doctor.ts';
-import { testModelProviderConnection } from '../gemini-engine.ts';
+import {
+  listAvailableGeminiModels,
+  testModelProviderConnection,
+} from '../gemini-engine.ts';
 import { audit, respondError, respondOk } from '../http-helpers.ts';
 import { probeExternalMcpServer } from '../mcp-server.ts';
 import { executeGovernedCommand } from '../os-adapter.ts';
@@ -234,6 +237,12 @@ export function createSystemRouter(ctx: SystemRouterContext): express.Router {
   router.post('/api/settings/test-provider', async (req, res) => {
     ctx.reloadDotEnv();
     const result = await testModelProviderConnection(req.body || {});
+    respondOk(res, result);
+  });
+
+  router.get('/api/settings/gemini-models', async (_req, res) => {
+    ctx.reloadDotEnv();
+    const result = await listAvailableGeminiModels();
     respondOk(res, result);
   });
 

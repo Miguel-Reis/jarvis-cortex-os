@@ -2528,6 +2528,60 @@ export interface ProviderConnectivityResult {
   envKeysStatus: { geminiConfigured: boolean; openRouterConfigured: boolean };
 }
 
+export async function listAvailableGeminiModels(): Promise<{
+  ok: boolean;
+  models: { id: string; displayName: string; description?: string }[];
+  detail: string;
+}> {
+  const ai = getGeminiClient();
+  if (!ai || !process.env.GEMINI_API_KEY?.trim()) {
+    return {
+      ok: false,
+      models: [],
+      detail: 'GEMINI_API_KEY não configurada no servidor (.env).',
+    };
+  }
+
+  try {
+    const fetchModels = async () => {
+      const pager = await ai.models.list({ config: { pageSize: 100 } });
+      const items: { id: string; displayName: string; description?: string }[] = [];
+      for await (const mdl of pager) {
+        const rawName = String(mdl.name || '');
+        const id = rawName.replace(/^models\//, '').trim();
+        if (!id || !id.toLowerCase().includes('gemini')) continue;
+        const actions = (mdl.supportedActions || []) as string[];
+        if (actions.length > 0 && !actions.some((a) => a.toLowerCase().includes('generate'))) {
+          continue;
+        }
+        items.push({
+          id,
+          displayName: String(mdl.displayName || id),
+          description: mdl.description ? String(mdl.description) : undefined,
+        });
+      }
+      items.sort((a, b) => b.id.localeCompare(a.id, undefined, { numeric: true }));
+      return items;
+    };
+
+    const timeoutPromise = new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error('TIMEOUT_LIST_MODELS')), 4500)
+    );
+    const models = await Promise.race([fetchModels(), timeoutPromise]);
+    return {
+      ok: true,
+      models,
+      detail: `${models.length} modelo(s) Gemini descobertos na tua API Key.`,
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      models: [],
+      detail: `Não foi possível listar modelos da API: ${(err as Error).message}`,
+    };
+  }
+}
+
 export async function testModelProviderConnection(params?: {
   provider?: string;
   preferredGeminiModel?: string;
@@ -2610,7 +2664,10 @@ export async function testModelProviderConnection(params?: {
     };
 
     try {
-      const res = await pingGeminiWithTimeout(targetModel, 4800);
+      const [res, listed] = await Promise.all([
+        pingGeminiWithTimeout(targetModel, 4800),
+        listAvailableGeminiModels().catch(() => ({ ok: false, models: [], detail: '' })),
+      ]);
       const sample = (res.text ?? '').trim().slice(0, 80) || 'OPERACIONAL';
       const latencyMs = Math.max(1, Math.round(performance.now() - t0));
       return {
@@ -2620,6 +2677,7 @@ export async function testModelProviderConnection(params?: {
         modelUsed: targetModel,
         endpointUsed: '@google/genai Server SDK',
         sampleOutput: sample,
+        discoveredModels: listed.models.map((m) => m.id),
         detail: `Round-trip real concluído com sucesso em ${targetModel} (${latencyMs}ms). Visão multimodal e 18 tools ativas.`,
         fallbackReady: true,
         envKeysStatus,
